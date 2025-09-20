@@ -20,6 +20,25 @@ def fetch_papers(subject, count=10):
     response.raise_for_status()
     return response.json().get("search-results", {}).get("entry", [])
 
+def fetch_citations(scopus_id):
+    """Fetch citations for a given paper using Elsevier API."""
+    url =  f"https://api.elsevier.com/content/abstract/scopus_id/{scopus_id}"
+    headers = {"Accept": "application/json", "X-ELS-APIKey": API_KEY}
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    data = response.json()
+
+    # Extract cited references (papers this paper cites)
+    cited_refs = []
+    ref_list = data.get("abstracts-retrieval-response", {}).get("references", {}).get("reference", [])
+    for ref in ref_list:
+        ref_id = ref.get("scopus-id")
+        if ref_id:
+            cited_refs.append(ref_id)
+
+    return cited_refs
+
+
 
 def db_is_empty():
     """Check if Paper table has rows."""
@@ -37,6 +56,7 @@ def bulk_load(entries):
     authors_csv = "csv_data/authors.csv"
     papers_csv = "csv_data/papers.csv"
     wrote_csv = "csv_data/wrote.csv"
+    # cited_csv = "csv_data/cited.csv"  # For future use 
 
     with open(authors_csv, "w", newline="") as f:
         writer = csv.writer(f)
@@ -73,9 +93,20 @@ def bulk_load(entries):
                 if a.get("authid"):
                     writer.writerow([a.get("authid"), pid])
 
+    #with open(cited_csv, "w", newline="") as f:
+    #    writer = csv.writer(f)
+    #    writer.writerow(["citing_paper_id", "cited_paper_id"])
+    #    for e in entries:
+    #        citing_pid = e.get("dc:identifier", "").replace("SCOPUS_ID:", "")
+    #        cited_ids = fetch_citations(citing_pid)
+    #        for cited_id in cited_ids:
+    #            writer.writerow([citing_pid, cited_id])
+
+
     conn.execute(f"COPY Author FROM '{authors_csv}' (HEADER=true);")
     conn.execute(f"COPY Paper FROM '{papers_csv}' (HEADER=true);")
     conn.execute(f"COPY WROTE FROM '{wrote_csv}' (HEADER=true);")
+    # conn.execute(f"COPY CITED FROM '{cited_csv}' (HEADER=true);") 
 
     print("Bulk load completed")
 
