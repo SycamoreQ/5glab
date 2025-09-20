@@ -1,4 +1,4 @@
-from graph.database.crawler import fetch_papers , save_to_csv
+from graph.database.crawler import fetch_papers , bulk_load , insert_incremental , db_is_empty
 from graph.database.schema import create_schema, load_csv_into_kuzu
 from kuzu import Database, Connection
 
@@ -7,17 +7,19 @@ db = Database(DB_PATH)
 conn = Connection(db)
 
 def main():
-    subjects = ["COMP", "MATH", "PHYS"] 
+    create_schema()
+
+    subjects = ["COMP", "MATH", "PHYS"]
     all_entries = []
     for subj in subjects:
-        entries = fetch_papers(subj, count=10)
-        all_entries.extend(entries)
+        all_entries.extend(fetch_papers(subj, count=5))
 
-    save_to_csv(all_entries, "papers.csv", "authors.csv", "wrote.csv")
-    print("✅ CSVs created")
-
-    create_schema()
-    load_csv_into_kuzu()
+    if db_is_empty():
+        print("⚡ First run → using bulk load")
+        bulk_load(all_entries)
+    else:
+        print("🔄 Incremental mode → inserting new data")
+        insert_incremental(all_entries)
 
     result = conn.execute("MATCH (a:Author)-[:WROTE]->(p:Paper) RETURN a.name, p.title LIMIT 5;")
     for row in result:
