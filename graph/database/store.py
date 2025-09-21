@@ -2,6 +2,7 @@ import kuzu
 import logging
 import os 
 from kuzu import Database, Connection
+import datetime 
 
 DB_PATH = "research_db"  
 db = Database(DB_PATH)
@@ -23,6 +24,7 @@ def get_papers_by_author(author_name):
 
 def get_authors_by_paper(paper_title):
     """Get all authors of a specific paper"""
+
     try:
         result = conn.execute("""
             MATCH (a:Author)-[:WROTE]->(p:Paper {title: $title})
@@ -37,6 +39,7 @@ def get_authors_by_paper(paper_title):
 
 def get_paper_by_year(year):
     """Get all papers published in a specific year"""
+
     try:
         result = conn.execute("""
             MATCH (p:Paper {year: $year})
@@ -97,6 +100,7 @@ def get_paper_by_doi(doi):
 
 def get_author_by_id(author_id):
     """Get a specific author by their ID"""
+
     try:
         result = conn.execute("""
             MATCH (a:Author {author_id: $id})
@@ -113,6 +117,7 @@ def get_author_by_id(author_id):
 
 def search_papers_by_title(title_substring):
     """Search papers by title (case-insensitive substring match)"""
+
     try:
         result = conn.execute("""
             MATCH (p:Paper)
@@ -365,6 +370,7 @@ def get_citations_by_paper(paper_id):
 
 def get_references_by_paper(paper_id):
     """Get all papers referenced/cited by a specific paper"""
+
     try:
         result = conn.execute("""
             MATCH (citing:Paper {paper_id: $paper_id})-[:CITES]->(cited:Paper)
@@ -381,6 +387,7 @@ def get_references_by_paper(paper_id):
 
 def get_citation_count(paper_id):
     """Get citation count for a specific paper"""
+
     try:
         result = conn.execute("""
             MATCH (citing:Paper)-[:CITES]->(cited:Paper {paper_id: $paper_id})
@@ -395,6 +402,7 @@ def get_citation_count(paper_id):
 
 def get_most_cited_papers(limit=10):
     """Get papers with highest citation counts"""
+
     try:
         result = conn.execute("""
             MATCH (citing:Paper)-[:CITES]->(cited:Paper)
@@ -411,6 +419,7 @@ def get_most_cited_papers(limit=10):
 
 def get_citation_depth(paper_id, max_depth=3):
     """Get citation network up to specified depth"""
+
     try:
         result = conn.execute("""
             MATCH path = (start:Paper {paper_id: $paper_id})-[:CITES*1..$max_depth]->(end:Paper)
@@ -426,6 +435,7 @@ def get_citation_depth(paper_id, max_depth=3):
 
 def get_co_citation_papers(paper_id, limit=10):
     """Get papers that are co-cited with the given paper"""
+
     try:
         result = conn.execute("""
             MATCH (p1:Paper {paper_id: $paper_id})<-[:CITES]-(citing:Paper)-[:CITES]->(p2:Paper)
@@ -434,6 +444,79 @@ def get_co_citation_papers(paper_id, limit=10):
             ORDER BY co_citation_count DESC
             LIMIT $limit
             """, {"paper_id": paper_id, "limit": limit})
+    except Exception as e:
+        logging.error(f"Query failed: {e}")
+        return []
+    return [dict(row) for row in result]
+
+
+
+def detect_research_communities(min_cluster_size=5):
+    """Detect research communities using citation and collaboration patterns"""
+
+    try:
+        result = conn.execute("""
+            MATCH (a1:Author)-[:WROTE]->(p1:Paper)-[:CITES]->(p2:Paper)<-[:WROTE]-(a2:Author)
+            WHERE a1 <> a2
+            WITH a1, a2, count(*) as connection_strength
+            WHERE connection_strength >= 2
+            RETURN a1.name, a2.name, connection_strength
+            ORDER BY connection_strength DESC
+            """)
+    except Exception as e:
+        logging.error(f"Query failed: {e}")
+        return []
+    return [dict(row) for row in result]
+
+
+
+def track_keyword_citation_impact(keyword):
+    """Track how papers containing a keyword perform in citations over time"""
+
+    try:
+        result = conn.execute("""
+            MATCH (p:Paper)
+            WHERE toLower(p.title) CONTAINS $keyword 
+                  OR (p.abstract IS NOT NULL AND toLower(p.abstract) CONTAINS $keyword)
+            
+            OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
+            WITH p, count(citing) as citation_count
+            
+            RETURN p.year, 
+                   count(p) as papers_with_keyword,
+                   avg(citation_count) as avg_citations_per_paper,
+                   sum(citation_count) as total_citations,
+                   max(citation_count) as max_citations
+            ORDER BY p.year
+            """, {"keyword": keyword.lower()})
+    except Exception as e:
+        logging.error(f"Query failed: {e}")
+        return []
+    return [dict(row) for row in result]
+    
+
+
+def track_keyword_temporal_trend(keyword, start_year=None, end_year=None):
+    """Track how a specific keyword's usage evolves over time"""
+    try:
+        year_filter = ""
+        params = {"keyword": keyword.lower()}
+        
+        if start_year:
+            year_filter += "AND p.year >= $start_year "
+            params["start_year"] = start_year
+        if end_year:
+            year_filter += "AND p.year <= $end_year "
+            params["end_year"] = end_year
+            
+        result = conn.execute(f"""
+            MATCH (p:Paper)
+            WHERE (toLower(p.title) CONTAINS $keyword 
+                   OR (p.keywords IS NOT NULL AND toLower(p.keywords) CONTAINS $keyword))
+                  {year_filter}
+            RETURN p.year, count(p) as keyword_count
+            ORDER BY p.year
+            """, params)
     except Exception as e:
         logging.error(f"Query failed: {e}")
         return []
