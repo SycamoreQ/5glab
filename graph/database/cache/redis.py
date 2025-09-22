@@ -5,3 +5,6 @@ import logging
 import os 
 from graph.database.store import * 
 
+redis_client = ""
+
+
