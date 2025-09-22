@@ -1,227 +1,215 @@
-import kuzu 
+import kuzu
 import logging
-import os 
+import asyncio
 from kuzu import Database, Connection
-import datetime 
+from typing import Any, List, Optional, Dict
 
-DB_PATH = "research_db"  
-db = Database(DB_PATH)
-conn = Connection(db)
+DB_PATH = "research_db"
+# Initialize database and connection once. Be careful: the Kuzu Connection object
+# may not be fully thread-safe. If you see odd behavior under heavy concurrency,
+# consider creating a new Connection per request or using a connection pool. //TODO 
+_db = Database(DB_PATH)
+_conn = Connection(_db)
 
 
-def get_papers_by_author(author_name):
-    """Get all papers by a specific author"""
+async def _run_query(query: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
+    """Run a Kuzu query in a thread to avoid blocking the event loop.
+
+    Returns a list of dict rows.
+    """
+    params = params or []
+
+    def _exec():
+        try:
+            result = _conn.execute(query, params)
+            # Convert to list immediately while still in the thread.
+            return [dict(row) for row in result]
+        except Exception as e:
+            logging.error(f"Query failed: {e}")
+            raise
+
+    rows = await asyncio.to_thread(_exec)
+    return rows
+
+
+# -- Read functions --
+async def get_papers_by_author(author_name: str) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (a:Author {name: $1})-[:WROTE]->(p:Paper)
+        RETURN p.title, p.year, p.doi, p.paper_id
+        """
     try:
-        result = conn.execute("""
-            MATCH (a:Author {name: $1})-[:WROTE]->(p:Paper)
-            RETURN p.title, p.year, p.doi, p.paper_id
-            """, [author_name])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [author_name])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_authors_by_paper(paper_title):
-    """Get all authors of a specific paper"""
+async def get_authors_by_paper(paper_title: str) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (a:Author)-[:WROTE]->(p:Paper {title: $1})
+        RETURN a.name, a.author_id
+        """
     try:
-        result = conn.execute("""
-            MATCH (a:Author)-[:WROTE]->(p:Paper {title: $1})
-            RETURN a.name, a.author_id
-            """, [paper_title])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [paper_title])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_paper_by_year(year):
-    """Get all papers published in a specific year"""
+async def get_paper_by_year(year: int) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (p:Paper {year: $1})
+        RETURN p.title, p.doi, p.paper_id
+        """
     try:
-        result = conn.execute("""
-            MATCH (p:Paper {year: $1})
-            RETURN p.title, p.doi, p.paper_id
-            """, [year])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [year])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_papers_by_year_range(start_year, end_year):
-    """Get all papers within a year range"""
+async def get_papers_by_year_range(start_year: int, end_year: int) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (p:Paper)
+        WHERE p.year >= $1 AND p.year <= $2
+        RETURN p.title, p.year, p.doi, p.paper_id
+        ORDER BY p.year DESC
+        """
     try:
-        result = conn.execute("""
-            MATCH (p:Paper)
-            WHERE p.year >= $1 AND p.year <= $2
-            RETURN p.title, p.year, p.doi, p.paper_id
-            ORDER BY p.year DESC
-            """, [start_year, end_year])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [start_year, end_year])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_paper_by_id(paper_id):
-    """Get a specific paper by its ID"""
+async def get_paper_by_id(paper_id: str) -> Optional[Dict[str, Any]]:
+    query = """
+        MATCH (p:Paper {paper_id: $1})
+        RETURN p.title, p.year, p.doi, p.paper_id
+        """
     try:
-        result = conn.execute("""
-            MATCH (p:Paper {paper_id: $1})
-            RETURN p.title, p.year, p.doi, p.paper_id
-            """, [paper_id])
-        papers = [dict(row) for row in result]
-        return papers[0] if papers else None
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        rows = await _run_query(query, [paper_id])
+        return rows[0] if rows else None
+    except Exception:
         return None
 
 
-def get_paper_by_doi(doi):
-    """Get a specific paper by its DOI"""
+async def get_paper_by_doi(doi: str) -> Optional[Dict[str, Any]]:
+    query = """
+        MATCH (p:Paper {doi: $1})
+        RETURN p.title, p.year, p.paper_id
+        """
     try:
-        result = conn.execute("""
-            MATCH (p:Paper {doi: $1})
-            RETURN p.title, p.year, p.paper_id
-            """, [doi])
-        papers = [dict(row) for row in result]
-        return papers[0] if papers else None
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        rows = await _run_query(query, [doi])
+        return rows[0] if rows else None
+    except Exception:
         return None
 
 
-def get_author_by_id(author_id):
-    """Get a specific author by their ID"""
+async def get_author_by_id(author_id: str) -> Optional[Dict[str, Any]]:
+    query = """
+        MATCH (a:Author {author_id: $1})
+        RETURN a.name, a.author_id
+        """
     try:
-        result = conn.execute("""
-            MATCH (a:Author {author_id: $1})
-            RETURN a.name, a.author_id
-            """, [author_id])
-        authors = [dict(row) for row in result]
-        return authors[0] if authors else None
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        rows = await _run_query(query, [author_id])
+        return rows[0] if rows else None
+    except Exception:
         return None
 
 
-def search_papers_by_title(title_substring):
-    """Search papers by title (case-insensitive substring match)"""
+async def search_papers_by_title(title_substring: str) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (p:Paper)
+        WHERE toLower(p.title) CONTAINS toLower($1)
+        RETURN p.title, p.year, p.doi, p.paper_id
+        """
     try:
-        result = conn.execute("""
-            MATCH (p:Paper)
-            WHERE toLower(p.title) CONTAINS toLower($1)
-            RETURN p.title, p.year, p.doi, p.paper_id
-            """, [title_substring])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [title_substring])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def search_authors_by_name(name_substring):
-    """Search authors by name (case-insensitive substring match)"""
+async def search_authors_by_name(name_substring: str) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (a:Author)
+        WHERE toLower(a.name) CONTAINS toLower($1)
+        RETURN a.name, a.author_id
+        """
     try:
-        result = conn.execute("""
-            MATCH (a:Author)
-            WHERE toLower(a.name) CONTAINS toLower($1)
-            RETURN a.name, a.author_id
-            """, [name_substring])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [name_substring])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_all_papers(limit=None):
-    """Get all papers, optionally with a limit"""
+async def get_all_papers(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     query = "MATCH (p:Paper) RETURN p.title, p.year, p.doi, p.paper_id ORDER BY p.year DESC"
-    params = []
-    
+    params: List[Any] = []
     if limit:
         query += " LIMIT $1"
         params = [limit]
-        
     try:
-        result = conn.execute(query, params)
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, params)
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_all_authors(limit=None):
-    """Get all authors, optionally with a limit"""
+async def get_all_authors(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     query = "MATCH (a:Author) RETURN a.name, a.author_id ORDER BY a.name"
-    params = []
-    
+    params: List[Any] = []
     if limit:
         query += " LIMIT $1"
         params = [limit]
-        
     try:
-        result = conn.execute(query, params)
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, params)
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def regex_for_paper(regex_string: str, limit=100):
-    """Perform regex search on paper titles"""
-    try: 
-        result = conn.execute("""
-            MATCH (p:Paper)
-            WHERE p.title =~ $1
-            RETURN p.title
-            LIMIT $2
-            """, [regex_string, limit])
-    except Exception as e: 
-        logging.error(f"Query failed: {e}")
+async def regex_for_paper(regex_string: str, limit: int = 100) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (p:Paper)
+        WHERE p.title =~ $1
+        RETURN p.title
+        LIMIT $2
+        """
+    try:
+        return await _run_query(query, [regex_string, limit])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def regex_for_author(regex_string: str, limit=100):
-    """Perform regex search on author names"""
-    try: 
-        result = conn.execute("""
-            MATCH (a:Author)
-            WHERE a.name =~ $1
-            RETURN a.name
-            LIMIT $2
-            """, [regex_string, limit])
-    except Exception as e: 
-        logging.error(f"Query failed: {e}")
+async def regex_for_author(regex_string: str, limit: int = 100) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (a:Author)
+        WHERE a.name =~ $1
+        RETURN a.name
+        LIMIT $2
+        """
+    try:
+        return await _run_query(query, [regex_string, limit])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-# Update Functions
-def update_author(author_id, new_name=None):
-    """Update author information"""
+# -- Update functions --
+async def update_author(author_id: str, new_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if not new_name:
         return None
-        
+    query = """
+        MATCH (a:Author {author_id: $1})
+        SET a.name = $2
+        RETURN a.name, a.author_id
+        """
     try:
-        result = conn.execute("""
-            MATCH (a:Author {author_id: $1})
-            SET a.name = $2
-            RETURN a.name, a.author_id
-            """, [author_id, new_name])
-        updated = [dict(row) for row in result]
-        return updated[0] if updated else None
-    except Exception as e:
-        logging.error(f"Update author failed: {e}")
+        rows = await _run_query(query, [author_id, new_name])
+        return rows[0] if rows else None
+    except Exception:
         return None
 
 
-def update_paper(paper_id, title=None, year=None, doi=None):
-    """Update paper information"""
-    set_clauses = []
-    params = [paper_id]
+async def update_paper(paper_id: str, title: Optional[str] = None, year: Optional[int] = None, doi: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    set_clauses: List[str] = []
+    params: List[Any] = [paper_id]
     param_count = 2
-    
+
     if title:
         set_clauses.append(f"p.title = ${param_count}")
         params.append(title)
@@ -234,264 +222,251 @@ def update_paper(paper_id, title=None, year=None, doi=None):
         set_clauses.append(f"p.doi = ${param_count}")
         params.append(doi)
         param_count += 1
-        
+
     if not set_clauses:
         return None
-        
+
     query = f"""
         MATCH (p:Paper {{paper_id: $1}})
         SET {', '.join(set_clauses)}
         RETURN p.title, p.year, p.doi, p.paper_id
     """
-    
     try:
-        result = conn.execute(query, params)
-        updated = [dict(row) for row in result]
-        return updated[0] if updated else None
-    except Exception as e:
-        logging.error(f"Update paper failed: {e}")
+        rows = await _run_query(query, params)
+        return rows[0] if rows else None
+    except Exception:
         return None
 
 
-# Delete functions
-def delete_author(author_id):
-    """Delete an author and their relationships"""
+# -- Delete functions --
+async def delete_author(author_id: str) -> bool:
+    query = """
+        MATCH (a:Author {author_id: $1})
+        DETACH DELETE a
+        """
+
+    def _exec():
+        try:
+            _conn.execute(query, [author_id])
+            return True
+        except Exception as e:
+            logging.error(f"Delete author failed: {e}")
+            return False
+
+    return await asyncio.to_thread(_exec)
+
+
+async def delete_paper(paper_id: str) -> bool:
+    query = """
+        MATCH (p:Paper {paper_id: $1})
+        DETACH DELETE p
+        """
+
+    def _exec():
+        try:
+            _conn.execute(query, [paper_id])
+            return True
+        except Exception as e:
+            logging.error(f"Delete paper failed: {e}")
+            return False
+
+    return await asyncio.to_thread(_exec)
+
+
+async def delete_authorship(author_id: str, paper_id: str) -> bool:
+    query = """
+        MATCH (a:Author {author_id: $1})-[r:WROTE]->(p:Paper {paper_id: $2})
+        DELETE r
+        """
+
+    def _exec():
+        try:
+            _conn.execute(query, [author_id, paper_id])
+            return True
+        except Exception as e:
+            logging.error(f"Delete authorship failed: {e}")
+            return False
+
+    return await asyncio.to_thread(_exec)
+
+
+# -- Analytics / citation functions --
+async def get_author_collaboration_count(author_id: str) -> int:
+    query = """
+        MATCH (a1:Author {author_id: $1})-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
+        WHERE a1 <> a2
+        RETURN count(DISTINCT a2) as collaborator_count
+        """
     try:
-        result = conn.execute("""
-            MATCH (a:Author {author_id: $1})
-            DETACH DELETE a
-            """, [author_id])
-        return True
-    except Exception as e:
-        logging.error(f"Delete author failed: {e}")
-        return False
-
-
-def delete_paper(paper_id):
-    """Delete a paper and its relationships"""
-    try:
-        result = conn.execute("""
-            MATCH (p:Paper {paper_id: $1})
-            DETACH DELETE p
-            """, [paper_id])
-        return True
-    except Exception as e:
-        logging.error(f"Delete paper failed: {e}")
-        return False
-
-
-def delete_authorship(author_id, paper_id):
-    """Delete a specific WROTE relationship"""
-    try:
-        result = conn.execute("""
-            MATCH (a:Author {author_id: $1})-[r:WROTE]->(p:Paper {paper_id: $2})
-            DELETE r
-            """, [author_id, paper_id])
-        return True
-    except Exception as e:
-        logging.error(f"Delete authorship failed: {e}")
-        return False
-
-
-# Analytics Functions
-def get_author_collaboration_count(author_id):
-    """Get number of unique collaborators for an author"""
-    try:
-        result = conn.execute("""
-            MATCH (a1:Author {author_id: $1})-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
-            WHERE a1 <> a2
-            RETURN count(DISTINCT a2) as collaborator_count
-            """, [author_id])
-        counts = [dict(row) for row in result]
-        return counts[0]['collaborator_count'] if counts else 0
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        rows = await _run_query(query, [author_id])
+        return rows[0]['collaborator_count'] if rows else 0
+    except Exception:
         return 0
 
 
-def get_most_prolific_authors(limit=10):
-    """Get authors with most papers"""
+async def get_most_prolific_authors(limit: int = 10) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (a:Author)-[:WROTE]->(p:Paper)
+        RETURN a.name, a.author_id, count(p) as paper_count
+        ORDER BY paper_count DESC
+        LIMIT $1
+        """
     try:
-        result = conn.execute("""
-            MATCH (a:Author)-[:WROTE]->(p:Paper)
-            RETURN a.name, a.author_id, count(p) as paper_count
-            ORDER BY paper_count DESC
-            LIMIT $1
-            """, [limit])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [limit])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_papers_per_year():
-    """Get paper count by year"""
+async def get_papers_per_year() -> List[Dict[str, Any]]:
+    query = """
+        MATCH (p:Paper)
+        RETURN p.year, count(p) as paper_count
+        ORDER BY p.year DESC
+        """
     try:
-        result = conn.execute("""
-            MATCH (p:Paper)
-            RETURN p.year, count(p) as paper_count
-            ORDER BY p.year DESC
-            """)
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query)
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-# Citation Functions
-def get_citations_by_paper(paper_id):
-    """Get all papers that cite a specific paper"""
+async def get_citations_by_paper(paper_id: str) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (citing:Paper)-[:CITES]->(cited:Paper {paper_id: $1})
+        RETURN citing.title, citing.year, citing.doi, citing.paper_id
+        ORDER BY citing.year DESC
+        """
     try:
-        result = conn.execute("""
-            MATCH (citing:Paper)-[:CITES]->(cited:Paper {paper_id: $1})
-            RETURN citing.title, citing.year, citing.doi, citing.paper_id
-            ORDER BY citing.year DESC
-            """, [paper_id])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [paper_id])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_references_by_paper(paper_id):
-    """Get all papers referenced/cited by a specific paper"""
+async def get_references_by_paper(paper_id: str) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (citing:Paper {paper_id: $1})-[:CITES]->(cited:Paper)
+        RETURN cited.title, cited.year, cited.doi, cited.paper_id
+        ORDER BY cited.year DESC
+        """
     try:
-        result = conn.execute("""
-            MATCH (citing:Paper {paper_id: $1})-[:CITES]->(cited:Paper)
-            RETURN cited.title, cited.year, cited.doi, cited.paper_id
-            ORDER BY cited.year DESC
-            """, [paper_id])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [paper_id])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_citation_count(paper_id):
-    """Get citation count for a specific paper"""
+async def get_citation_count(paper_id: str) -> int:
+    query = """
+        MATCH (citing:Paper)-[:CITES]->(cited:Paper {paper_id: $1})
+        RETURN count(citing) as citation_count
+        """
     try:
-        result = conn.execute("""
-            MATCH (citing:Paper)-[:CITES]->(cited:Paper {paper_id: $1})
-            RETURN count(citing) as citation_count
-            """, [paper_id])
-        counts = [dict(row) for row in result]
-        return counts[0]['citation_count'] if counts else 0
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        rows = await _run_query(query, [paper_id])
+        return rows[0]['citation_count'] if rows else 0
+    except Exception:
         return 0
 
 
-def get_most_cited_papers(limit=10):
-    """Get papers with highest citation counts"""
+async def get_most_cited_papers(limit: int = 10) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (citing:Paper)-[:CITES]->(cited:Paper)
+        RETURN cited.title, cited.year, cited.doi, cited.paper_id, count(citing) as citation_count
+        ORDER BY citation_count DESC
+        LIMIT $1
+        """
     try:
-        result = conn.execute("""
-            MATCH (citing:Paper)-[:CITES]->(cited:Paper)
-            RETURN cited.title, cited.year, cited.doi, cited.paper_id, count(citing) as citation_count
-            ORDER BY citation_count DESC
-            LIMIT $1
-            """, [limit])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [limit])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_citation_depth(paper_id, max_depth=3):
-    """Get citation network up to specified depth"""
+async def get_citation_depth(paper_id: str, max_depth: int = 3) -> List[Dict[str, Any]]:
+    query = """
+        MATCH path = (start:Paper {paper_id: $1})-[:CITES*1..$2]->(end:Paper)
+        RETURN end.title, end.year, end.paper_id, length(path) as depth
+        ORDER BY depth, end.year DESC
+        """
     try:
-        result = conn.execute("""
-            MATCH path = (start:Paper {paper_id: $1})-[:CITES*1..$2]->(end:Paper)
-            RETURN end.title, end.year, end.paper_id, length(path) as depth
-            ORDER BY depth, end.year DESC
-            """, [paper_id, max_depth])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [paper_id, max_depth])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def get_co_citation_papers(paper_id, limit=10):
-    """Get papers that are co-cited with the given paper"""
+async def get_co_citation_papers(paper_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (p1:Paper {paper_id: $1})<-[:CITES]-(citing:Paper)-[:CITES]->(p2:Paper)
+        WHERE p1 <> p2
+        RETURN p2.title, p2.year, p2.paper_id, count(citing) as co_citation_count
+        ORDER BY co_citation_count DESC
+        LIMIT $2
+        """
     try:
-        result = conn.execute("""
-            MATCH (p1:Paper {paper_id: $1})<-[:CITES]-(citing:Paper)-[:CITES]->(p2:Paper)
-            WHERE p1 <> p2
-            RETURN p2.title, p2.year, p2.paper_id, count(citing) as co_citation_count
-            ORDER BY co_citation_count DESC
-            LIMIT $2
-            """, [paper_id, limit])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [paper_id, limit])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def detect_research_communities(min_cluster_size=5):
-    """Detect research communities using citation and collaboration patterns"""
+async def detect_research_communities(min_cluster_size: int = 5) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (a1:Author)-[:WROTE]->(p1:Paper)-[:CITES]->(p2:Paper)<-[:WROTE]-(a2:Author)
+        WHERE a1 <> a2
+        WITH a1, a2, count(*) as connection_strength
+        WHERE connection_strength >= 2
+        RETURN a1.name, a2.name, connection_strength
+        ORDER BY connection_strength DESC
+        """
     try:
-        result = conn.execute("""
-            MATCH (a1:Author)-[:WROTE]->(p1:Paper)-[:CITES]->(p2:Paper)<-[:WROTE]-(a2:Author)
-            WHERE a1 <> a2
-            WITH a1, a2, count(*) as connection_strength
-            WHERE connection_strength >= 2
-            RETURN a1.name, a2.name, connection_strength
-            ORDER BY connection_strength DESC
-            """)
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query)
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def track_keyword_citation_impact(keyword):
-    """Track how papers containing a keyword perform in citations over time"""
+async def track_keyword_citation_impact(keyword: str) -> List[Dict[str, Any]]:
+    query = """
+        MATCH (p:Paper)
+        WHERE toLower(p.title) CONTAINS $1 
+              OR (p.abstract IS NOT NULL AND toLower(p.abstract) CONTAINS $1)
+
+        OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
+        WITH p, count(citing) as citation_count
+
+        RETURN p.year, 
+               count(p) as papers_with_keyword,
+               avg(citation_count) as avg_citations_per_paper,
+               sum(citation_count) as total_citations,
+               max(citation_count) as max_citations
+        ORDER BY p.year
+        """
     try:
-        result = conn.execute("""
-            MATCH (p:Paper)
-            WHERE toLower(p.title) CONTAINS $1 
-                  OR (p.abstract IS NOT NULL AND toLower(p.abstract) CONTAINS $1)
-            
-            OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
-            WITH p, count(citing) as citation_count
-            
-            RETURN p.year, 
-                   count(p) as papers_with_keyword,
-                   avg(citation_count) as avg_citations_per_paper,
-                   sum(citation_count) as total_citations,
-                   max(citation_count) as max_citations
-            ORDER BY p.year
-            """, [keyword.lower()])
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, [keyword.lower()])
+    except Exception:
         return []
-    return [dict(row) for row in result]
 
 
-def track_keyword_temporal_trend(keyword, start_year=None, end_year=None):
-    """Track how a specific keyword's usage evolves over time"""
+async def track_keyword_temporal_trend(keyword: str, start_year: Optional[int] = None, end_year: Optional[int] = None) -> List[Dict[str, Any]]:
+    year_filter = ""
+    params: List[Any] = [keyword.lower()]
+    param_count = 2
+
+    if start_year:
+        year_filter += f"AND p.year >= ${param_count} "
+        params.append(start_year)
+        param_count += 1
+    if end_year:
+        year_filter += f"AND p.year <= ${param_count} "
+        params.append(end_year)
+        param_count += 1
+
+    query = f"""
+        MATCH (p:Paper)
+        WHERE (toLower(p.title) CONTAINS $1 
+               OR (p.keywords IS NOT NULL AND toLower(p.keywords) CONTAINS $1))
+              {year_filter}
+        RETURN p.year, count(p) as keyword_count
+        ORDER BY p.year
+        """
     try:
-        year_filter = ""
-        params = [keyword.lower()]
-        param_count = 2
-        
-        if start_year:
-            year_filter += f"AND p.year >= ${param_count} "
-            params.append(start_year)
-            param_count += 1
-        if end_year:
-            year_filter += f"AND p.year <= ${param_count} "
-            params.append(end_year)
-            param_count += 1
-            
-        result = conn.execute(f"""
-            MATCH (p:Paper)
-            WHERE (toLower(p.title) CONTAINS $1 
-                   OR (p.keywords IS NOT NULL AND toLower(p.keywords) CONTAINS $1))
-                  {year_filter}
-            RETURN p.year, count(p) as keyword_count
-            ORDER BY p.year
-            """, params)
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
+        return await _run_query(query, params)
+    except Exception:
         return []
-    return [dict(row) for row in result]
+
+
+async def 
