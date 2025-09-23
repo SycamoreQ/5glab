@@ -9,7 +9,7 @@ DB_PATH = "research_db"
 # may not be fully thread-safe. If you see odd behavior under heavy concurrency,
 # consider creating a new Connection per request or using a connection pool. //TODO 
 _db = Database(DB_PATH)
-_conn = Connection(_db)
+_conn = kuzu.AsyncConnection(_db)
 
 
 async def _run_query(query: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
@@ -469,4 +469,3 @@ async def track_keyword_temporal_trend(keyword: str, start_year: Optional[int] =
         return []
 
 
-async def 
