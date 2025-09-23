@@ -8,7 +8,9 @@ db = Database(DB_PATH)
 conn = Connection(db)
 
 
-def create_schema():
+def create_author_schema():
+    """ Create author schema"""
+
     try:
         conn.execute("""
             CREATE NODE TABLE Author (
@@ -16,6 +18,17 @@ def create_schema():
                 name STRING
             );
         """)
+        print("author schema created successfully")
+
+    except Exception as e:
+        logging.error(f"Schema creation failed: {e}")
+        print(f"Author schema creation failed: {e}")
+
+
+def create_paper_schema():
+    """Create paper schema """
+
+    try:
         conn.execute("""
             CREATE NODE TABLE Paper (
                 paper_id STRING PRIMARY KEY,
@@ -26,16 +39,57 @@ def create_schema():
                 keywords STRING[]
             );
         """)
+
+        print("paper schema created successfully")
+
+    except Exception as e: 
+        logging.error(f"Schema creation failed: {e}")
+        print(f"Paper creation schema failed: {e}")
+
+
+def wrote_relation():
+    """Create WROTE relation"""
+
+    try:
         conn.execute("""
             CREATE REL TABLE WROTE (FROM Author TO Paper);
         """)
+
+        print("relation WROTE created")
+
+    except Exception as e: 
+        logging.error(f"relation wrote creation failed: {e}")
+        print(f"relation wrote creation failed: {e}") 
+
+
+def cites_relation():
+    """"""
+    try:         
         conn.execute("""
                 CREATE REL TABLE CITES (FROM Paper TO Paper);
 
             """
         )
-        print("Schema created successfully")
+
+        print("relation CITED created successfully")
+
+    except Exception as e: 
+        logging.error(f"relation wrote creation failed: {e}")
+        print(f"relation wrote creation failed: {e}") 
+
+
+
+def similar_to_relation():
+    try:
+        conn.execute("""
+            CREATE REL TABLE IF NOT EXISTS SIMILAR_TO(
+                    FROM PAPER TO PAPER)
+                    similarity_score FLOAT
+                     """)
+        print("relation SIMILAR_TO created successfully")
+
     except Exception as e:
+        logging.error(f"relation similar_to failed to be created: {e}")
         print(f"Schema creation failed: {e}")
 
 
