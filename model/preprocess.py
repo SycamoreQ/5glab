@@ -28,7 +28,7 @@ class QueryType(str , Enum):
     TEMPORAL_TRENDS = "temporal_trends"
     COLLABORATION_NETWORK = "collaboration_network"
     KEYWORD_ANALYSIS = "keyword_analysis"
-    CUSTOM = "custom"
+    GENERAL_SEARCH = "general_search"
 
 
 
