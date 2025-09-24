@@ -22,4 +22,3 @@ def create_vector_index(conn: kuzu.Connection, table_name: str, index_name: str)
     )
     print(f"Vector index created for {table_name} table.")
 
-
