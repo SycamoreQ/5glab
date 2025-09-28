@@ -6,6 +6,7 @@ import os
 from graph.database.store import * 
 import hashlib
 import pickle
+from preprocess import AsyncResponseGenerator
 
 @dataclass
 class CacheConfig:
@@ -174,7 +175,67 @@ class QueryCache(RedisCache):
             return 0
         
 
-class CacheManager()
+class CacheManager:
+    """Manages both LLM and Query caches."""
+    
+    def __init__(self, config: CacheConfig = None):
+        self.config = config or CacheConfig()
+        self.llm_cache = LLMCache(self.config)
+        self.query_cache = QueryCache(self.config)
+    
+    async def close(self):
+        """Close both cache connections."""
+        await self.llm_cache.close()
+        await self.query_cache.close()
+    
+    async def health_check(self) -> Dict[str, bool]:
+        """Check health of both caches."""
+        try:
+            llm_redis = await self.llm_cache._get_redis()
+            query_redis = await self.query_cache._get_redis()
+            
+            llm_ok = await llm_redis.ping()
+            query_ok = await query_redis.ping()
+            
+            return {
+                "llm_cache": llm_ok,
+                "query_cache": query_ok,
+                "overall": llm_ok and query_ok
+            }
+        except Exception as e:
+            logging.error(f"Cache health check failed: {e}")
+            return {"llm_cache": False, "query_cache": False, "overall": False}
+
+
+
+def cached_prediction(cache_manager: CacheManager, module_name: str, ttl: Optional[int] = None):
+    def decorator(func: Callable):
+        async def wrapper(*args, **kwargs):
+            # Extract signature name from function
+            signature = getattr(func, '__name__', 'unknown')
+            
+            # Try to get from cache first
+            cached_result = await cache_manager.llm_cache.get_prediction(
+                module_name, signature, **kwargs
+            )
+            
+            if cached_result is not None:
+                logging.info(f"Cache hit for {module_name}:{signature}")
+                return cached_result
+            
+            # Execute function and cache result
+            result = await func(*args, **kwargs)
+            
+            # Cache the result
+            await cache_manager.llm_cache.cache_prediction(
+                module_name, signature, kwargs, result, ttl
+            )
+            logging.info(f"Cached result for {module_name}:{signature}")
+            
+            return result
+        return wrapper
+    return decorator
+
 
 
 
