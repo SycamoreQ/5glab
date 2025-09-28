@@ -2,12 +2,65 @@ import kuzu
 from kuzu import Database, Connection
 import logging
 import os   
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+import json
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import asyncio
 
 DB_PATH = "research_db"  
 db = Database(DB_PATH)
 conn = Connection(db)
 
+class ConnectionPool:
+    """Thread-safe connection pool for Kuzu database."""
+    
+    def __init__(self, db_path: str, pool_size: int = 10):
+        self.db_path = db_path
+        self.pool_size = pool_size
+        self._db = Database(db_path)
+        self._pool = []
+        self._available = threading.Semaphore(pool_size)
+        self._lock = threading.Lock()
+        self._initialized = False
+    
+    def _initialize_pool(self):
+        """Initialize the connection pool."""
+        if self._initialized:
+            return
+        
+        with self._lock:
+            if self._initialized:
+                return
+            
+            for _ in range(self.pool_size):
+                conn = kuzu.AsyncConnection(self._db)
+                self._pool.append(conn)
+            
+            self._initialized = True
+    
+    @asynccontextmanager
+    async def get_connection(self):
+        """Get a connection from the pool using context manager."""
+        if not self._initialized:
+            self._initialize_pool()
+        
+        # Wait for available connection
+        await asyncio.to_thread(self._available.acquire)
+        
+        try:
+            with self._lock:
+                conn = self._pool.pop()
+            yield conn
+        finally:
+            with self._lock:
+                self._pool.append(conn)
+            self._available.release()
 
+# Global connection pool
+_connection_pool = ConnectionPool(DB_PATH)
+    
 def create_author_schema():
     """ Create author schema"""
 
@@ -19,6 +72,7 @@ def create_author_schema():
             );
         """)
         print("author schema created successfully")
+        logging.info("Author schema created successfully")
 
     except Exception as e:
         logging.error(f"Schema creation failed: {e}")
@@ -41,6 +95,7 @@ def create_paper_schema():
         """)
 
         print("paper schema created successfully")
+        logging.info("Paper schema created successfully")
 
     except Exception as e: 
         logging.error(f"Schema creation failed: {e}")
@@ -56,6 +111,7 @@ def wrote_relation():
         """)
 
         print("relation WROTE created")
+        logging.info("relation WROTE created successfully")
 
     except Exception as e: 
         logging.error(f"relation wrote creation failed: {e}")
@@ -72,6 +128,7 @@ def cites_relation():
         )
 
         print("relation CITED created successfully")
+        logging.info("relation CITED created successfully")
 
     except Exception as e: 
         logging.error(f"relation wrote creation failed: {e}")
@@ -154,7 +211,6 @@ def load_csv_into_kuzu():
         print(f"CSV loading failed: {e}")
         return False
     
-
 
 
 #placeholder for future use
