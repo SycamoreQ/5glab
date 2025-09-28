@@ -12,7 +12,6 @@ from graph.database.store import *
 
 
 
-
 class Pipeline:
     
     def __init__(self ):
@@ -248,6 +247,4 @@ class AsyncConnectionPool:
 
 
         
-            
-
-        
+             
