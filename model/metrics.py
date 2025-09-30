@@ -1,4 +1,3 @@
-i
 import asyncio
 import time
 import json
@@ -22,6 +21,5 @@ class MetricType(str , Enum):
     ERROR_COUNT = "error_count"
     CONCURRENT_QUERIES = "concurrent_queries"
     DSPy_RESPONSE_TIME = "dsp_response_time"
-
 
 

@@ -12,7 +12,6 @@ import shutil
 import logging 
 
 
-
 @pytest.fixture(scope="session")
 def test_db_path():
     temp_dir = tempfile.mkdtemp()

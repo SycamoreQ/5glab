@@ -8,7 +8,6 @@ from dataclasses import dataclass
 import json
 from concurrent.futures import ThreadPoolExecutor
 import threading
-from graph.database.cache.redis import CacheManager , RedisCache , QueryCache
 
 DB_PATH = "research_db"
 
@@ -445,37 +444,6 @@ async def _run_query(query: str, params: Optional[List[Any]] = None) -> List[Dic
     """Backwards compatible query runner."""
     result = await _enhanced_store._execute_query(query, params)
     return result.data
-
-
-class CacheStore:
-    
-    def __init__(self , cache_manager: CacheManager): 
-        self.cache_manager = cache_manager
-        
-
-    async def _execute_cached_query(
-            self , 
-            query: str ,
-            params: Optional[List[Any]] = None,
-            ttl: Optional[int] = None
-    ): 
-        
-        params = params or []
-
-        cached_result = await self.cache_manager.query_cache.get_query_result(query , params)
-
-        if cached_result is not None: 
-            logging.info("Cache hit for query")
-            return cached_result
-        
-        result = await _run_query(query , params)
-
-        if not result.error:
-            await self.cache_manager.query_cache.cache_query_result(query , params , result , ttl)
-            logging.info("Query result cached")
-            
-
-        return result
 
 
 
