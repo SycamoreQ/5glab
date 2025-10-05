@@ -12,10 +12,14 @@ from kuzu import Database, Connection
 
 @pytest.fixture(scope="session")
 def test_db_path():
-    """Create isolated test database directory."""
-    temp_dir = tempfile.mkdtemp(prefix="test_kuzu_")
-    yield temp_dir
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    """Create isolated test database path (not directory yet)."""
+    # Create a temp directory, but use a subdirectory name for the DB
+    temp_parent = tempfile.mkdtemp(prefix="test_kuzu_parent_")
+    db_path = os.path.join(temp_parent, "test_db")
+    # Don't create db_path - let KuzuDB create it
+    yield db_path
+    # Clean up parent directory
+    shutil.rmtree(temp_parent, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
@@ -305,27 +309,6 @@ class TestRetrieval:
         assert len(papers) == 2
         years = [p.get("p.year") for p in papers]
         assert all(2020 <= y <= 2021 for y in years)
-
-
-# ============================================
-# MANUAL SETUP EXAMPLE
-# ============================================
-
-def manual_setup_example():
-    """
-    If you want to manually set up the database before running tests,
-    you can use this approach instead.
-    """
-    db_path = "test_research_db"
-    db = Database(db_path)
-    conn = Connection(db)
-    
-    # Your setup code...
-    
-    conn.close()
-    
-    # Then run: pytest with DB_PATH environment variable
-    # DB_PATH=test_research_db pytest tests/
 
 
 if __name__ == "__main__":
