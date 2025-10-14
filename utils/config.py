@@ -79,6 +79,43 @@ class BaseConfig:
         metadata={"help": "Whether to use the SciQA dataset for training."}
     )
 
+    epochs: bool = field(
+        default=3 ,
+        metadata={"help": "Number of epochs for fine-tuning."}
+    )
+
+    per_device_batch_size: int = field(
+        default= 4 , 
+        metadata={"help": "Batch size per device during training. Used for ddp"}
+    )
+
+    grad_accum_steps: int = field(
+        default=8 , 
+        metadata={"help": "Number of gradient accumulation steps."}
+    )
+
+    lr: float = field(
+        default=2e-5,
+        metadata={"help": "Learning rate for the optimizer."}
+    )
+
+    model_output_dir: str = field(
+        default="models/llama_finetuned",
+        metadata={"help": "Directory to save the fine-tuned model."}
+    )
+    
+    num_gpus: int = field(
+        default=3,
+        metadata={"help": "Number of GPUs to use for training."}
+    )
+
+    use_unsloth_fast_model: bool = field(
+        default=False,
+        metadata={"help": "Whether to use the Unsloth Fast model for fine-tuning."}
+    )
+
+    
+
     
 
     
