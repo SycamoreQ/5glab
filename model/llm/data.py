@@ -11,6 +11,9 @@ import dspy
 from utils.config import BaseConfig
 from datasets import Dataset, DatasetDict, load_dataset
 import kuzu 
+from tqdm import tqdm
+from model.llm.prompt import optimize_pipeline_with_mipro
+import pandas as pd
 
 
 class TrainingDataset: 
@@ -124,9 +127,7 @@ class TrainingDataset:
         return dataset
 
 
-        
-        
-
+    
         
 
     

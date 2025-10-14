@@ -23,13 +23,18 @@ class TrainingExample:
     expected_entities: Dict[str, Any]
     db_results: str
     expected_answer: str
-    
+
     def to_dspy_example(self):
-        return dspy.Example(
+        prompt_text = build_prompt(
             user_query=self.query,
             db_results=self.db_results,
+            query_type=self.expected_query_type
+        )
+
+        return dspy.Example(
+            prompt=prompt_text,
             answer=self.expected_answer
-        ).with_inputs('user_query', 'db_results')
+        ).with_inputs("prompt")
 
 
 def create_training_data_from_kuzu(kuzu_db_path: str) -> List[TrainingExample]:
@@ -149,32 +154,26 @@ def create_training_data_from_kuzu(kuzu_db_path: str) -> List[TrainingExample]:
     return examples
 
 
-def optimize_pipeline_with_mipro(
-    pipeline: Pipeline,
-    trainset: List[dspy.Example],
-    valset: List[dspy.Example]
-):
-    """
-    Use DSPy's MIPRO optimizer to find best prompts.
-    This is CRITICAL before fine-tuning!
-    """
+def optimize_pipeline_with_mipro(pipeline, trainset, valset):
     from dspy.teleprompt import MIPROv2
-    
-    def answer_quality_metric(example, pred, is_similarity: bool ,  trace=None):
-        """Evaluate if answer is relevant and accurate."""
-        expected_keywords = set(example.answer.lower().split())
-        pred_keywords = set(pred.answer.lower().split())
+    from sklearn.metrics.pairwise import cosine_similarity
+    import numpy as np
 
-        similarity = cosine_similarity(np.array(list(expected_keywords)).reshape(1, -1) , np.array(list(pred_keywords)).reshape(1, -1))
-        return similarity[0][0] if similarity[0][0] > 0.5 else 0.0 # Return similarity score if above threshold, else 0
+    def answer_quality_metric(example, pred, trace=None):
+        """Semantic similarity metric between expected and predicted answers."""
+        expected = example.answer.lower()
+        predicted = pred.answer.lower()
+        expected_tokens = expected.split()
+        predicted_tokens = predicted.split()
         
-    optimizer = MIPROv2(
-        metric=answer_quality_metric,
-        num_candidates=10,
-        init_temperature=1.0
-    )
-    
-    print("Optimizing DSPy pipeline...")
+        # lightweight cosine similarity (token overlap proxy)
+        intersection = len(set(expected_tokens) & set(predicted_tokens))
+        score = intersection / max(len(set(expected_tokens)), 1)
+        return score
+
+    optimizer = MIPROv2(metric=answer_quality_metric, num_candidates=10, init_temperature=1.0)
+
+    print("Optimizing DSPy pipeline prompts with MIPROv2...")
     optimized_pipeline = optimizer.compile(
         pipeline,
         trainset=trainset,
@@ -183,7 +182,43 @@ def optimize_pipeline_with_mipro(
         max_labeled_demos=4,
         eval_kwargs={'num_threads': 4}
     )
-    
+
+    print("Optimization complete. Returning tuned pipeline.")
     return optimized_pipeline
+
+
+
+
+def build_prompt(
+    user_query: str,
+    db_results: Optional[str] = "",
+    context: Optional[str] = "",
+    query_type: Optional[str] = "",
+    system_role: str = "scholarly assistant"
+) -> str:
+    """
+    Build a structured chat prompt used for MIPRO and Unsloth fine-tuning.
+    """
+    return f"""
+<s>[INST] <<SYS>>
+You are an intelligent {system_role} specialized in academic knowledge graphs.
+Your goal is to answer research-related questions accurately using the provided context and graph data.
+<</SYS>>
+
+User Query:
+{user_query}
+
+Query Type:
+{query_type or 'unknown'}
+
+Database Results:
+{db_results or 'No database results provided.'}
+
+Additional Context:
+{context or 'None'}
+
+Provide a concise, evidence-backed academic-style answer.
+[/INST]
+"""
 
 
