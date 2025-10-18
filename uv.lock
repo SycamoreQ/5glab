@@ -10,6 +10,7 @@ dependencies = [
     { name = "dspy" },
     { name = "fastapi" },
     { name = "kuzu" },
+    { name = "logger" },
     { name = "preprocess" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -23,6 +24,7 @@ requires-dist = [
     { name = "dspy", specifier = ">=3.0.3" },
     { name = "fastapi", specifier = ">=0.116.2" },
     { name = "kuzu", specifier = ">=0.11.2" },
+    { name = "logger", specifier = ">=1.4" },
     { name = "preprocess", specifier = ">=2.0.0" },
     { name = "pytest", specifier = ">=8.4.2" },
     { name = "pytest-asyncio", specifier = ">=1.2.0" },
@@ -719,6 +721,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/8c/65/71fe4851709fa4a61
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bb/dc/ff4f119cd4d783742c9648a03e0ba5c2b52fc385b2ae9f0d32acf3a78241/litellm-1.77.1-py3-none-any.whl", hash = "sha256:407761dc3c35fbcd41462d3fe65dd3ed70aac705f37cde318006c18940f695a0", size = 9067070, upload-time = "2025-09-13T21:05:18.078Z" },
 ]
+
+[[package]]
+name = "logger"
+version = "1.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/2f/b0d28eaa1e2c1cf64129f8da3fe701888d152677fec708cd0f13e8309e1e/logger-1.4.tar.gz", hash = "sha256:4ecac57133c6376fa215f0fe6b4dc4d60e4d1ad8be005cab4e8a702df682f8b3", size = 1187, upload-time = "2013-10-22T16:49:01.48Z" }
 
 [[package]]
 name = "magicattr"
