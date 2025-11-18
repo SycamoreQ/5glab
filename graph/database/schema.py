@@ -1,236 +1,121 @@
-import kuzu 
-from kuzu import Database, Connection
 import logging
-import os   
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-import json
-from concurrent.futures import ThreadPoolExecutor
-import threading
+import os
 import asyncio
+import pandas as pd
+from neo4j import GraphDatabase
 
-DB_PATH = "research_db"  
-db = Database(DB_PATH)
-conn = Connection(db)
+# MEMGRAPH CONFIGURATION
+# Default Memgraph local settings
+URI = "bolt://localhost:7687" 
+AUTH = ("", "") # Memgraph usually has no auth by default, or ("username", "password")
 
-class ConnectionPool:
-    """Thread-safe connection pool for Kuzu database."""
-    
-    def __init__(self, db_path: str, pool_size: int = 10):
-        self.db_path = db_path
-        self.pool_size = pool_size
-        self._db = Database(db_path)
-        self._pool = []
-        self._available = threading.Semaphore(pool_size)
-        self._lock = threading.Lock()
-        self._initialized = False
-    
-    def _initialize_pool(self):
-        """Initialize the connection pool."""
-        if self._initialized:
-            return
-        
-        with self._lock:
-            if self._initialized:
-                return
-            
-            for _ in range(self.pool_size):
-                conn = kuzu.AsyncConnection(self._db)
-                self._pool.append(conn)
-            
-            self._initialized = True
-    
-    @asynccontextmanager
-    async def get_connection(self):
-        """Get a connection from the pool using context manager."""
-        if not self._initialized:
-            self._initialize_pool()
-        
-        # Wait for available connection
-        await asyncio.to_thread(self._available.acquire)
-        
-        try:
-            with self._lock:
-                conn = self._pool.pop()
-            yield conn
-        finally:
-            with self._lock:
-                self._pool.append(conn)
-            self._available.release()
+# Setup synchronous driver for schema operations
+driver = GraphDatabase.driver(URI, auth=AUTH)
 
-# Global connection pool
-_connection_pool = ConnectionPool(DB_PATH)
-    
 def create_author_schema():
-    """ Create author schema"""
-
+    """Create Author constraints (Memgraph equivalent of Node Table)"""
     try:
-        conn.execute("""
-            CREATE NODE TABLE Author (
-                author_id STRING PRIMARY KEY,
-                name STRING
-            );
-        """)
-        print("author schema created successfully")
+        with driver.session() as session:
+            # Create constraint for primary key
+            session.run("CREATE CONSTRAINT ON (a:Author) ASSERT a.author_id IS UNIQUE;")
+            # Create index for name
+            session.run("CREATE INDEX ON :Author(name);")
+            
+        print("Author schema/constraints created successfully")
         logging.info("Author schema created successfully")
-
     except Exception as e:
         logging.error(f"Schema creation failed: {e}")
         print(f"Author schema creation failed: {e}")
 
-
 def create_paper_schema():
-    """Create paper schema """
-
+    """Create Paper constraints"""
     try:
-        conn.execute("""
-            CREATE NODE TABLE Paper (
-                paper_id STRING PRIMARY KEY,
-                title STRING,
-                doi STRING,
-                publication_name STRING,
-                year INT,
-                keywords STRING[]
-            );
-        """)
-
-        print("paper schema created successfully")
+        with driver.session() as session:
+            session.run("CREATE CONSTRAINT ON (p:Paper) ASSERT p.paper_id IS UNIQUE;")
+            session.run("CREATE INDEX ON :Paper(title);")
+            session.run("CREATE INDEX ON :Paper(doi);")
+            session.run("CREATE INDEX ON :Paper(year);")
+            
+        print("Paper schema/constraints created successfully")
         logging.info("Paper schema created successfully")
-
-    except Exception as e: 
+    except Exception as e:
         logging.error(f"Schema creation failed: {e}")
         print(f"Paper creation schema failed: {e}")
 
-
 def wrote_relation():
-    """Create WROTE relation"""
-
-    try:
-        conn.execute("""
-            CREATE REL TABLE WROTE (FROM Author TO Paper);
-        """)
-
-        print("relation WROTE created")
-        logging.info("relation WROTE created successfully")
-
-    except Exception as e: 
-        logging.error(f"relation wrote creation failed: {e}")
-        print(f"relation wrote creation failed: {e}") 
-
+    """Create WROTE relation - No explicit schema needed in Memgraph"""
+    # Memgraph is schema-optional for edges, but we can verify connectivity
+    print("Relation WROTE (schema-less) prepared")
+    logging.info("relation WROTE prepared")
 
 def cites_relation():
-    """"""
-    try:         
-        conn.execute("""
-                CREATE REL TABLE CITES (FROM Paper TO Paper);
-
-            """
-        )
-
-        print("relation CITED created successfully")
-        logging.info("relation CITED created successfully")
-
-    except Exception as e: 
-        logging.error(f"relation wrote creation failed: {e}")
-        print(f"relation wrote creation failed: {e}") 
-
-
+    """Create CITES relation"""
+    print("Relation CITES (schema-less) prepared")
+    logging.info("relation CITES prepared")
 
 def similar_to_relation():
-    try:
-        conn.execute("""
-            CREATE REL TABLE IF NOT EXISTS SIMILAR_TO(
-                    FROM PAPER TO PAPER)
-                    similarity_score FLOAT
-                     """)
-        print("relation SIMILAR_TO created successfully")
-
-    except Exception as e:
-        logging.error(f"relation similar_to failed to be created: {e}")
-        print(f"Schema creation failed: {e}")
-
-
+    """Create SIMILAR_TO relation"""
+    print("Relation SIMILAR_TO (schema-less) prepared")
+    logging.info("relation SIMILAR_TO prepared")
 
 def drop_schema():
-    """Drop all tables - useful for testing/resetting"""
+    """Drop all data - useful for testing/resetting"""
     try:
-        # Drop relationship tables first (due to dependencies)
-        tables_to_drop = [
-            "CITES", "WROTE",
-            "Paper", "Author"
-        ]
+        with driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
+            # Note: In Memgraph/Neo4j, constraints must be dropped separately if you want a full schema wipe,
+            # but DETACH DELETE cleans all data.
         
-        for table in tables_to_drop:
-            try:
-                conn.execute(f"DROP TABLE {table};")
-            except Exception as e:
-                # Table might not exist, continue
-                logging.warning(f"Could not drop table {table}: {e}")
-        
-        conn.commit()
-        logging.info("Schema dropped successfully")
-        print("Schema dropped successfully")
+        logging.info("Database data dropped successfully")
+        print("Database data dropped successfully")
         return True
-        
     except Exception as e:
-        conn.rollback()
         logging.error(f"Schema drop failed: {e}")
         print(f"Schema drop failed: {e}")
         return False
 
-
-
-
 def load_csv_into_kuzu():
-    """Load CSV files with proper transaction control and error handling"""
+    """
+    Load CSV files. 
+    Note: Modified to read CSV in Python and push to Memgraph via Bolt.
+    This ensures it works even if Memgraph is in Docker and can't see local files.
+    """
     try:
-        # Check if CSV files exist
-        csv_files = {
-            'authors.csv': 'Author',
-            'papers.csv': 'Paper', 
-            'wrote.csv': 'WROTE',
-            #'cited.csv': 'CITES'  Uncomment if using citations
+        files_map = {
+            'authors.csv': {'label': 'Author', 'query': "UNWIND $rows AS row MERGE (n:Author {author_id: row.author_id}) SET n += row"},
+            'papers.csv':  {'label': 'Paper',  'query': "UNWIND $rows AS row MERGE (n:Paper {paper_id: row.paper_id}) SET n.title = row.title, n.doi = row.doi, n.year = toInteger(row.year), n.publication_name = row.publication_name"},
+            'wrote.csv':   {'type': 'WROTE',   'query': "UNWIND $rows AS row MATCH (a:Author {author_id: row.from}), (p:Paper {paper_id: row.to}) MERGE (a)-[:WROTE]->(p)"},
+            # 'cited.csv': {'type': 'CITES',   'query': "UNWIND $rows AS row MATCH (p1:Paper {paper_id: row.from}), (p2:Paper {paper_id: row.to}) MERGE (p1)-[:CITES]->(p2)"}
         }
         
-        for csv_file, table_name in csv_files.items():
-            if not os.path.exists(csv_file):
-                logging.warning(f"CSV file {csv_file} not found, skipping...")
-                continue
-            
-            logging.info(f"Loading {csv_file} into {table_name}")
-            conn.execute(f"COPY {table_name} FROM '{csv_file}';")
-
-        conn.commit()
+        with driver.session() as session:
+            for filename, config in files_map.items():
+                if not os.path.exists(filename):
+                    logging.warning(f"CSV file {filename} not found, skipping...")
+                    continue
+                
+                print(f"Loading {filename}...")
+                # Read CSV using pandas
+                df = pd.read_csv(filename)
+                
+                # Replace NaN with None for Cypher compatibility
+                data = df.where(pd.notnull(df), None).to_dict('records')
+                
+                # Batch process (Memgraph handles large batches well, but 1000-5000 is safe)
+                batch_size = 2000
+                for i in range(0, len(data), batch_size):
+                    batch = data[i:i + batch_size]
+                    session.run(config['query'], rows=batch)
+                    
         logging.info("CSV data loaded successfully")
         print("CSV data loaded successfully")
         return True
     
     except Exception as e:
-        conn.rollback()
         logging.error(f"CSV loading failed: {e}")
         print(f"CSV loading failed: {e}")
         return False
-    
 
-
-#placeholder for future use
 def index_tables():
-    """Create indexes on frequently queried fields"""
-    try:
-        conn.execute("CREATE INDEX ON :Author(name);")
-        conn.execute("CREATE INDEX ON :Paper(title);")
-        conn.execute("CREATE INDEX ON :Paper(doi);")
-        conn.execute("CREATE INDEX ON :Paper(year);")
-        conn.execute("CREATE INDEX ON :Paper(keywords);")
-        conn.commit()
-        logging.info("Indexes created successfully")
-        print("Indexes created successfully")
-        return True
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"Index creation failed: {e}")
-        print(f"Index creation failed: {e}")
-        return False
-
-
-    
+    """Already handled in schema creation functions, keeping for compatibility"""
+    return True
