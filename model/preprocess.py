@@ -92,19 +92,24 @@ query_classifier_template = ChatAdapter.from_messages([
 
 
 context_retriever_template = ChatAdapter.from_messages([
-    {"role": "system", "content": "You are a context retriever that summarizes database results to provide relevant information for answering research queries."},
+    {"role": "system", "content": "You are an advanced research assistant. You analyze database results to answer user queries."},
     {"role": "user", "content": (
-        "Given the user query and the following database results, extract and summarize the most relevant information.\n\n"
-        "User Query: {user_query}\n\n"
-        "Database Results: {db_results}\n\n"
-        "Focus on information that directly addresses the query type: {query_type}.\n"
-        "Provide a concise context summary and highlight key insights."
+        "Analyze the following data to build a context for the user's question.\n\n"
+        "User Query: {user_query}\n"
+        "Query Type: {query_type}\n\n"
+        "DATA SOURCES:\n"
+        "1. Standard Search Results: Found in 'data' key.\n"
+        "2. Deep Traversal Path: Found in 'rl_deep_traversal'. These are papers/authors found by an AI agent specifically following relationships (like Citations or Authorship) relevant to the query.\n\n"
+        "INPUT DATA: {db_results}\n\n"
+        "INSTRUCTIONS:\n"
+        "- Synthesize the Standard Search results.\n"
+        "- Pay special attention to the 'Deep Traversal Path'. This represents the 'trace' of the answer in the graph. If the agent moved from Paper A to Paper B, it means they are strongly connected relevant to the intent.\n"
+        "- highlighting the relationships found."
     )},
     {"role": "assistant", "content": (
         "Context: {context}\n"
         "Key Insights: {key_insights}"
     )}
-
 ])
 
 response_generator_template = ChatAdapter.from_message([

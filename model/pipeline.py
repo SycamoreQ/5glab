@@ -2,12 +2,14 @@ import dspy
 import json 
 from typing import List , Optional , Literal , Dict 
 import logging 
+import torch 
 import os 
-import kuzu 
 from kuzu import Database , AsyncConnection
 import asyncio 
 from preprocess import * 
 from graph.database.store import * 
+from RL.ddqn import DDQLAgent
+from RL.env import RelationType
 from .preprocess import QueryClassifier , ContextRetriever , ResponseGenerator , QueryType 
 
 
@@ -20,6 +22,75 @@ class Pipeline:
         self.context_retriever = ContextRetriever()
         self.response_generator = ResponseGenerator()
 
+        self.rl_agent = DDQLAgent(state_dim=773, text_dim=384)
+        try: 
+            self.rl_agent.policy_net.load_state_dict(torch.load("ddql_navigator.pth"))
+            self.rl_agent.policy_net.eval()
+            self.rl_epsilon = 0.0
+            logging.info("RL Agent loaded successfully with epsilon set to 0.0 for inference.")
+
+        except Exception as e:
+            self.rl_agent = None
+            logging.error(f"Failed to load RL Agent: {e}")
+            raise e
+        
+
+    def _map_rl_intent(self, query_type: QueryType) -> Optional[int]:
+        mapping = {
+            QueryType.AUTHOR_PAPERS: RelationType.WROTE,
+            QueryType.PAPER_AUTHORS: RelationType.AUTHORED,
+            QueryType.CITATION_TRENDS: RelationType.CITES,
+            QueryType.TEMPORAL_TRENDS: RelationType.CITES,
+            QueryType.COLLABORATION_NETWORK: RelationType.WROTE,
+            QueryType.KEYWORD_ANALYSIS: None,
+            QueryType.GENERAL_SEARCH: None
+        }
+        return mapping.get(query_type, None)
+    
+    async def _run_retrieval_rl(self , user_query:str , intent:int) -> List[Dict[str , Any]]:
+        if not self.rl_agent:
+            logging.error("RL Agent is not initialized.")
+            return []
+        
+        if intent is None:
+            logging.info("No specific intent mapped for this query type. Skipping RL navigation.")
+            return []
+        
+        env = env(self.store)
+        collected_nodes = []
+
+        try: 
+            state = await env.reset(user_query , intent)
+            done = False
+            steps = 0
+            max_steps = 5
+
+            while not done and steps < max_steps:
+                valid_actions = await env.get_valid_actions()
+                if not valid_actions: 
+                    break 
+
+                action_tuple = self.rl_agent.act(state , valid_actions , epsilon = self.rl_epsilon)
+             
+                if not action_tuple:
+                    break   
+
+                node , relation = action_tuple
+
+                collected_nodes.append(node)
+
+                next_state , reward , done = await env.step(node , relation)
+
+                state = next_state 
+
+                steps +=1
+
+
+        except Exception as e:
+            logging.error(f"Error during RL retrieval: {e}")
+        
+        return collected_nodes 
+    
 
     async def process_query(self , user_query:str) -> List[str , Any]:
         
@@ -37,6 +108,17 @@ class Pipeline:
             entities
         )
 
+        rl_intent = self._map_rl_intent(classification.query_type)
+        rl_result = None 
+
+        if rl_intent is not None:
+            logging.info(f"Triggering RL Agent with intent: {RelationType(rl_intent).name}")
+            rl_result = await self._run_retrieval_rl(
+                user_query= user_query,
+                intent= rl_intent
+            )
+
+            db_result["rl_navigated_nodes"] = rl_result
 
         context_result = await self.context_retriever.forward(
             user_query = user_query,
@@ -57,6 +139,7 @@ class Pipeline:
             "query_classification": {
                 "type": classification.query_type,
                 "reasoning": classification.reasoning,
+                "intent_mapped": rl_intent if rl_intent is not None else "None",
                 "entities": entities
             },
             "raw_data": db_result
@@ -237,14 +320,4 @@ class AsyncConnectionPool:
             return result
         finally:
             await self.return_connection(conn)
-
-
-                
-
-
-
-
-
-
-        
-             
+          

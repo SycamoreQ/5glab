@@ -9,7 +9,6 @@ from sentence_transformers import SentenceTransformer
 import logging
 
 
-
 class QNetwork(nn.Module):
     def __init__(self, state_dim, action_emb_dim, relation_dim=5):
         super(QNetwork, self).__init__()
