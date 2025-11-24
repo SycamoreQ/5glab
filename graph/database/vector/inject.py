@@ -46,31 +46,26 @@ def fetch_and_vectorize_pdf(paper_data: Dict[str, Any]):
         logging.warning(f"No DOI for paper {paper_data['paper_id']}, skipping PDF fetch.")
         return
 
-    # 1. Download PDF
     pdf_dir = "./temp_pdfs"
     os.makedirs(pdf_dir, exist_ok=True)
     pdf_path = os.path.join(pdf_dir, f"{paper_data['paper_id']}.pdf")
     
     try:
-        # Check if already processed
         existing = vector_collection.get(where={"paper_id": paper_data['paper_id']})
         if existing and len(existing['ids']) > 0:
             print(f"Vectors already exist for {doi}, skipping.")
             return
 
         print(f"Fetching PDF for DOI: {doi}...")
-        # paperscraper tries arXiv, PubMed, etc.
         paperscraper.pdf.save_pdf({'doi': doi}, filepath=pdf_path)
         
         if not os.path.exists(pdf_path):
             logging.warning(f"Could not download PDF for {doi}")
             return
 
-        # 2. Load & Chunk
         loader = PyPDFLoader(pdf_path)
         documents = loader.load()
         
-        # Academic-optimized splitter
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
@@ -78,7 +73,6 @@ def fetch_and_vectorize_pdf(paper_data: Dict[str, Any]):
         )
         chunks = splitter.split_documents(documents)
 
-        # 3. Vector Ingest
         ids = []
         metadatas = []
         texts = []
@@ -87,7 +81,7 @@ def fetch_and_vectorize_pdf(paper_data: Dict[str, Any]):
             ids.append(f"{paper_data['paper_id']}_{i}")
             texts.append(chunk.page_content)
             metadatas.append({
-                "paper_id": paper_data['paper_id'], # CRITICAL LINK KEY
+                "paper_id": paper_data['paper_id'], 
                 "doi": doi,
                 "title": paper_data['title'],
                 "chunk_index": i
@@ -100,7 +94,6 @@ def fetch_and_vectorize_pdf(paper_data: Dict[str, Any]):
     except Exception as e:
         logging.error(f"Vectorization failed for {doi}: {e}")
     finally:
-        # Cleanup
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
     
