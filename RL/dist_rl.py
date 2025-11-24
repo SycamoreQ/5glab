@@ -6,7 +6,6 @@ import random
 import time
 import os
 from collections import deque
-
 import DDQLAgent, env, RelationType
 from graph.database.store import EnhancedStore
 
@@ -144,33 +143,25 @@ def learner_process(shared_queue, shared_model_dict, stop_event):
                     logging.info(f"Learner Step {steps}: Target Net Updated")
 
         except Exception:
-            # Queue empty or timeout, just loop
             continue
 
-    # Save final model
     torch.save(agent.policy_net.state_dict(), "distributed_ddql_navigator.pth")
     logging.info("Training finished. Model saved.")
 
 
 if __name__ == "__main__":
-    # Required for PyTorch Multiprocessing
     try:
         mp.set_start_method('spawn')
     except RuntimeError:
         pass
-
-    # Shared Data Structures
     manager = mp.Manager()
-    
-    # Queue: Workers put data here, Learner gets data here
+
     shared_queue = manager.Queue(maxsize=10000)
-    
-    # Dictionary: Learner updates weights here, Workers read from here
+
     shared_model_dict = manager.dict()
     
     stop_event = mp.Event()
-    
-    # Initialize shared dict with random weights from a fresh agent
+
     init_agent = DDQLAgent(state_dim=773, text_dim=384)
     for k, v in init_agent.policy_net.state_dict().items():
         shared_model_dict[k] = v

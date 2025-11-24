@@ -4,12 +4,9 @@ import asyncio
 import pandas as pd
 from neo4j import GraphDatabase
 
-# MEMGRAPH CONFIGURATION
-# Default Memgraph local settings
 URI = "bolt://localhost:7687" 
-AUTH = ("", "") # Memgraph usually has no auth by default, or ("username", "password")
+AUTH = ("", "")
 
-# Setup synchronous driver for schema operations
 driver = GraphDatabase.driver(URI, auth=AUTH)
 
 def create_author_schema():
@@ -85,7 +82,7 @@ def load_csv_into_kuzu():
             'authors.csv': {'label': 'Author', 'query': "UNWIND $rows AS row MERGE (n:Author {author_id: row.author_id}) SET n += row"},
             'papers.csv':  {'label': 'Paper',  'query': "UNWIND $rows AS row MERGE (n:Paper {paper_id: row.paper_id}) SET n.title = row.title, n.doi = row.doi, n.year = toInteger(row.year), n.publication_name = row.publication_name"},
             'wrote.csv':   {'type': 'WROTE',   'query': "UNWIND $rows AS row MATCH (a:Author {author_id: row.from}), (p:Paper {paper_id: row.to}) MERGE (a)-[:WROTE]->(p)"},
-            # 'cited.csv': {'type': 'CITES',   'query': "UNWIND $rows AS row MATCH (p1:Paper {paper_id: row.from}), (p2:Paper {paper_id: row.to}) MERGE (p1)-[:CITES]->(p2)"}
+            # 'cites.csv': {'type': 'CITES',   'query': "UNWIND $rows AS row MATCH (p1:Paper {paper_id: row.from}), (p2:Paper {paper_id: row.to}) MERGE (p1)-[:CITES]->(p2)"}
         }
         
         with driver.session() as session:
