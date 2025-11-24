@@ -60,7 +60,7 @@ class BaseConfig:
     )
 
     database_path: str = field(
-        default="data/kuzu/5g_graph",
+        default="data/memgraph/5g_graph",
         metadata={"help": "Path to the Kuzu graph database."}
     )
 

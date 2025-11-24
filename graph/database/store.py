@@ -405,8 +405,6 @@ async def _run_query(query: str, params: Optional[List[Any]] = None) -> List[Dic
     result = await _enhanced_store._execute_query(query, params)
     return result.data
 
-# --- Passthrough functions (kept identical to original for drop-in compatibility) ---
-
 async def get_papers_by_author(author_name: str) -> List[Dict[str, Any]]:
     return await _enhanced_store.get_papers_by_author(author_name)
 

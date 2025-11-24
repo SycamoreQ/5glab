@@ -1,18 +1,33 @@
-import csv
 import requests
-from kuzu import Database, Connection
-import os 
-
+import os
+from neo4j import GraphDatabase
+import logging
 
 API_KEY = "YOUR_ELSEVIER_API_KEY"
 BASE_URL = "https://api.elsevier.com/content/search/scopus"
 HEADERS = {"Accept": "application/json", "X-ELS-APIKey": API_KEY}
 
-# KuzuDB
-DB_PATH = "research_db"  
-db = Database(DB_PATH)
-conn = Connection(db)
 
+DB_URI = "bolt://localhost:7687" 
+DB_AUTH = ("", "")
+
+driver = GraphDatabase.driver(DB_URI, auth=DB_AUTH)
+
+def setup_schema():
+    """Create constraints to mimic Kuzu's PRIMARY KEY schema."""
+    queries = [
+        "CREATE CONSTRAINT ON (a:Author) ASSERT a.author_id IS UNIQUE;",
+        "CREATE CONSTRAINT ON (p:Paper) ASSERT p.paper_id IS UNIQUE;",
+        "CREATE INDEX ON :Paper(year);",
+        "CREATE INDEX ON :Paper(title);"
+    ]
+    with driver.session() as session:
+        for q in queries:
+            try:
+                session.run(q)
+            except Exception as e:
+                pass
+    print("Schema constraints ensured.")
 
 def fetch_papers(subject, count=10):
     url = f"{BASE_URL}?query=SUBJAREA({subject})&count={count}"
@@ -22,126 +37,121 @@ def fetch_papers(subject, count=10):
 
 def fetch_citations(scopus_id):
     """Fetch citations for a given paper using Elsevier API."""
-    url =  f"https://api.elsevier.com/content/abstract/scopus_id/{scopus_id}"
+    url = f"https://api.elsevier.com/content/abstract/scopus_id/{scopus_id}"
     headers = {"Accept": "application/json", "X-ELS-APIKey": API_KEY}
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    data = response.json()
-
-    # Extract cited references (papers this paper cites)
-    cited_refs = []
-    ref_list = data.get("abstracts-retrieval-response", {}).get("references", {}).get("reference", [])
-    for ref in ref_list:
-        ref_id = ref.get("scopus-id")
-        if ref_id:
-            cited_refs.append(ref_id)
-
-    return cited_refs
-
-
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        
+        cited_refs = []
+        ref_list = data.get("abstracts-retrieval-response", {}).get("references", {}).get("reference", [])
+        if not isinstance(ref_list, list):
+            ref_list = [ref_list]
+            
+        for ref in ref_list:
+            ref_id = ref.get("scopus-id")
+            if ref_id:
+                cited_refs.append(ref_id)
+        return cited_refs
+    except Exception as e:
+        logging.warning(f"Failed to fetch citations for {scopus_id}: {e}")
+        return []
 
 def db_is_empty():
-    """Check if Paper table has rows."""
-    try:
-        result = conn.execute("MATCH (p:Paper) RETURN COUNT(p) AS c;")
-        count = result[0]["c"]
+    """Check if Paper nodes exist."""
+    with driver.session() as session:
+        result = session.run("MATCH (p:Paper) RETURN count(p) as c")
+        count = result.single()["c"]
         return count == 0
-    except Exception:
-        return True 
 
+def clean_entry(e):
+    """Helper to clean Scopus JSON into a dict."""
+    return {
+        "paper_id": e.get("dc:identifier", "").replace("SCOPUS_ID:", ""),
+        "title": e.get("dc:title", "").replace('"', "'"),
+        "doi": e.get("prism:doi", ""),
+        "publication_name": e.get("prism:publicationName", "").replace('"', "'"),
+        "year": int(e.get("prism:coverDate", "").split("-")[0]) if e.get("prism:coverDate") else None,
+        "keywords": e.get("authkeywords", "")
+    }
 
 def bulk_load(entries):
-    """Dump JSON → CSV and use COPY FROM for first load."""
-    os.makedirs("csv_data", exist_ok=True)
-    authors_csv = "csv_data/authors.csv"
-    papers_csv = "csv_data/papers.csv"
-    wrote_csv = "csv_data/wrote.csv"
-    # cited_csv = "csv_data/cited.csv"  # For future use 
+    """
+    Load data using UNWIND (Batch Processing).
+    This is the Memgraph/Neo4j equivalent of COPY FROM CSV for client-side scripts.
+    """
+    setup_schema()
+    
+    # Pre-process data into lists of dicts
+    papers_data = []
+    authors_data = []
+    wrote_relations = []
+    
+    print(f"Preparing bulk load for {len(entries)} entries...")
 
-    with open(authors_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["author_id", "name"])
-        for e in entries:
-            authors = e.get("author", [])
-            if not isinstance(authors, list):
-                authors = [authors]
-            for a in authors:
-                if a.get("authid"):
-                    writer.writerow([a.get("authid"), a.get("authname", "")])
+    for e in entries:
+        # Prepare Paper
+        p_data = clean_entry(e)
+        papers_data.append(p_data)
+        
+        # Prepare Authors and Relationships
+        authors = e.get("author", [])
+        if not isinstance(authors, list):
+            authors = [authors]
+            
+        for a in authors:
+            auth_id = a.get("authid")
+            auth_name = a.get("authname", "")
+            if auth_id:
+                authors_data.append({"author_id": auth_id, "name": auth_name})
+                wrote_relations.append({"author_id": auth_id, "paper_id": p_data["paper_id"]})
 
-    with open(papers_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["paper_id", "title", "doi", "publication_name", "year", "keywords"])
-        for e in entries:
-            pid = e.get("dc:identifier", "").replace("SCOPUS_ID:", "")
-            title = e.get("dc:title", "").replace('"', "'")
-            doi = e.get("prism:doi", "")
-            pub = e.get("prism:publicationName", "").replace('"', "'")
-            year = e.get("prism:coverDate", "").split("-")[0] if e.get("prism:coverDate") else ""
-            keywords = e.get("authkeywords", "")
-            writer.writerow([pid, title, doi, pub, year, keywords])
+    with driver.session() as session:
+        
+        print("Inserting Papers...")
+        session.run("""
+            UNWIND $batch AS row
+            MERGE (p:Paper {paper_id: row.paper_id})
+            SET p += row
+        """, batch=papers_data)
 
-    with open(wrote_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["author_id", "paper_id"])
-        for e in entries:
-            pid = e.get("dc:identifier", "").replace("SCOPUS_ID:", "")
-            authors = e.get("author", [])
-            if not isinstance(authors, list):
-                authors = [authors]
-            for a in authors:
-                if a.get("authid"):
-                    writer.writerow([a.get("authid"), pid])
-
-    #with open(cited_csv, "w", newline="") as f:
-    #    writer = csv.writer(f)
-    #    writer.writerow(["citing_paper_id", "cited_paper_id"])
-    #    for e in entries:
-    #        citing_pid = e.get("dc:identifier", "").replace("SCOPUS_ID:", "")
-    #        cited_ids = fetch_citations(citing_pid)
-    #        for cited_id in cited_ids:
-    #            writer.writerow([citing_pid, cited_id])
-
-
-    conn.execute(f"COPY Author FROM '{authors_csv}' (HEADER=true);")
-    conn.execute(f"COPY Paper FROM '{papers_csv}' (HEADER=true);")
-    conn.execute(f"COPY WROTE FROM '{wrote_csv}' (HEADER=true);")
-    # conn.execute(f"COPY CITED FROM '{cited_csv}' (HEADER=true);") 
+        print("Inserting Authors...")
+        session.run("""
+            UNWIND $batch AS row
+            MERGE (a:Author {author_id: row.author_id})
+            SET a.name = row.name
+        """, batch=authors_data)
+        
+        print("Inserting Relationships...")
+        session.run("""
+            UNWIND $batch AS row
+            MATCH (a:Author {author_id: row.author_id})
+            MATCH (p:Paper {paper_id: row.paper_id})
+            MERGE (a)-[:WROTE]->(p)
+        """, batch=wrote_relations)
 
     print("Bulk load completed")
 
-
 def insert_incremental(entries):
-    """Insert new papers/authors with MERGE (no overwrite)."""
-    for entry in entries:
-        pid = entry.get("dc:identifier", "").replace("SCOPUS_ID:", "")
-        title = entry.get("dc:title", "").replace('"', "'")
-        doi = entry.get("prism:doi", "")
-        pub = entry.get("prism:publicationName", "").replace('"', "'")
-        year = entry.get("prism:coverDate", "").split("-")[0] if entry.get("prism:coverDate") else "NULL"
-        keywords = entry.get("authkeywords", "")
+    """Insert new papers/authors transactionally."""
+    # In Memgraph/Neo4j, we can actually reuse the bulk logic 
+    # because UNWIND works efficiently for small batches too.
+    # However, to keep your logic flow, we'll process them here.
+    
+    if not entries:
+        return
 
-        conn.execute("""
-            MERGE (p:Paper {paper_id: $pid})
-            SET p.title = $title, p.doi = $doi, p.publication_name = $pub,
-                p.year = $year, p.keywords = $keywords
-        """, {"pid": pid, "title": title, "doi": doi, "pub": pub,
-              "year": int(year) if year != "NULL" else None, "keywords": keywords})
+    bulk_load(entries)
+    print(f"Incrementally loaded {len(entries)} entries")
 
-        authors = entry.get("author", [])
-        if not isinstance(authors, list):
-            authors = [authors]
-        for a in authors:
-            aid = a.get("authid", "")
-            name = a.get("authname", "")
-            if aid:
-                conn.execute("""
-                    MERGE (a:Author {author_id: $aid})
-                    SET a.name = $name
-                """, {"aid": aid, "name": name})
-                conn.execute("""
-                    MATCH (a:Author {author_id: $aid}), (p:Paper {paper_id: $pid})
-                    MERGE (a)-[:WROTE]->(p)
-                """, {"aid": aid, "pid": pid})
-
-
+# Example Usage logic (similar to your main block)
+if __name__ == "__main__":
+    if db_is_empty():
+        print("Database empty. Fetching initial batch...")
+        data = fetch_papers("COMP", count=20)
+        bulk_load(data)
+    else:
+        print("Database has data. Fetching incremental...")
+        data = fetch_papers("COMP", count=5) # Example
+        insert_incremental(data)
