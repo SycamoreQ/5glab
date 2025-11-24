@@ -114,7 +114,15 @@ class BaseConfig:
         metadata={"help": "Whether to use the Unsloth Fast model for fine-tuning."}
     )
 
-    
+    chroma_path: str = field (
+        default = "data/chromadb/vectordb",
+        metadata= {"help:" "Directory for the chromadb vectorstore"}
+    )
+
+    embedding_model: str = field (
+        default="all-MiniLM-L6-v2",
+        metadata={"help":"Embedding model for everything that needs to be embedded"}
+    )
 
     
 
