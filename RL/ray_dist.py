@@ -105,5 +105,34 @@ class Learner:
         self.steps = 0 
 
     
-    async def run_learning(self):
-        
+def update_model(self):
+        self.storage.set_weights.remote(
+            {k: v.cpu() for k, v in self.agent.policy_net.state_dict().items()}
+        )
+
+        while True:
+            batch = ray.get(self.storage.get_batch.remote(32))
+            
+            if not batch:
+                time.sleep(1)
+                continue
+
+            self.agent.memory = batch
+            self.agent.replay()
+
+            self.steps += 1
+
+            if self.steps % 50 == 0 : 
+                self.storage.set_weights.remote(
+                    {self.k : v.cpu() for k , v in self.agent.policy.net_state_dict().items()}
+                )
+
+                print(f"Learner Step {self.steps} | Loss optimized")
+
+            if self.steps % 50 == 0: 
+                self.agent.update_target_network()
+                torch.save(
+                    self.agent.policy_net.state_dict(),
+                    f"models/ddqn_learner_checkpoint.pth"
+                )
+

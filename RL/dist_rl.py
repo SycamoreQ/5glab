@@ -6,7 +6,8 @@ import random
 import time
 import os
 from collections import deque
-import DDQLAgent, env, RelationType
+from ddqn import  DDQLAgent
+from env import AdvancedGraphTraversalEnv , RelationType
 from graph.database.store import EnhancedStore
 
 logging.basicConfig(

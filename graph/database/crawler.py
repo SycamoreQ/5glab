@@ -1,72 +1,39 @@
 import requests
 import os
-from neo4j import GraphDatabase
+import time
 import logging
+from neo4j import GraphDatabase
+from tqdm import tqdm # pip install tqdm
 
 API_KEY = "YOUR_ELSEVIER_API_KEY"
 BASE_URL = "https://api.elsevier.com/content/search/scopus"
 HEADERS = {"Accept": "application/json", "X-ELS-APIKey": API_KEY}
 
-
 DB_URI = "bolt://localhost:7687" 
 DB_AUTH = ("", "")
-
 driver = GraphDatabase.driver(DB_URI, auth=DB_AUTH)
 
 def setup_schema():
-    """Create constraints to mimic Kuzu's PRIMARY KEY schema."""
     queries = [
-        "CREATE CONSTRAINT ON (a:Author) ASSERT a.author_id IS UNIQUE;",
         "CREATE CONSTRAINT ON (p:Paper) ASSERT p.paper_id IS UNIQUE;",
-        "CREATE INDEX ON :Paper(year);",
-        "CREATE INDEX ON :Paper(title);"
+        "CREATE CONSTRAINT ON (a:Author) ASSERT a.author_id IS UNIQUE;",
+        "CREATE INDEX ON :Paper(year);"
     ]
     with driver.session() as session:
         for q in queries:
-            try:
-                session.run(q)
-            except Exception as e:
-                pass
+            try: session.run(q)
+            except: pass
     print("Schema constraints ensured.")
 
-def fetch_papers(subject, count=10):
+# --- 1. METADATA SEARCH (NODES) ---
+def fetch_papers_metadata(subject, count=20):
+    """Searches Scopus for papers to populate the graph nodes."""
+    print(f"Searching for {count} papers on '{subject}'...")
     url = f"{BASE_URL}?query=SUBJAREA({subject})&count={count}"
-    response = requests.get(url, headers=HEADERS)
-    response.raise_for_status()
-    return response.json().get("search-results", {}).get("entry", [])
-
-def fetch_citations(scopus_id):
-    """Fetch citations for a given paper using Elsevier API."""
-    url = f"https://api.elsevier.com/content/abstract/scopus_id/{scopus_id}"
-    headers = {"Accept": "application/json", "X-ELS-APIKey": API_KEY}
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        
-        cited_refs = []
-        ref_list = data.get("abstracts-retrieval-response", {}).get("references", {}).get("reference", [])
-        if not isinstance(ref_list, list):
-            ref_list = [ref_list]
-            
-        for ref in ref_list:
-            ref_id = ref.get("scopus-id")
-            if ref_id:
-                cited_refs.append(ref_id)
-        return cited_refs
-    except Exception as e:
-        logging.warning(f"Failed to fetch citations for {scopus_id}: {e}")
-        return []
-
-def db_is_empty():
-    """Check if Paper nodes exist."""
-    with driver.session() as session:
-        result = session.run("MATCH (p:Paper) RETURN count(p) as c")
-        count = result.single()["c"]
-        return count == 0
+    resp = requests.get(url, headers=HEADERS)
+    return resp.json().get("search-results", {}).get("entry", [])
 
 def clean_entry(e):
-    """Helper to clean Scopus JSON into a dict."""
     return {
         "paper_id": e.get("dc:identifier", "").replace("SCOPUS_ID:", ""),
         "title": e.get("dc:title", "").replace('"', "'"),
@@ -76,82 +43,121 @@ def clean_entry(e):
         "keywords": e.get("authkeywords", "")
     }
 
-def bulk_load(entries):
-    """
-    Load data using UNWIND (Batch Processing).
-    This is the Memgraph/Neo4j equivalent of COPY FROM CSV for client-side scripts.
-    """
+def bulk_load_metadata(entries):
     setup_schema()
-    
-    # Pre-process data into lists of dicts
     papers_data = []
     authors_data = []
     wrote_relations = []
-    
-    print(f"Preparing bulk load for {len(entries)} entries...")
 
     for e in entries:
-        # Prepare Paper
-        p_data = clean_entry(e)
-        papers_data.append(p_data)
+        p = clean_entry(e)
+        if not p['paper_id']: continue
+        papers_data.append(p)
         
-        # Prepare Authors and Relationships
+        # Authors
         authors = e.get("author", [])
-        if not isinstance(authors, list):
-            authors = [authors]
-            
+        if not isinstance(authors, list): authors = [authors]
         for a in authors:
-            auth_id = a.get("authid")
-            auth_name = a.get("authname", "")
-            if auth_id:
-                authors_data.append({"author_id": auth_id, "name": auth_name})
-                wrote_relations.append({"author_id": auth_id, "paper_id": p_data["paper_id"]})
+            if a.get("authid"):
+                authors_data.append({"author_id": a.get("authid"), "name": a.get("authname", "")})
+                wrote_relations.append({"author_id": a.get("authid"), "paper_id": p["paper_id"]})
 
     with driver.session() as session:
-        
-        print("Inserting Papers...")
-        session.run("""
-            UNWIND $batch AS row
-            MERGE (p:Paper {paper_id: row.paper_id})
-            SET p += row
-        """, batch=papers_data)
-
-        print("Inserting Authors...")
-        session.run("""
-            UNWIND $batch AS row
-            MERGE (a:Author {author_id: row.author_id})
-            SET a.name = row.name
-        """, batch=authors_data)
-        
-        print("Inserting Relationships...")
-        session.run("""
-            UNWIND $batch AS row
-            MATCH (a:Author {author_id: row.author_id})
-            MATCH (p:Paper {paper_id: row.paper_id})
-            MERGE (a)-[:WROTE]->(p)
-        """, batch=wrote_relations)
-
-    print("Bulk load completed")
-
-def insert_incremental(entries):
-    """Insert new papers/authors transactionally."""
-    # In Memgraph/Neo4j, we can actually reuse the bulk logic 
-    # because UNWIND works efficiently for small batches too.
-    # However, to keep your logic flow, we'll process them here.
+        session.run("UNWIND $batch AS row MERGE (p:Paper {paper_id: row.paper_id}) SET p += row", batch=papers_data)
+        session.run("UNWIND $batch AS row MERGE (a:Author {author_id: row.author_id}) SET a.name = row.name", batch=authors_data)
+        session.run("UNWIND $batch AS row MATCH (a:Author {author_id: row.author_id}), (p:Paper {paper_id: row.paper_id}) MERGE (a)-[:WROTE]->(p)", batch=wrote_relations)
     
-    if not entries:
-        return
+    print(f"Loaded {len(papers_data)} papers and metadata.")
 
-    bulk_load(entries)
-    print(f"Incrementally loaded {len(entries)} entries")
+def fetch_references(scopus_id):
+    """
+    Fetches the list of paper IDs that 'scopus_id' cites.
+    REQUIRES: 'view=REF' in the API call.
+    """
+    url = f"https://api.elsevier.com/content/abstract/scopus_id/{scopus_id}?view=REF"
+    try:
+        resp = requests.get(url, headers=HEADERS)
+        if resp.status_code == 429: # Rate limit
+            time.sleep(1)
+            return []
+        if resp.status_code != 200:
+            return []
+            
+        data = resp.json()
+        refs = data.get("abstracts-retrieval-response", {}).get("references", {}).get("reference", [])
+        
+        # Scopus returns a list or a single dict if only 1 ref
+        if isinstance(refs, dict): refs = [refs]
+        
+        cited_ids = []
+        for r in refs:
+            # We prefer Scopus ID, but can fallback to DOI if needed
+            if r.get("scopus-id"):
+                cited_ids.append(r.get("scopus-id"))
+        return cited_ids
+    except Exception as e:
+        logging.error(f"Error fetching refs for {scopus_id}: {e}")
+        return []
 
-# Example Usage logic (similar to your main block)
+def enrich_graph_with_citations():
+    """
+    Iterates over papers in the DB that don't have CITATION data yet.
+    Fetches their references and builds [:CITES] edges.
+    """
+    print("Starting Citation Graph Enrichment...")
+    
+    # 1. Find papers we haven't processed yet (Optimization)
+    # We can flag them or just check for papers with 0 outgoing CITES edges
+    # For now, we grab all papers in DB
+    with driver.session() as session:
+        result = session.run("MATCH (p:Paper) RETURN p.paper_id AS pid")
+        paper_ids = [record["pid"] for record in result]
+
+    print(f"Found {len(paper_ids)} papers to check for citations.")
+    
+    citations_batch = []
+    batch_size = 50
+
+    for pid in tqdm(paper_ids):
+        # Fetch who this paper cites
+        cited_pids = fetch_references(pid)
+        
+        for cited_pid in cited_pids:
+            citations_batch.append({"from": pid, "to": cited_pid})
+            
+        # Batch Insert
+        if len(citations_batch) >= batch_size:
+            _flush_citations(citations_batch)
+            citations_batch = []
+            
+    # Flush remaining
+    if citations_batch:
+        _flush_citations(citations_batch)
+
+def _flush_citations(batch):
+    """
+    Inserts CITES edges.
+    CRITICAL: Creates 'Ghost Nodes' for papers we haven't scraped yet.
+    """
+    query = """
+    UNWIND $batch AS row
+    MATCH (source:Paper {paper_id: row.from})
+    
+    // MERGE the target (Ghost Node if it doesn't exist)
+    MERGE (target:Paper {paper_id: row.to})
+    
+    // Create the edge
+    MERGE (source)-[:CITES]->(target)
+    """
+    with driver.session() as session:
+        session.run(query, batch=batch)
+
 if __name__ == "__main__":
-    if db_is_empty():
-        print("Database empty. Fetching initial batch...")
-        data = fetch_papers("COMP", count=20)
-        bulk_load(data)
-    else:
-        print("Database has data. Fetching incremental...")
-        data = fetch_papers("COMP", count=5) # Example
-        insert_incremental(data)
+    # 1. Get Nodes
+    if input("Fetch new papers? (y/n): ") == 'y':
+        data = fetch_papers_metadata("COMP", count=10)
+        bulk_load_metadata(data)
+        
+    # 2. Get Edges
+    if input("Enrich citations? (y/n): ") == 'y':
+        enrich_graph_with_citations()

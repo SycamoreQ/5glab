@@ -3,7 +3,8 @@ import logging
 import random
 import torch
 import numpy as np 
-import env, DDQLAgent , RelationType
+from ddqn import DDQLAgent 
+from env import AdvancedGraphTraversalEnv , RelationType
 from graph.database.store import EnhancedStore
 
 logging.basicConfig(level=logging.INFO)
