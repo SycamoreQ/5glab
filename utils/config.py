@@ -114,15 +114,16 @@ class BaseConfig:
         metadata={"help": "Whether to use the Unsloth Fast model for fine-tuning."}
     )
 
-    chroma_path: str = field (
-        default = "data/chromadb/vectordb",
-        metadata= {"help:" "Directory for the chromadb vectorstore"}
+    elsevier_api_key: Optional[str] = field(
+        default="c8c6a526c4eb5208a8ac9e2df12ab40f",
+        metadata={"help": "API key for Elsevier API access."}
     )
 
-    embedding_model: str = field (
-        default="all-MiniLM-L6-v2",
-        metadata={"help":"Embedding model for everything that needs to be embedded"}
+    elsevier_api_url: str = field(
+        default="https://api.elsevier.com/content/search/scopus",
+        metadata={"help": "Base URL for Elsevier API."}
     )
+    
 
     
 
