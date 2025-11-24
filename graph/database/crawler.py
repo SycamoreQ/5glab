@@ -144,13 +144,3 @@ def insert_incremental(entries):
     bulk_load(entries)
     print(f"Incrementally loaded {len(entries)} entries")
 
-# Example Usage logic (similar to your main block)
-if __name__ == "__main__":
-    if db_is_empty():
-        print("Database empty. Fetching initial batch...")
-        data = fetch_papers("COMP", count=20)
-        bulk_load(data)
-    else:
-        print("Database has data. Fetching incremental...")
-        data = fetch_papers("COMP", count=5) # Example
-        insert_incremental(data)

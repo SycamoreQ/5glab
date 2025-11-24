@@ -82,7 +82,7 @@ def load_csv_into_kuzu():
             'authors.csv': {'label': 'Author', 'query': "UNWIND $rows AS row MERGE (n:Author {author_id: row.author_id}) SET n += row"},
             'papers.csv':  {'label': 'Paper',  'query': "UNWIND $rows AS row MERGE (n:Paper {paper_id: row.paper_id}) SET n.title = row.title, n.doi = row.doi, n.year = toInteger(row.year), n.publication_name = row.publication_name"},
             'wrote.csv':   {'type': 'WROTE',   'query': "UNWIND $rows AS row MATCH (a:Author {author_id: row.from}), (p:Paper {paper_id: row.to}) MERGE (a)-[:WROTE]->(p)"},
-            # 'cites.csv': {'type': 'CITES',   'query': "UNWIND $rows AS row MATCH (p1:Paper {paper_id: row.from}), (p2:Paper {paper_id: row.to}) MERGE (p1)-[:CITES]->(p2)"}
+            'cites.csv': {'type': 'CITES',   'query': "UNWIND $rows AS row MATCH (p1:Paper {paper_id: row.from}), (p2:Paper {paper_id: row.to}) MERGE (p1)-[:CITES]->(p2)"}
         }
         
         with driver.session() as session:

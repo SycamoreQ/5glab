@@ -45,7 +45,6 @@ class AdvancedGraphTraversalEnv:
         self.current_step = 0
         
         if not start_node_id:
-            # Heuristic start
             candidates = await self.store.search_papers_by_title(query)
             if not candidates:
                 raise ValueError("No starting node found.")
@@ -62,26 +61,20 @@ class AdvancedGraphTraversalEnv:
     
         intent_vec = self._get_intent_vector(self.current_intent)
         
-        # Concatenate: [Query(384) | Node(384) | Intent(5)]
         return np.concatenate([self.query_embedding, node_emb, intent_vec])
 
     async def get_valid_actions(self) -> List[Tuple[Dict, int]]:
         paper_id = self.current_node.get('paper_id')
         
-        # Fetch different types of neighbors explicitly
-        # 1. References (Papers this paper cites)
         refs = await self.store.get_references_by_paper(paper_id)
         actions = [(n, RelationType.CITES) for n in refs]
         
-        # 2. Citations (Papers that cite this paper)
         cites = await self.store.get_citations_by_paper(paper_id)
         actions += [(n, RelationType.CITED_BY) for n in cites]
         
-        # 3. Authors
         authors = await self.store.get_authors_by_paper(self.current_node.get('title', ''))
         actions += [(n, RelationType.WROTE) for n in authors]
 
-        # Filter visited
         valid_actions = [
             (node, r_type) for node, r_type in actions 
             if node.get('paper_id') not in self.visited 
@@ -98,7 +91,7 @@ class AdvancedGraphTraversalEnv:
         if action_relation == self.current_intent:
             struct_reward = 1.0
         else:
-            struct_reward = -0.5  # Soft penalty (sometimes accidental discovery is okay, but discouraged)
+            struct_reward = -0.5  # Soft penalty 
         node_text = action_node.get('title', '') or action_node.get('name', '')
         node_emb = self.encoder.encode(node_text)
         
