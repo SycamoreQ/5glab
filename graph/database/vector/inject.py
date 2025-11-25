@@ -1,8 +1,4 @@
-import chromadb.proto
-import ray
-import io
-from pathlib import Path
-from typing import Dict, List , str , Any 
+from typing import Dict, List  , Any 
 from unstructured.partition.auto import partition
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -14,25 +10,26 @@ from chromadb.utils import embedding_functions
 import paperscraper
 import os 
 import logging
-from langchain_text_splitters import (
-    RecursiveCharacterTextSplitter,
-    CharacterTextSplitter,
-    NLTKTextSplitter,
-)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
+import tempfile
+
+chroma_path = tempfile.mkdtemp(prefix="chroma_test_")
+print("Using temp chroma path:", chroma_path)
+config = BaseConfig()
 
 
-chroma_client = chromadb.PersistentClient(path = BaseConfig.chroma_path)
+chroma_client = chromadb.PersistentClient(path = chroma_path)
 emb_fun = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name= BaseConfig.embedding_model
+    model_name= 'all-MiniLM-L6-v2'
 )
 
 
-vector_collection = chroma_client.get_collection(
-    name = "academic_papers",
-    embedding_function=emb_fun,
-    metadata ={"hnsw:space": "cosine"}
+vector_collection = chroma_client.get_or_create_collection(
+    name="academic_papers",
+    embedding_function=emb_fun
 )
+
 
 
 def fetch_and_vectorize_pdf(paper_data: Dict[str, Any]):
@@ -43,7 +40,7 @@ def fetch_and_vectorize_pdf(paper_data: Dict[str, Any]):
     """
     doi = paper_data.get("doi")
     if not doi:
-        logging.warning(f"No DOI for paper {paper_data['paper_id']}, skipping PDF fetch.")
+        logging.warning(f"No DOI for paper {paper_data.get('paper_id', 'UNKNOWN')}, skipping PDF fetch.")
         return
 
     pdf_dir = "./temp_pdfs"

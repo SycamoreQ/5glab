@@ -6,6 +6,8 @@ from typing import (
     Optional
 )
 
+from pathlib import Path
+
 
 class BaseConfig:
     
@@ -123,8 +125,16 @@ class BaseConfig:
         default="https://api.elsevier.com/content/search/scopus",
         metadata={"help": "Base URL for Elsevier API."}
     )
+
+    chroma_path: str = field(
+        default=str(Path.home() / "chroma_db"),
+        metadata={"help": "Path to ChromaDB database for vector storage."}
+    )
     
 
-    
+    embedding_model: str = field(
+        default= "all-MiniLM-L6-v2",
+        metadata={"help": "SentenceTransformer model name for embeddings."}
+    )
 
     
