@@ -7,20 +7,20 @@ from collections import deque
 from typing import List, Tuple, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 import logging
+from graph.database.store import EnhancedStore , get_citation_count , get_authors_by_paper , get_paper_by_doi , get_references_by_paper , get_paper_by_id , search_papers_by_title
 
 class RelationType:
     CITES = 0      # Outgoing: This paper cites X
-    CITED_BY = 1   # Incoming: This paper is cited by X
-    WROTE = 2      # Incoming: Author wrote this
-    AUTHORED = 3   # Outgoing: This paper was authored by X
-    SELF = 4       # The node itself
+    WROTE = 1    # Incoming: Author wrote this
+    COLLAB = 2
+    SELF = 3   # The node itself
 
 class AdvancedGraphTraversalEnv:
     """
     Goal-Conditioned Environment.
     The 'Goal' is defined by the User's Intent (e.g., "Find References").
     """
-    def __init__(self, store, embedding_model_name="all-MiniLM-L6-v2"):
+    def __init__(self, store = EnhancedStore(), embedding_model_name="all-MiniLM-L6-v2"):
         self.store = store
         self.encoder = SentenceTransformer(embedding_model_name)
         self.query_embedding = None
@@ -45,12 +45,12 @@ class AdvancedGraphTraversalEnv:
         self.current_step = 0
         
         if not start_node_id:
-            candidates = await self.store.search_papers_by_title(query)
+            candidates = await search_papers_by_title(query)
             if not candidates:
                 raise ValueError("No starting node found.")
             self.current_node = candidates[0]
         else:
-            self.current_node = await self.store.get_paper_by_id(start_node_id)
+            self.current_node = await get_paper_by_id(start_node_id)
 
         self.visited.add(self.current_node['paper_id'])
         return self._get_state()
@@ -66,10 +66,10 @@ class AdvancedGraphTraversalEnv:
     async def get_valid_actions(self) -> List[Tuple[Dict, int]]:
         paper_id = self.current_node.get('paper_id')
         
-        refs = await self.store.get_references_by_paper(paper_id)
+        refs = await get_references_by_paper(paper_id)
         actions = [(n, RelationType.CITES) for n in refs]
         
-        cites = await self.store.get_citations_by_paper(paper_id)
+        cites = await get_citation_count(paper_id)
         actions += [(n, RelationType.CITED_BY) for n in cites]
         
         authors = await self.store.get_authors_by_paper(self.current_node.get('title', ''))
