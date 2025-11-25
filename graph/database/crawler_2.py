@@ -87,14 +87,12 @@ def commit_to_neo4j(papers, author_nodes, authorships, cites_edges):
                 MERGE (p:Paper {id: row.id})
                 SET p += row.props
             """, batch=papers)
-        # Author nodes
         if author_nodes:
             session.run("""
                 UNWIND $batch AS row
                 MERGE (a:Author {id: row.id})
                 SET a.name = row.name, a.org = row.org
             """, batch=list(author_nodes.values()))
-        # WROTE edges
         if authorships:
             session.run("""
                 UNWIND $batch AS row
