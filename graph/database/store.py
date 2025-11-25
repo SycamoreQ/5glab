@@ -8,8 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from neo4j import AsyncGraphDatabase
 import threading
 
-URI = "bolt://localhost:7687"
-AUTH = ("", "") 
+URI = "neo4j://localhost:7687"
+AUTH = ("neo4j", "diam0ndman@3") 
 
 @dataclass
 class QueryResult:
@@ -375,6 +375,27 @@ class EnhancedStore:
                 "papers_processed": 0,
                 "error": str(e)
             }
+        
+
+    async def get_all_papers(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        query = "MATCH (p:Paper) RETURN p.title, p.year, p.doi, p.paper_id ORDER BY p.year DESC"
+        params: List[Any] = []
+        if limit:
+            query += " LIMIT $1"
+            params = [limit]
+        result = await self._execute_query(query, params)
+        return result.data
+    
+    async def get_all_authors(self, limit: int = 10) -> List[Dict[str, Any]]:
+        query = "MATCH (a:Author) RETURN a.name, a.author_id ORDER BY a.name"
+        params = []
+        if limit:
+            query += " LIMIT $1"
+            params = [limit]
+        result = await self._execute_query(query, params)
+        return result.data
+
+        
 
     def clear_cache(self):
         if self._cache:
@@ -434,6 +455,9 @@ async def get_paper_by_id(paper_id: str) -> Optional[Dict[str, Any]]:
     """
     rows = await _run_query(query, [paper_id])
     return rows[0] if rows else None
+
+
+
 
 async def get_paper_by_doi(doi: str) -> Optional[Dict[str, Any]]:
     query = """

@@ -4,8 +4,8 @@ import asyncio
 import pandas as pd
 from neo4j import GraphDatabase
 
-URI = "bolt://localhost:7687" 
-AUTH = ("", "")
+URI = "neo4j://localhost:7687" 
+AUTH = ("neo4j", "diam0ndman@3")
 
 driver = GraphDatabase.driver(URI, auth=AUTH)
 
