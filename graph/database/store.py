@@ -442,6 +442,10 @@ async def get_papers_by_year_range(start_year: int, end_year: int) -> List[Dict[
         WHERE p.year >= $1 AND p.year <= $2
         RETURN p.title, p.year, p.doi, p.paper_id
         ORDER BY p.year DESC
+ graph/database/vector/inject.py |   31 +-
+ model/__init__.py               |    0
+ pyproject.toml                  |    6 +
+ utils/__init__.py               |    0
     """
     return await _run_query(query, [start_year, end_year])
 
