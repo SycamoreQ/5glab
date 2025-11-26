@@ -4,7 +4,7 @@ from .crawler_2 import load_kaggle_json
 from .store import EnhancedStore
 from .vector.inject import fetch_and_vectorize_pdf
 
-KAGGLE_JSON = "/Users/kaushikmuthukumar/Downloads/dblp.v12.json"
+KAGGLE_JSON = "/home/administrator/Documents/dblp.v12.json"
 
 async def main():
     print("Step 1: Setting up Neo4j schema constraints and indexes...")
