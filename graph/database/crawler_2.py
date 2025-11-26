@@ -5,7 +5,7 @@ from tqdm import tqdm
 DB_URI = "neo4j://localhost:7687"
 DB_AUTH = ("neo4j", "diam0ndman@3") 
 driver = GraphDatabase.driver(DB_URI, auth=DB_AUTH)
-BATCH_SIZE = 2000
+BATCH_SIZE = 10000
 
 
 def index_schema():
