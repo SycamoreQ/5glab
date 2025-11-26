@@ -29,7 +29,6 @@ class RewardModel:
         citation_count = action_node.get('citation_count', 0)
         citation_score = np.log(1 + citation_count) / 10.0
 
-        # Recency
         year = action_node.get('year')
         recency = 0.0
         if year is not None:

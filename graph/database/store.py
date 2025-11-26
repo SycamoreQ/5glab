@@ -221,7 +221,6 @@ class EnhancedStore:
         params = []
         param_count = 1
         
-        # NOTE: toLower() is valid Cypher in Memgraph too
         if title_keywords:
             title_conditions = []
             for keyword in title_keywords:
@@ -335,7 +334,6 @@ class EnhancedStore:
     
     async def bulk_insert_papers(self, papers_data: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Bulk insert papers with batch processing."""
-        # Re-written to use efficient UNWIND for Memgraph
         
         query = """
         UNWIND $papers AS paper
@@ -351,7 +349,6 @@ class EnhancedStore:
         
         start_time = time.time()
         
-        # Process in chunks
         chunk_size = 100
         processed = 0
         
@@ -364,7 +361,7 @@ class EnhancedStore:
                     
             return {
                 "papers_processed": processed,
-                "queries_executed": 1, # Logical execution
+                "queries_executed": 1, 
                 "successful": processed,
                 "failed": 0,
                 "total_execution_time": time.time() - start_time
@@ -455,8 +452,6 @@ async def get_paper_by_id(paper_id: str) -> Optional[Dict[str, Any]]:
     """
     rows = await _run_query(query, [paper_id])
     return rows[0] if rows else None
-
-
 
 
 async def get_paper_by_doi(doi: str) -> Optional[Dict[str, Any]]:
@@ -696,6 +691,35 @@ async def track_keyword_citation_impact(keyword: str) -> List[Dict[str, Any]]:
         ORDER BY p.year
     """
     return await _run_query(query, [keyword.lower()])
+
+
+
+async def get_author_h_index(author_id: str) -> int:
+    query = """
+        MATCH (a:Author {author_id: $1})-[:WROTE]->(p:Paper)
+        OPTIONAL MATCH (p2:Paper)-[:CITES]->(p)
+        WITH p, count(p2) as citation_count
+        RETURN collect(citation_count) as citations
+    """
+    rows = await _run_query(query, [author_id])
+    if not rows:
+        return 0
+    citations = sorted(rows[0]['citations'], reverse=True)
+    h_index = 0
+    for i, c in enumerate(citations):
+        if c >= i + 1:
+            h_index = i + 1
+        else:
+            break
+    return h_index
+
+
+async def get_author_uni_collab_count(author_id: str) -> int:
+    query = """
+        IF (a1:Author {author_id: $1})-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
+        WHERE a1 <> a2 AND a1.university = a2.university
+        RETURN count(DISTINCT a2) as uni_collaborator_count
+        """
 
 async def track_keyword_temporal_trend(keyword: str, start_year: Optional[int] = None, end_year: Optional[int] = None) -> List[Dict[str, Any]]:
     return await _enhanced_store.track_keyword_temporal_trend(keyword, start_year, end_year)

@@ -7,13 +7,46 @@ from collections import deque
 from typing import List, Tuple, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 import logging
-from graph.database.store import EnhancedStore , get_citation_count , get_authors_by_paper , get_paper_by_doi , get_references_by_paper , get_paper_by_id , search_papers_by_title
+from graph.database.store import * 
 
 class RelationType:
     CITES = 0      # Outgoing: This paper cites X
+    CITED_BY = 1
     WROTE = 1    # Incoming: Author wrote this
     COLLAB = 2
     SELF = 3   # The node itself
+
+
+relations_dispatch = {
+    RelationType.CITES: {
+        "Paper": get_references_by_paper,
+        "Count": get_citation_count
+    },
+    
+    RelationType.CITED_BY: {
+        "Paper" : get_citations_by_paper, 
+        "Depth" : get_citation_depth, 
+        "Author" : get_papers_citing_author, 
+        
+    }, 
+
+    RelationType.WROTE: {
+        "Papers" : get_papers_by_author, 
+        "Authors" : get_authors_by_paper,
+        "Count" : get_author_collaboration_count,
+        "H_index": get_author_recency, 
+        "Coauthorship": get_author_neighbours,
+    },  
+}
+
+class ActionSpace: 
+    def __init__(self , intent: RelationType):
+        self.intent = intent
+
+    def action_space(self):
+        if self.intent == RelationType.CITES: 
+            return await get_references_by_paper(paper_id)
+
 
 class AdvancedGraphTraversalEnv:
     """
