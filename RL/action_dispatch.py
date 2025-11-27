@@ -11,6 +11,8 @@ class RelationType:
     VENUE_JUMP = 7
     OLDER_REF = 8
     NEWER_CITED_BY = 9 
+    SECOND_COLLAB = 10
+    SHARED_KEYWORD = 11 
 
 ACTION_DISPATCH: Dict[Tuple[int, str], str] = {
     # (action, node_type): 'store_function_name'
@@ -22,7 +24,9 @@ ACTION_DISPATCH: Dict[Tuple[int, str], str] = {
     (RelationType.KEYWORD_JUMP, "Paper"): "get_papers_by_keyword",
     (RelationType.VENUE_JUMP, "Paper"):"get_papers_by_venue", 
     (RelationType.OLDER_REF, "Paper"): "get_older_references", 
-    (RelationType.NEWER_CITED_BY , "Paper"): "get_newer_citations"
+    (RelationType.NEWER_CITED_BY , "Paper"): "get_newer_citations",
+    (RelationType.SECOND_COLLAB, "Author"): "get_second_degree_collaborators",
+    (RelationType.SHARED_KEYWORD , "Paper"): "shared_kewords"
 }
 
 ACTION_ARG_MAP: Dict[Tuple[int, str], str] = {
@@ -34,5 +38,7 @@ ACTION_ARG_MAP: Dict[Tuple[int, str], str] = {
     (RelationType.KEYWORD_JUMP, "Paper"): "keyword",
     (RelationType.VENUE_JUMP, "Paper") : "venue", 
     (RelationType.OLDER_REF , "Paper"): "paper_id",  
-    (RelationType.NEWER_CITED_BY , "Paper"): "paper_id"
+    (RelationType.NEWER_CITED_BY , "Paper"): "paper_id", 
+    (RelationType.SECOND_COLLAB , "Author"): "author_id", 
+    (RelationType.SHARED_KEYWORD, "Paper"): "paper_id"
 }
