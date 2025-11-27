@@ -58,13 +58,6 @@ class EnhancedStore:
         self.executor = ThreadPoolExecutor(max_workers=pool_size)
     
     def _convert_params_to_dict(self, params: List[Any]) -> Dict[str, Any]:
-        """
-        CRITICAL COMPATIBILITY LAYER:
-        Kuzu uses positional params ($1, $2).
-        Memgraph/Neo4j uses named params ($name).
-        However, to keep your query strings valid ("... WHERE name = $1"),
-        we map list [a, b] to dictionary {'1': a, '2': b}.
-        """
         if not params:
             return {}
         return {str(i+1): param for i, param in enumerate(params)}
@@ -75,8 +68,6 @@ class EnhancedStore:
         params: Optional[List[Any]] = None,
         cache_key: Optional[str] = None
     ) -> QueryResult:
-        """Enhanced query execution with timing and caching."""
-        
         params = params or []
         
         # Check cache first
@@ -439,10 +430,6 @@ async def get_papers_by_year_range(start_year: int, end_year: int) -> List[Dict[
         WHERE p.year >= $1 AND p.year <= $2
         RETURN p.title, p.year, p.doi, p.paper_id
         ORDER BY p.year DESC
- graph/database/vector/inject.py |   31 +-
- model/__init__.py               |    0
- pyproject.toml                  |    6 +
- utils/__init__.py               |    0
     """
     return await _run_query(query, [start_year, end_year])
 
@@ -731,6 +718,74 @@ async def get_collabs_by_author(author_id: str) -> List[Dict[str , Any]]:
     
     return await _run_query(query, [author_id])
 
+
+async def get_papers_by_keyword(self , keyword: str , limit = 5 , exclude_paper_id = None ) ->  List[Dict]: 
+    query = """
+            MATCH (p: Paper) 
+            WHERE toLower(p.keyword) CONTAINS toLower ($1)
+            """
+
+    params = [keyword]
+
+    if exclude_paper_id:
+        query += " AND p.paper_id <> $2 "
+        params.append(exclude_paper_id)
+    query += """
+            RETURN p.title , p.year , p.doi , p.paper_id
+            ORDER BY p.year DESC
+            LIMIT ($3)
+            """
+    return await _run_query(query , params + [limit])
+
+async def get_papers_by_venue(venue_name: str , exclude_paper_id = None , limit = 5) -> List[Dict]:
+    query = """
+            MATCH (p: Paper)
+            WHERE toLower(p.venue) CONTAINS toLower ($1)
+            """
+    
+    params = [venue_name]
+    
+    if exclude_paper_id:
+        query += """
+                RETURN p.title , p.year , p.doi , p.keyword , p.paper_id
+                ORDER BY p.year DESC 
+                LIMIT ($3)             
+                """
+        
+    return await _run_query(query , params + [limit])
+
+async def get_older_references(paper_id: str) -> List[Dict]: 
+    query = """
+            MATCH (p: Paper {paper_id: $1})-[:CITES]->(ref: Paper)
+            WHERE ref.year < p.year
+            RETURN ref.doi , ref.title , ref.publisher , ref.venue , ref.keyword
+            """
+    
+    return await _run_query(query , [paper_id])
+
+
+async def get_newer_citations(paper_id: str) -> List[Dict]:
+    query = """
+            MATCH (p: Paper{paper_id: $1})-[:CITES]->(citing:Paper)
+            WHERE citing.year > p.year 
+            RETURN citing.doi , citing.title , citing.publisher , citing.venue , citing.keyword
+            """
+    
+    return await _run_query(query  , [paper_id])
+
+
+async def get_papers_in_year_window(year: int , window:int = 2) -> List[Dict]:
+    query = """
+            MATCH (p: Paper)
+            WHERE p.year >= $1 - $2 AND p.year <= $1 + $2 
+            RETURN p.doi , p.title , p.publisher , p.venue , p.keyword  
+            """
+    
+    return await _run_query(query , [year , window])
+
+async def 
+
+    
 
 
 async def track_keyword_temporal_trend(keyword: str, start_year: Optional[int] = None, end_year: Optional[int] = None) -> List[Dict[str, Any]]:
