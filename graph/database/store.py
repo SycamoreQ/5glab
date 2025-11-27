@@ -783,7 +783,44 @@ async def get_papers_in_year_window(year: int , window:int = 2) -> List[Dict]:
     
     return await _run_query(query , [year , window])
 
-async def 
+async def get_co_cited_neighbors(paper_id: str, limit: int = 10) -> List[Dict]:
+    query = """
+            MATCH (p1:Paper {paper_id: $1})<-[:CITES]-(citing:Paper)-[:CITES]->(p2:Paper)
+            WHERE p1 <> p2
+            RETURN p2.title, p2.year, p2.doi, p2.paper_id, count(citing) as co_citation_count
+            ORDER BY co_citation_count DESC
+            LIMIT $2
+    """
+    return await _run_query(query, [paper_id, limit])
+
+
+async def get_second_deg_collab(author_id: str , limit: int = 20) -> List[Dict]:
+    query = """
+            MATCH (a1:Author{author_id: $1})-[:WROTE]->(p1:Paper)<-[:WROTE]-(a2:Author)
+            MATCH (a2)-[:WROTE]->(p2:Paper)<-[:WROTE]-(a3:Author)
+            RETURN DISTINCT a3.author_id , a3.name
+            """
+    
+    return await _run_query(query , [author_id , limit])
+
+async def shared_keywords(paper_id: str , limit: int = 50) -> List[Dict]:
+    query = """
+            MATCH (p:Paper)
+            WITH p.split(p.keyword , ';') AS KWS 
+            MATCH (other: Paper)
+            WHERE other.paper_id <> p.paper_id 
+            AND any(k IN KWS WHERE toLower(other.keyword) CONTAINS toLower(k))
+            RETURN other.doi , other.title , other.year , other.paper_id 
+            LIMIT $2
+            """
+    
+    return await _run_query(query , [paper_id , limit])
+
+
+
+
+
+
 
     
 
