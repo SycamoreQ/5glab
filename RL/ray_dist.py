@@ -33,6 +33,13 @@ class SharedStorage:
     
     def get_weights(self):
         return self.weights
+    
+    def get_batch(self , batch_size):
+        if len(self.memory) < batch_size:
+            return []
+        
+        random.sample(self.memory , batch_size)
+
 
     def size(self):
         return len(self.memory)
@@ -42,13 +49,13 @@ class SharedStorage:
 class Explorer:
     def __init__(self, worker_id):
         self.worker_id = worker_id
-        # Connect to the DB on Machine A
-        # Note: If running ON Machine A, use localhost. If elsewhere, use IP.
-        # We assume Memgraph accepts remote connections or this worker is forced to Machine A.
         self.store = EnhancedStore() 
         self.env = AdvancedGraphTraversalEnv(self.store)
         self.agent = DDQLAgent(773, 384)
         self.agent.epsilon = 0.4 + (worker_id * 0.05)
+
+    async def run_episode(self , episode_idx:int): 
+        weights = ray.get(self)
 
     async def run_exploration(self , storage_actor):
         logging.info(f"Learner {self.worker_id} started")

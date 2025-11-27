@@ -13,9 +13,7 @@ def create_author_schema():
     """Create Author constraints (Memgraph equivalent of Node Table)"""
     try:
         with driver.session() as session:
-            # Create constraint for primary key
             session.run("CREATE CONSTRAINT ON (a:Author) ASSERT a.author_id IS UNIQUE;")
-            # Create index for name
             session.run("CREATE INDEX ON :Author(name);")
             
         print("Author schema/constraints created successfully")
@@ -60,8 +58,6 @@ def drop_schema():
     try:
         with driver.session() as session:
             session.run("MATCH (n) DETACH DELETE n")
-            # Note: In Memgraph/Neo4j, constraints must be dropped separately if you want a full schema wipe,
-            # but DETACH DELETE cleans all data.
         
         logging.info("Database data dropped successfully")
         print("Database data dropped successfully")
@@ -92,13 +88,10 @@ def load_csv_into_kuzu():
                     continue
                 
                 print(f"Loading {filename}...")
-                # Read CSV using pandas
                 df = pd.read_csv(filename)
                 
-                # Replace NaN with None for Cypher compatibility
                 data = df.where(pd.notnull(df), None).to_dict('records')
-                
-                # Batch process (Memgraph handles large batches well, but 1000-5000 is safe)
+            
                 batch_size = 2000
                 for i in range(0, len(data), batch_size):
                     batch = data[i:i + batch_size]
