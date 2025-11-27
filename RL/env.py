@@ -5,47 +5,10 @@ import numpy as np
 import random
 from collections import deque
 from typing import List, Tuple, Dict, Any, Optional
-from sentence_transformers import SentenceTransformer
-import logging
 from graph.database.store import * 
-
-class RelationType:
-    CITES = 0      # Outgoing: This paper cites X
-    CITED_BY = 1
-    WROTE = 1    # Incoming: Author wrote this
-    COLLAB = 2
-    SELF = 3   # The node itself
-
-
-relations_dispatch = {
-    RelationType.CITES: {
-        "Paper": get_references_by_paper,
-        "Count": get_citation_count
-    },
-    
-    RelationType.CITED_BY: {
-        "Paper" : get_citations_by_paper, 
-        "Depth" : get_citation_depth, 
-        "Author" : get_papers_citing_author, 
-        
-    }, 
-
-    RelationType.WROTE: {
-        "Papers" : get_papers_by_author, 
-        "Authors" : get_authors_by_paper,
-        "Count" : get_author_collaboration_count,
-        "H_index": get_author_recency, 
-        "Coauthorship": get_author_neighbours,
-    },  
-}
-
-class ActionSpace: 
-    def __init__(self , intent: RelationType):
-        self.intent = intent
-
-    def action_space(self):
-        if self.intent == RelationType.CITES: 
-            return await get_references_by_paper(paper_id)
+from sentence_transformers import SentenceTransformer
+from action_dispatch import ACTION_DISPATCH, ACTION_ARG_MAP , RelationType
+import logging
 
 
 class AdvancedGraphTraversalEnv:
@@ -53,7 +16,7 @@ class AdvancedGraphTraversalEnv:
     Goal-Conditioned Environment.
     The 'Goal' is defined by the User's Intent (e.g., "Find References").
     """
-    def __init__(self, store = EnhancedStore(), embedding_model_name="all-MiniLM-L6-v2"):
+    def __init__(self, store, embedding_model_name="all-MiniLM-L6-v2"):
         self.store = store
         self.encoder = SentenceTransformer(embedding_model_name)
         self.query_embedding = None
@@ -78,12 +41,12 @@ class AdvancedGraphTraversalEnv:
         self.current_step = 0
         
         if not start_node_id:
-            candidates = await search_papers_by_title(query)
+            candidates = await self.store.search_papers_by_title(query)
             if not candidates:
                 raise ValueError("No starting node found.")
             self.current_node = candidates[0]
         else:
-            self.current_node = await get_paper_by_id(start_node_id)
+            self.current_node = await self.store.get_paper_by_id(start_node_id)
 
         self.visited.add(self.current_node['paper_id'])
         return self._get_state()
@@ -93,27 +56,33 @@ class AdvancedGraphTraversalEnv:
         node_emb = self.encoder.encode(node_text)
     
         intent_vec = self._get_intent_vector(self.current_intent)
-        
+    
         return np.concatenate([self.query_embedding, node_emb, intent_vec])
 
     async def get_valid_actions(self) -> List[Tuple[Dict, int]]:
-        paper_id = self.current_node.get('paper_id')
+        node = self.current_node
+        node_type = node.get("type", "Paper")  # Default to "Paper" if not set
+        actions = []
         
-        refs = await get_references_by_paper(paper_id)
-        actions = [(n, RelationType.CITES) for n in refs]
+        for (rel_type, src_type), store_func_name in ACTION_DISPATCH.items():
+            if src_type != node_type:
+                continue
+            func = getattr(self.store, store_func_name)
+            arg_key = ACTION_ARG_MAP[(rel_type, src_type)]
+            arg_val = node.get(arg_key)
+            if not arg_val:
+                continue
+            # Call the store function; must be awaited as it's async
+            results = await func(arg_val)
+            for res in results:
+                res["type"] = "Paper" if rel_type in {RelationType.CITES, RelationType.CITED_BY, RelationType.AUTHORED} else "Author"
+                actions.append((res, rel_type))
         
-        cites = await get_citation_count(paper_id)
-        actions += [(n, RelationType.CITED_BY) for n in cites]
-        
-        authors = await self.store.get_authors_by_paper(self.current_node.get('title', ''))
-        actions += [(n, RelationType.WROTE) for n in authors]
-
         valid_actions = [
-            (node, r_type) for node, r_type in actions 
-            if node.get('paper_id') not in self.visited 
-            and node.get('author_id') not in self.visited
+            (node, r_type) for node, r_type in actions
+            if node.get('paper_id') not in self.visited and node.get('author_id') not in self.visited
         ]
-        
+
         return valid_actions
 
     async def step(self, action_node: Dict, action_relation: int):
@@ -124,7 +93,7 @@ class AdvancedGraphTraversalEnv:
         if action_relation == self.current_intent:
             struct_reward = 1.0
         else:
-            struct_reward = -0.5  # Soft penalty 
+            struct_reward = -0.5  # Soft penalty (sometimes accidental discovery is okay, but discouraged)
         node_text = action_node.get('title', '') or action_node.get('name', '')
         node_emb = self.encoder.encode(node_text)
         

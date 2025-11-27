@@ -145,9 +145,6 @@ class EnhancedStore:
                 processed_results.append(result)
         
         return processed_results
-
-    # --- The rest of your business logic methods remain EXACTLY the same ---
-    # The _execute_query method handles the DB difference abstraction.
     
     async def get_papers_by_author(self, author_name: str) -> List[Dict[str, Any]]:
         query = """
@@ -653,8 +650,6 @@ async def get_citation_depth(paper_id: str, max_depth: int = 3) -> List[Dict[str
         RETURN end.title, end.year, end.paper_id, length(path) as depth
         ORDER BY depth, end.year DESC
     """
-    # Note: Cypher dynamic path length like 1..$2 is not always supported in parameters.
-    # Fixed to 1..3 for safety or requires string interpolation if dynamic depth needed.
     return await _run_query(query, [paper_id])
 
 async def get_co_citation_papers(paper_id: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -724,6 +719,19 @@ async def get_author_uni_collab_count(author_id: str) -> int:
         WHERE a1 <> a2 AND a1.university = a2.university
         RETURN count(DISTINCT a2) as uni_collaborator_count
         """
+    rows = await _run_query(query, [author_id])
+    return rows[0]['uni_collaborator_count'] if rows else 0
+    
+
+async def get_collabs_by_author(author_id: str) -> List[Dict[str , Any]]: 
+    query = """ 
+            MATCH (a1:Author {author_id: $1})-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
+            WHERE  a1 <> a2
+            RETURN a2.name, a2.author_id"""
+    
+    return await _run_query(query, [author_id])
+
+
 
 async def track_keyword_temporal_trend(keyword: str, start_year: Optional[int] = None, end_year: Optional[int] = None) -> List[Dict[str, Any]]:
     return await _enhanced_store.track_keyword_temporal_trend(keyword, start_year, end_year)
