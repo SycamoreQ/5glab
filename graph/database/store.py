@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from neo4j import AsyncGraphDatabase
 
-# --- CONFIGURATION ---
 URI = "neo4j://localhost:7687"
 AUTH = ("neo4j", "diam0ndman@3") 
 
@@ -37,7 +36,6 @@ class Neo4jConnectionPool:
         async with self._driver.session() as session:
             yield session
 
-# Global connection pool
 _connection_pool = Neo4jConnectionPool(URI, AUTH)
 
 class EnhancedStore:
@@ -264,7 +262,33 @@ async def get_co_cited_neighbors(paper_id: str, limit: int = 10) -> List[Dict]:
     """
     return await _run_query(query, [paper_id, limit])
 
-# --- Analytics / Stats ---
+
+async def count_prolific_publisher(paper_id: str , limit: int = 10) -> List[Dict]:
+    query = """
+            MATCH (p: Paper)
+            WHERE p.publisher as publisher
+            ORDER BY count(publisher) BY DESC 
+            """
+    
+    return await _run_query(query , [paper_id , limit])
+
+
+async def get_influence_path_papers(author_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Meta-Path Action: Finds papers cited by collaborators of the given author.
+    (Author) -[WROTE]-> (P1) <-[WROTE]- (Collaborator) -[CITES]-> (P_Influence)
+    """
+    query = """
+        MATCH (a1:Author {author_id: $1})-[:WROTE]->(:Paper)<-[:WROTE]-(collab:Author)
+        WHERE a1 <> collab
+        WITH collab
+        MATCH (collab)-[:WROTE]->(p_collab:Paper)-[:CITES]->(p_influence:Paper)
+        RETURN DISTINCT p_influence.title, p_influence.year, p_influence.doi, p_influence.paper_id
+        ORDER BY p_influence.year DESC
+        LIMIT $2
+    """
+    return await _run_query(query, [author_id, limit])
+
 
 async def get_author_uni_collab_count(author_id: str) -> int:
     query = """
@@ -285,3 +309,4 @@ async def get_all_papers(limit: Optional[int] = None) -> List[Dict[str, Any]]:
         query += " LIMIT $1"
         params = [limit]
     return await _run_query(query, params)
+
