@@ -5,7 +5,7 @@ from typing import List, Tuple, Dict, Any
 from sentence_transformers import SentenceTransformer
 from .ddqn import DDQLAgent
 from graph.database.store import EnhancedStore
-from action_dispatch import ACTION_SPACE_MAP, ACTION_VALID_SOURCE_TYPE, RelationType
+from .action_dispatch import ACTION_SPACE_MAP, ACTION_VALID_SOURCE_TYPE, RelationType
 
 class AdvancedGraphTraversalEnv:
     """
@@ -19,7 +19,6 @@ class AdvancedGraphTraversalEnv:
         self.store = EnhancedStore()
         self.current_intent = None 
         self.current_node = None
-        self.agent = DDQLAgent(self.state_dim , self.text_dim)
         self.visited = set()
         self.max_steps = 5
         self.current_step = 0
@@ -55,7 +54,7 @@ class AdvancedGraphTraversalEnv:
 
         if node_type == "Paper": 
             paper_id = node.get("paper_id")
-            citation_count = self.store._get_citation_count(paper_id)
+            citation_count = self.store.get_citation_count(paper_id)
             citation_count = citation_count[0]['count']
 
             score = np.log(citation_count)/np.log(MAX_CITATION_COUNT)
@@ -63,7 +62,7 @@ class AdvancedGraphTraversalEnv:
         
         elif node_type == "Author":
             author_id = node.get("author_id")
-            collab_count = self.store._get_collaboration_count(author_id)
+            collab_count = self.store.get_collab_count(author_id)
             collab_count = collab_count[0]['count']
 
             score = np.log1p(collab_count) / np.log1p(MAX_COLLAB_COUNT)
@@ -90,7 +89,7 @@ class AdvancedGraphTraversalEnv:
 
         
         if not start_node_id:
-            candidates = await self.store.search_papers_by_title(query)
+            candidates = await self.store.get_paper_by_title(query)
             if not candidates: raise ValueError("No starting node found.")
             self.current_node = candidates[0]
         else:
