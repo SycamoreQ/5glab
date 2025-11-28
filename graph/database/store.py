@@ -6,9 +6,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from neo4j import AsyncGraphDatabase
+import os 
 
-URI = "neo4j://localhost:7687"
-AUTH = ("neo4j", "diam0ndman@3") 
+URI = os.environ.get("NEO4J_URI", "neo4j://localhost:7687")
+AUTH = ("neo4j", "diam0ndman@3")
 
 @dataclass
 class QueryResult:
@@ -115,16 +116,13 @@ class EnhancedStore:
         result = await self._execute_query(query, params)
         return result.data
 
-# Initialize Global Store Instance
 _enhanced_store = EnhancedStore()
-
-# --- STANDALONE WRAPPERS (For Action Dispatch) ---
 
 async def _run_query(query: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
     result = await _enhanced_store._execute_query(query, params)
     return result.data
 
-# 1. Basic Getters
+# Basic Getters
 async def get_papers_by_author(author_name: str) -> List[Dict[str, Any]]:
     query = "MATCH (a:Author {name: $1})-[:WROTE]->(p:Paper) RETURN p.title, p.year, p.doi, p.paper_id ORDER BY p.year DESC"
     return await _run_query(query, [author_name])
@@ -151,7 +149,7 @@ async def get_author_by_id(author_id: str) -> Optional[Dict[str, Any]]:
     rows = await _run_query(query, [author_id])
     return rows[0] if rows else None
 
-# 2. Advanced / Action Space Functions
+# Advanced / Action Space Functions
 
 async def get_citations_by_paper(paper_id: str) -> List[Dict[str, Any]]:
     """Get papers that cite THIS paper (Incoming edges)."""
@@ -309,4 +307,12 @@ async def get_all_papers(limit: Optional[int] = None) -> List[Dict[str, Any]]:
         query += " LIMIT $1"
         params = [limit]
     return await _run_query(query, params)
+
+
+async def get_temporal_cliques(year: int , keyword: int): 
+    query = """
+            MATCH (p: Paper)
+            WHERE p.year , p.keyword
+            
+            """
 
