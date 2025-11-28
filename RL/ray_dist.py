@@ -6,13 +6,13 @@ import time
 import os 
 from collections import deque
 import numpy as np 
-from env import AdvancedGraphTraversalEnv, RelationType
-from ddqn import DDQLAgent
+from .env import AdvancedGraphTraversalEnv, RelationType
+from .ddqn import DDQLAgent
 from graph.database.store import EnhancedStore
 import random 
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any , Optional
 
-@ray.remote(resources= {"shared_storage": 1})
+@ray.remote(num_cpus = 0.1)
 class SharedStorage:
     def __init__(self):
         self.memory = deque(maxlen = 500000)
@@ -47,7 +47,7 @@ class SharedStorage:
         return len(self.memory)
     
 
-@ray.remote(num_cpus=1 , resources = {"worker_node": 0.1}) 
+@ray.remote(num_cpus=1) 
 class Explorer:
     def __init__(self, worker_id , storage_actor):
         self.worker_id = worker_id
@@ -122,7 +122,7 @@ class Explorer:
             self.agent.policy_net.load_state_dict(weights)
             self.agent.epsilon = max(0.1, 0.999**episode_idx) 
 
-        initial_query = "papers on large language models and reinforcement learning" 
+        initial_query = "Spatio-temporal adaptive fusion transformer for next POI recommendation"
         initial_intent = RelationType.CITED_BY 
         state = await self.env.reset(initial_query, initial_intent)
 
@@ -186,7 +186,7 @@ class Explorer:
         return episode_idx, total_reward , local_memory
 
 
-@ray.remote(num_gpus=1 , resources={"learner_node" : 1})
+@ray.remote(num_gpus=1)
 class Learner:
     def __init__(self , storage_actor):
         self.agent = DDQLAgent(773, 384)
@@ -222,3 +222,56 @@ class Learner:
                     self.agent.policy_net.state_dict(),
                     f"models/ddqn_learner_checkpoint.pth"
                 )
+
+
+def run_training(num_explorers: int = 4 , total_eps: int = 2000): 
+    if ray.is_initialized():
+        ray.shutdown()
+
+    context = ray.init()
+    print(f'ray initialized. Dashboard URL: {context.dashboard_url}')
+    TOTAL_EPISODES = total_eps
+    NUM_EXPLORERS = num_explorers
+
+    storage_actor = SharedStorage.remote()
+    print("storage actor created")
+
+    explorer_actors = [Explorer.remote(i, storage_actor) for i in range(NUM_EXPLORERS)]
+    print(f"{NUM_EXPLORERS} Explorer actors created.")
+    
+    learner_actor = Learner.remote(storage_actor)
+    print("learner actor created")
+
+    episode_futures = []
+
+    for episode_idx in range(1 , TOTAL_EPISODES + 1):
+        explorer_id = (episode_idx - 1)% NUM_EXPLORERS
+        explorer = explorer_actors[explorer_id]
+
+        future = explorer.run_episode.remote(episode_idx)
+        episode_futures.append(future)
+
+        
+        if episode_idx % 50 == 0:
+            print(f"Launched {episode_idx} / {TOTAL_EPISODES} episodes.")
+            
+        if episode_idx % 100 == 0:
+             time.sleep(1) 
+
+    print("\nAll exploration tasks launched. Waiting for completion")
+    
+    results = ray.get(episode_futures)
+    
+    print("\n--- Training Completed ---")
+    print(f"Total Episodes Run: {len(results)}")
+    
+    total_rewards = [r[1] for r in results if r]
+    avg_reward = sum(total_rewards) / len(total_rewards) if total_rewards else 0
+    print(f"Average Episode Reward: {avg_reward:.4f}")
+    
+    ray.shutdown()
+    print("Ray shutdown complete.")
+            
+        
+    
+    
