@@ -3,19 +3,23 @@ import numpy as np
 import logging
 from typing import List, Tuple, Dict, Any
 from sentence_transformers import SentenceTransformer
+from .ddqn import DDQLAgent
+from graph.database.store import EnhancedStore
 from action_dispatch import ACTION_SPACE_MAP, ACTION_VALID_SOURCE_TYPE, RelationType
 
 class AdvancedGraphTraversalEnv:
     """
     Hierarchical Graph Traversal Environment.
     The Agent chooses a Relation (Manager), then a Node (Worker).
-    """
+    """ 
     def __init__(self, store, embedding_model_name="all-MiniLM-L6-v2"):
         self.store = store
         self.encoder = SentenceTransformer(embedding_model_name)
         self.query_embedding = None
+        self.store = EnhancedStore()
         self.current_intent = None 
         self.current_node = None
+        self.agent = DDQLAgent(self.state_dim , self.text_dim)
         self.visited = set()
         self.max_steps = 5
         self.current_step = 0
@@ -24,7 +28,7 @@ class AdvancedGraphTraversalEnv:
         self.state_dim = self.text_dim * 2 + self.intent_dim
         self.manager_action_space = list(ACTION_SPACE_MAP.keys())
         self.current_manager_action = None
-        self.node_quality_cache = Dict[str , float] = {}
+        self.node_quality_cache: Dict[str , float] = {}
 
     def _get_intent_vector(self, intent_enum: int):
         vec = np.zeros(self.intent_dim)
@@ -178,7 +182,9 @@ class AdvancedGraphTraversalEnv:
             logging.error(f"Error executing worker action {func_name}: {e}")
             return []
 
+                
 
+                    
     async def manager_step(self, action_relation: int) -> Tuple[bool, float]:
         self.current_manager_action = action_relation
         manager_reward = 0.0 
