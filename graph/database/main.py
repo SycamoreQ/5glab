@@ -4,18 +4,17 @@ from .crawler_2 import load_kaggle_json, load_cites_edges_only
 from .store import EnhancedStore
 from .vector.inject import fetch_and_vectorize_pdf
 
-KAGGLE_JSON = "/Users/kaushikmuthukumar/Downloads/dblp.v12.json"
+KAGGLE_JSON = "/home/administrator/Documents/dblp.v12.json"
 
 async def main():
     print("Step 1: Setting up Neo4j schema constraints and indexes...")
     setup_schema()
 
     print("\nStep 2: Loading Kaggle citation network nodes/authors into Neo4j (no CITES yet)...")
-    #load_kaggle_json(KAGGLE_JSON)
+    load_kaggle_json(KAGGLE_JSON)
 
     print("\nStep 3: Loading CITES edges (references) into Neo4j...")
-    load_cites_edges_only(KAGGLE_JSON)  # This adds CITES edges in a separate pass
-
+    load_cites_edges_only(KAGGLE_JSON)  
     store = EnhancedStore()
 
     print("\nStep 4: Querying for sample author papers in DB...")

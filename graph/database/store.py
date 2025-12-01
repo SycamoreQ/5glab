@@ -783,7 +783,7 @@ async def get_papers_in_year_window(year: int , window:int = 2) -> List[Dict]:
     
     return await _run_query(query , [year , window])
 
-async def 
+
 
     
 
