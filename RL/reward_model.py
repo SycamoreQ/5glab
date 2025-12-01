@@ -45,4 +45,24 @@ class RewardModel:
             0.1 * author_impact
         )
         return reward
+    
+    def compute_reward_2(self , query , action_node , action_relation):
+        #calculate cosine sim 
+        node_text = action_node.get('title', '') or action_node.get('name', '')
+        if 'abstract' in action_node:
+            node_text += " " + action_node['abstract']
+        node_emb = self.encoder.encode(node_text)
+        query_emb = self.encoder.encode(query)
+        sim_reward = self._cosine_similarity(query_emb, node_emb)
+        
+
+        #calculate graph structural similarity
+        #2 hop reward , k-hop reward and so on..
+
+        if action_relation is RelationType.CITES or RelationType.CITED_BY : 
+            if 
+
+        
+
+        
 

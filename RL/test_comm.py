@@ -1,0 +1,250 @@
+import asyncio
+from graph.database.store import EnhancedStore
+from RL.env import AdvancedGraphTraversalEnv, RelationType
+import random
+
+
+async def test_community_rewards():
+    print("=" * 80)
+    print("COMMUNITY-AWARE REWARD SYSTEM TEST")
+    print("=" * 80)
+    
+    store = EnhancedStore()
+    env = AdvancedGraphTraversalEnv(store, use_communities=True)
+    
+    if not env.use_communities:
+        print("\n⚠ Communities not available!")
+        print("Run: python -m RL.community_detection")
+        print("This will build the community cache.")
+        return
+    
+    # Get starting paper
+    print("\n1. Fetching well-connected paper...")
+    paper = await store.get_well_connected_paper()
+    
+    if not paper:
+        print("✗ No papers found!")
+        return
+    
+    paper_id = paper.get('paper_id')
+    query_text = paper.get('title') or paper.get('original_id') or 'research'
+    
+    print(f"✓ Starting paper: {query_text[:60]}...")
+    
+    # Reset
+    state = await env.reset(query_text, RelationType.CITED_BY, start_node_id=paper_id)
+    
+    print(f"\n2. Initial community: {env.current_community}")
+    if env.use_communities and env.current_community:
+        comm_size = env.community_detector.get_community_size(env.current_community)
+        print(f"   Community size: {comm_size} nodes")
+    
+    # Run episode
+    print("\n3. Running episode with community tracking...\n")
+    print("=" * 80)
+    
+    total_reward = 0.0
+    step = 0
+    done = False
+    
+    while not done and step < 5:
+        step += 1
+        print(f"\nSTEP {step}")
+        print("-" * 80)
+        
+        # Manager
+        manager_actions = await env.get_manager_actions()
+        if not manager_actions or (len(manager_actions) == 1 and RelationType.STOP in manager_actions):
+            break
+        
+        if RelationType.STOP in manager_actions and len(manager_actions) > 1 and step < 4:
+            manager_actions.remove(RelationType.STOP)
+        
+        manager_action = random.choice(manager_actions)
+        is_terminal, manager_reward = await env.manager_step(manager_action)
+        
+        print(f"Manager reward: {manager_reward:+.4f}")
+        total_reward += manager_reward
+        
+        if is_terminal:
+            break
+        
+        # Worker
+        worker_actions = await env.get_worker_actions()
+        if not worker_actions:
+            print("No worker actions available")
+            continue
+        
+        print(f"Worker actions available: {len(worker_actions)}")
+        
+        chosen_node, _ = random.choice(worker_actions)
+        node_text = (
+            chosen_node.get('title') or 
+            chosen_node.get('name') or 
+            'Unknown'
+        )[:50]
+        
+        print(f"Chose: {node_text}...")
+        
+        # Track community before step
+        prev_community = env.current_community
+        steps_in_comm_before = env.steps_in_current_community
+        
+        next_state, worker_reward, done = await env.worker_step(chosen_node)
+        
+        # Show community change
+        new_community = env.current_community
+        
+        print(f"\nWorker reward: {worker_reward:+.4f}")
+        
+        # Show community tracking
+        if env.use_communities:
+            if new_community != prev_community:
+                print(f"  ✓ COMMUNITY SWITCH: {prev_community} → {new_community}")
+                print(f"    (Was in {prev_community} for {steps_in_comm_before} steps)")
+            else:
+                print(f"  → Staying in community: {new_community}")
+                print(f"    (Now {env.steps_in_current_community} steps in this community)")
+                
+                if env.steps_in_current_community >= env.config.STUCK_THRESHOLD:
+                    print(f"    ⚠ STUCK WARNING! ({env.steps_in_current_community} steps)")
+        
+        # Show trajectory info
+        traj = env.trajectory_history[-1]
+        print(f"  Semantic similarity: {traj['similarity']:.4f}")
+        if env.use_communities and traj['community_reward'] != 0:
+            print(f"  Community reward: {traj['community_reward']:+.4f} ({traj['community_reason']})")
+        
+        total_reward += worker_reward
+        state = next_state
+    
+    # Episode summary
+    print("\n" + "=" * 80)
+    print("EPISODE SUMMARY")
+    print("=" * 80)
+    
+    summary = env.get_episode_summary()
+    
+    print(f"\nTotal Reward: {total_reward:+.4f}")
+    print(f"Steps taken: {step}")
+    
+    if env.use_communities:
+        print(f"\nCommunity Statistics:")
+        print(f"  Unique communities visited: {summary['unique_communities_visited']}")
+        print(f"  Community switches: {summary['community_switches']}")
+        print(f"  Max steps in one community: {summary['max_steps_in_community']}")
+        print(f"  Community loops: {summary['community_loops']}")
+        print(f"  Community diversity ratio: {summary['community_diversity_ratio']:.2%}")
+    
+    print(f"\nOther Statistics:")
+    print(f"  Unique relations: {summary['unique_relation_types']}")
+    print(f"  Dead ends: {summary['dead_ends_hit']}")
+    print(f"  Revisits: {summary['revisits']}")
+    print(f"  Max similarity: {summary['max_similarity_achieved']:.4f}")
+    
+    # Show trajectory with communities
+    print(f"\n" + "=" * 80)
+    print("TRAJECTORY (with communities)")
+    print("=" * 80)
+    
+    print(f"\n{'Step':<6} {'Node':<35} {'Comm':<15} {'Sim':<6} {'Reward':<8} {'Comm Reward'}")
+    print("-" * 90)
+    
+    for i, traj in enumerate(env.trajectory_history, 1):
+        node = traj['node']
+        node_name = (node.get('title') or node.get('name') or 'Unknown')[:30]
+        comm = str(traj['community'])[:12] if traj['community'] else "N/A"
+        sim = traj['similarity']
+        reward = traj['reward']
+        comm_reward = traj['community_reward']
+        
+        print(f"{i:<6} {node_name:<35} {comm:<15} {sim:<6.3f} {reward:+8.3f} {comm_reward:+.3f}")
+    
+    # Evaluation
+    print(f"\n" + "=" * 80)
+    print("EVALUATION")
+    print("=" * 80)
+    
+    if summary['community_switches'] >= 2:
+        print("✓ Good exploration diversity (multiple communities)")
+    else:
+        print("⚠ Low exploration diversity (stuck in local area)")
+    
+    if summary['max_steps_in_community'] <= 3:
+        print("✓ Avoiding getting stuck")
+    else:
+        print(f"⚠ Got stuck in one community for {summary['max_steps_in_community']} steps")
+    
+    if summary['community_loops'] == 0:
+        print("✓ No community loops (efficient exploration)")
+    else:
+        print(f"⚠ Detected {summary['community_loops']} community loops")
+    
+    if total_reward > 3.0:
+        print("\n✓✓✓ EXCELLENT! Community-aware rewards working well! ✓✓✓")
+    elif total_reward > 0:
+        print("\n✓ Good - positive rewards")
+    else:
+        print("\n⚠ Low rewards - agent getting stuck")
+    
+    await store.pool.close()
+
+
+async def visualize_community_structure():
+    """Visualize communities in the graph."""
+    print("=" * 80)
+    print("COMMUNITY STRUCTURE VISUALIZATION")
+    print("=" * 80)
+    
+    from graph.database.comm_det import CommunityDetector
+    
+    store = EnhancedStore()
+    detector = CommunityDetector(store)
+    
+    if not detector.load_cache():
+        print("\n⚠ No community cache found!")
+        print("Run: python -m RL.community_detection")
+        return
+    
+    stats = detector.get_statistics()
+    
+    print(f"\n Overall Statistics:")
+    print(f"  Total communities: {stats['num_communities']}")
+    print(f"  Total nodes: {stats['num_nodes']}")
+    print(f"  Avg community size: {stats['avg_community_size']:.1f}")
+    print(f"  Largest community: {stats['max_community_size']} nodes")
+    print(f"  Smallest community: {stats['min_community_size']} nodes")
+    
+    # Show top communities
+    print(f"\n📈 Largest Communities:")
+    
+    sorted_comms = sorted(
+        detector.community_sizes.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )[:10]
+    
+    for i, (comm_id, size) in enumerate(sorted_comms, 1):
+        percentage = (size / stats['num_nodes']) * 100
+        print(f"  {i}. Community {comm_id}: {size} nodes ({percentage:.1f}%)")
+    
+    # Sample some community neighbors
+    print(f"\n🔗 Community Connections (sample):")
+    
+    for comm_id, _ in sorted_comms[:3]:
+        neighbors = await detector.get_community_neighbors(comm_id, limit=5)
+        print(f"\n  Community {comm_id} connects to:")
+        for neighbor_comm in neighbors:
+            neighbor_size = detector.get_community_size(neighbor_comm)
+            print(f"    → {neighbor_comm} ({neighbor_size} nodes)")
+    
+    await store.pool.close()
+
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "viz":
+        asyncio.run(visualize_community_structure())
+    else:
+        asyncio.run(test_community_rewards())

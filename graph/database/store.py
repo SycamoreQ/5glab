@@ -110,7 +110,7 @@ class EnhancedStore:
             return []
         return result.data
     
-    # CRITICAL FIX: All queries now use elementId() instead of paper_id
+    #All queries now use elementId() instead of paper_id
     
     async def get_papers_by_author(self, author_name: str) -> List[Dict[str, Any]]:
         query = """
@@ -428,3 +428,9 @@ class EnhancedStore:
         """
         rows = await self._run_query_method(query, [])
         return rows[0] if rows else None
+    
+
+    async def get_n_hop_neighbors(self , n:int) -> List[Dict]: 
+        query = """
+                MATCH 
+                """
