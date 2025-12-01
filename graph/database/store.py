@@ -362,6 +362,9 @@ class EnhancedStore:
         """
         return await self._run_query_method(query, [limit]) 
 
+
+
+
     async def get_influence_path_papers(self, author_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """
         Meta-Path Action: Finds papers cited by collaborators of the given author.
@@ -380,6 +383,7 @@ class EnhancedStore:
             LIMIT $2
         """
         return await self._run_query_method(query, [author_id, limit])
+>>>>>>> e5002b7a1318e748c31bab2abdf670c328ee3345
 
     async def get_author_uni_collab_count(self, author_id: str) -> int:
         query = """
