@@ -30,19 +30,27 @@ async def test_single_episode():
             return
     
     paper_id = paper.get('paper_id')
-    title = paper.get('title', paper.get('original_id', 'Unknown'))
+    title = paper.get('title', '')
+    original_id = paper.get('original_id', '')
     ref_count = paper.get('ref_count', 0)
     cite_count = paper.get('cite_count', 0)
     
-    print(f"✓ Starting paper: {title[:60]}...")
+    # Use actual text for display and query
+    display_text = title or original_id or paper_id or 'Unknown'
+    
+    print(f"✓ Starting paper: {display_text[:60]}...")
     print(f"  ID: {paper_id}")
+    print(f"  Title field: '{title}'")
+    print(f"  Original_id field: '{original_id}'")
     print(f"  References: {ref_count}, Citations: {cite_count}")
     
+    # Reset environment with a meaningful query
     print("\n2. Resetting environment...")
     initial_intent = RelationType.CITED_BY
     
-    query_text = paper.get('title') or paper.get('original_id') or 'machine learning'
-    print(f"  Query: {query_text[:60]}...")
+    # Use the paper's title/id as the query for semantic matching
+    query_text = title or original_id or 'machine learning research'
+    print(f"  Query text: '{query_text[:60]}...'")
     
     state = await env.reset(query_text, initial_intent, start_node_id=paper_id)
     print(f"✓ State shape: {state.shape}")
@@ -91,17 +99,20 @@ async def test_single_episode():
         if not worker_actions:
             print("✗ No worker actions!")
             continue
-        
-        # Choose random worker action
+
         chosen_node, _ = random.choice(worker_actions)
         node_text = (
             chosen_node.get('title') or 
             chosen_node.get('original_id') or 
+            chosen_node.get('paper_id') or
             'Unknown'
         )
         print(f"Worker chose: {node_text[:50]}...")
         
-        # Execute worker step
+        if node_text == 'Unknown' or not chosen_node.get('title'):
+            print(f"  DEBUG - Node fields: {list(chosen_node.keys())}")
+            print(f"  DEBUG - Sample values: {dict(list(chosen_node.items())[:3])}")
+        
         next_state, worker_reward, done = await env.worker_step(chosen_node)
         print(f"Worker reward: {worker_reward:.4f}")
         print(f"Total step reward: {manager_reward + worker_reward:.4f}")

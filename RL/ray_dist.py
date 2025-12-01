@@ -138,7 +138,6 @@ class Explorer:
             
             new_total_reward = new_sem_reward 
             
-            # Bonus for reaching final state
             if i == len(trajectory) - 1:
                 new_total_reward += 5.0 
             
@@ -156,13 +155,11 @@ class Explorer:
             
             if weights: 
                 self.agent.policy_net.load_state_dict(weights)
-                self.agent.epsilon = max(0.05, 0.995**episode_idx)  # Slower decay
+                self.agent.epsilon = max(0.05, 0.995**episode_idx)  
 
-            # Reset environment - Get a well-connected paper from database
             initial_intent = RelationType.CITED_BY
             
             try:
-                # Get a well-connected paper (has both citations and references)
                 print(f"[Explorer {self.worker_id}] Fetching a well-connected paper...")
                 paper = await self.store.get_well_connected_paper()
                 
@@ -177,7 +174,10 @@ class Explorer:
                 if not paper_id:
                     raise ValueError("Paper has no paper_id field!")
                 
-                state = await self.env.reset(paper_id, initial_intent, start_node_id=paper_id)
+                # Use the paper's title/id as query for semantic matching
+                query_text = paper.get('title') or paper.get('original_id') or 'research paper'
+                
+                state = await self.env.reset(query_text, initial_intent, start_node_id=paper_id)
                 
                 paper_title = paper.get('title', paper.get('original_id', 'Unknown'))[:60]
                 ref_count = paper.get('ref_count', 0)
@@ -185,6 +185,7 @@ class Explorer:
                 
                 print(f"[Explorer {self.worker_id}] Episode {episode_idx} started")
                 print(f"  Paper: {paper_title}...")
+                print(f"  Query: {query_text[:60]}...")
                 print(f"  Connectivity: {ref_count} refs, {cite_count} citations")
                 
             except Exception as e:
@@ -200,22 +201,19 @@ class Explorer:
             
             print(f"[Ep {episode_idx}] Starting node: {self.env.current_node.get('title', 'Unknown')[:50]}")
             
-            while not done and step_count < 10:  # Safety limit
+            while not done and step_count < 10:  
                 step_count += 1
                 
-                # MANAGER: Choose relation type
                 valid_manager_actions = await self.env.get_manager_actions()
                 
                 if not valid_manager_actions:
                     print(f"[Ep {episode_idx}] No manager actions available. Ending episode.")
                     break
                 
-                # DEBUG: Force exploration for first few steps
                 if step_count <= 2 and RelationType.STOP in valid_manager_actions:
                     if len(valid_manager_actions) > 1:
                         valid_manager_actions.remove(RelationType.STOP)
                 
-                # Epsilon-greedy for manager (simplified - just random for now)
                 manager_action_reltype = random.choice(valid_manager_actions)
 
                 is_terminal, manager_reward = await self.env.manager_step(manager_action_reltype)
@@ -232,12 +230,10 @@ class Explorer:
                     done = True 
                     break
 
-                # WORKER: Choose specific node
                 worker_actions = await self.env.get_worker_actions()
 
                 if not worker_actions:
                     print(f"[Ep {episode_idx} Step {step_count}] No worker actions available after manager chose {manager_action_reltype}. Continuing...")
-                    # Add experience with negative reward for dead-end
                     action_emb = np.zeros(self.agent.text_dim)
                     action_tuple = (action_emb, manager_action_reltype)
                     experience = (state, action_tuple, manager_reward - 0.5, state, False, [])
@@ -247,7 +243,6 @@ class Explorer:
 
                 print(f"[Ep {episode_idx} Step {step_count}] {len(worker_actions)} worker actions available")
 
-                # Worker action selection: epsilon-greedy
                 if random.random() < self.agent.epsilon:
                     chosen_node_dict, chosen_rel_type = random.choice(worker_actions)
                     selection_method = "random"
@@ -333,26 +328,21 @@ class Learner:
         """
         print("[Learner] Starting continuous learning loop...")
         
-        # Set initial weights
         await self.storage.set_weights.remote(
             {k: v.cpu() for k, v in self.agent.policy_net.state_dict().items()}
         )
 
         while True:
-            # Get batch from storage
             batch = await self.storage.get_batch.remote(self.batch_size)
             
             if not batch:
-                # Wait for more experiences
                 await asyncio.sleep(1)
                 continue
 
-            # Train on batch
             loss = self.agent.replay_batch(batch) 
 
             self.steps += 1
 
-            # Periodically sync weights to storage
             if self.steps % self.update_frequency == 0:
                 await self.storage.set_weights.remote(
                     {k: v.cpu() for k, v in self.agent.policy_net.state_dict().items()}
@@ -361,12 +351,11 @@ class Learner:
                 stats = await self.storage.get_stats.remote()
                 print(f"[Learner] Step {self.steps} | Loss: {loss:.4f} | Memory: {stats['memory_size']} | Avg Reward: {stats['avg_reward']:.4f}")
 
-            # Periodically update target network
             if self.steps % self.target_update_frequency == 0: 
                 self.agent.update_target()
                 print(f"[Learner] Step {self.steps} | Updated target network")
-                
-            # Save checkpoint periodically
+
+
             if self.steps % 500 == 0:
                 os.makedirs("models", exist_ok=True)
                 torch.save(
@@ -421,13 +410,11 @@ def run_training(num_explorers: int = 4, total_eps: int = 2000):
 
     print("\n[Main] All exploration tasks launched. Waiting for completion...")
     
-    # Wait for all episodes to complete
     results = ray.get(episode_futures)
     
     print("\n=== Training Completed ===")
     print(f"Total Episodes Run: {len(results)}")
     
-    # Calculate statistics
     total_rewards = [r[1] for r in results if r and len(r) > 1]
     if total_rewards:
         avg_reward = sum(total_rewards) / len(total_rewards)
@@ -442,18 +429,11 @@ def run_training(num_explorers: int = 4, total_eps: int = 2000):
         positive_rewards = sum(1 for r in total_rewards if r > 0)
         print(f"Episodes with positive reward: {positive_rewards} / {len(total_rewards)} ({100*positive_rewards/len(total_rewards):.1f}%)")
     
-    # Get final stats from storage
     final_stats = ray.get(storage_actor.get_stats.remote())
     print(f"\nFinal Memory Size: {final_stats['memory_size']}")
     
-    # Save final model
     print("\n[Main] Saving final model...")
     os.makedirs("models", exist_ok=True)
     
     ray.shutdown()
     print("[Main] Ray shutdown complete")
-
-
-if __name__ == "__main__":
-    # Run training with specified parameters
-    run_training(num_explorers=4, total_eps=100)  # Start with fewer episodes for testing
