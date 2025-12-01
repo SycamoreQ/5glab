@@ -12,6 +12,7 @@ class CommunityDetector:
     Detects and caches communities in the paper graph using Louvain algorithm.
     Communities are precomputed and stored for fast lookup during training.
     """
+    
     def __init__(self, store: EnhancedStore, cache_file: str = "communities.pkl"):
         self.store = store
         self.cache_file = cache_file
@@ -44,6 +45,10 @@ class CommunityDetector:
         print(f"✓ Covering {len(self.communities)} nodes")
     
     async def _build_with_cypher_gds(self, max_nodes: int):
+        """
+        Use Neo4j Graph Data Science library for fast community detection.
+        Requires GDS plugin: https://neo4j.com/docs/graph-data-science/current/
+        """
         print("Attempting to use Neo4j GDS (Graph Data Science) library...")
         
         # Check if GDS is available
@@ -157,10 +162,13 @@ class CommunityDetector:
         """
         Simple fallback: cluster by citation patterns without external libraries.
         Uses connected components and citation counts.
+        
+        IMPORTANT: Uses elementId(p) to match the format used during navigation!
         """
         print("Using simple citation-based clustering...")
         
         # Get papers with their citation counts
+        # CRITICAL: Use elementId(p) as node_id to match navigation format
         query = """
             MATCH (p:Paper)
             OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
@@ -169,11 +177,20 @@ class CommunityDetector:
                  count(DISTINCT ref) as refs, 
                  count(DISTINCT citing) as cites
             WHERE refs > 0 OR cites > 0
-            RETURN node_id, refs, cites, p.year as year
+            RETURN node_id, refs, cites, p.year as year, 
+                   COALESCE(p.title, p.id, '') as title
             LIMIT $1
         """
         
         papers = await self.store._run_query_method(query, [max_nodes])
+        
+        print(f"✓ Fetched {len(papers)} papers from database")
+        
+        if papers:
+            # Show sample to verify format
+            sample = papers[0]
+            print(f"  Sample node_id format: {sample.get('node_id')}")
+            print(f"  Sample title: {sample.get('title', 'N/A')[:50]}")
         
         # Assign communities based on citation patterns
         # Strategy: Group papers with similar citation profiles
@@ -185,24 +202,45 @@ class CommunityDetector:
             
             # Create community ID based on:
             # 1. Citation tier (low/medium/high cited)
-            # 2. Time period (decade)
+            # 2. Time period (5-year buckets)
             
-            if cites > 100:
-                cite_tier = 3  # Highly cited
-            elif cites > 10:
+            # More granular citation tiers
+            if cites >= 1000:
+                cite_tier = 5  # Extremely highly cited
+            elif cites >= 100:
+                cite_tier = 4  # Highly cited
+            elif cites >= 20:
+                cite_tier = 3  # Medium-high cited
+            elif cites >= 5:
                 cite_tier = 2  # Medium cited
             else:
                 cite_tier = 1  # Low cited
             
-            decade = (year // 10) * 10 if year else 2000
+            # 5-year time buckets for finer granularity
+            if year:
+                year_bucket = (year // 5) * 5  # 2015, 2020, 2025, etc.
+            else:
+                year_bucket = 2000
             
-            # Community ID: "{decade}_{cite_tier}"
-            comm_id = f"{decade}_{cite_tier}"
+            # Community ID: "{year_bucket}_{cite_tier}"
+            # Example: "2015_4" = papers from 2015-2019 with 100-999 citations
+            comm_id = f"{year_bucket}_{cite_tier}"
             
             self.communities[node_id] = comm_id
         
         self._calculate_community_sizes()
-        print(f"✓ Created {len(set(self.communities.values()))} citation-based communities")
+        
+        num_communities = len(set(self.communities.values()))
+        print(f"✓ Created {num_communities} citation-based communities")
+        print(f"✓ Covered {len(self.communities)} papers")
+        
+        # Show community distribution
+        if self.community_sizes:
+            sorted_sizes = sorted(self.community_sizes.items(), key=lambda x: x[1], reverse=True)[:5]
+            print(f"\n  Top 5 largest communities:")
+            for i, (comm_id, size) in enumerate(sorted_sizes, 1):
+                percentage = (size / len(self.communities)) * 100
+                print(f"    {i}. {comm_id}: {size} papers ({percentage:.1f}%)")
     
     def _calculate_community_sizes(self):
         """Calculate the size of each community."""

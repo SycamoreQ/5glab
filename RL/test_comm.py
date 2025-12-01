@@ -1,3 +1,7 @@
+"""
+Test and visualize community-aware rewards.
+"""
+
 import asyncio
 from graph.database.store import EnhancedStore
 from RL.env import AdvancedGraphTraversalEnv, RelationType
@@ -18,6 +22,12 @@ async def test_community_rewards():
         print("This will build the community cache.")
         return
     
+    # Show cache info
+    print(f"✓ Communities loaded: {len(env.community_detector.communities)} nodes in cache")
+    stats = env.community_detector.get_statistics()
+    print(f"  Number of communities: {stats['num_communities']}")
+    print(f"  Coverage: {stats['num_nodes']} nodes")
+    
     # Get starting paper
     print("\n1. Fetching well-connected paper...")
     paper = await store.get_well_connected_paper()
@@ -30,14 +40,24 @@ async def test_community_rewards():
     query_text = paper.get('title') or paper.get('original_id') or 'research'
     
     print(f"✓ Starting paper: {query_text[:60]}...")
+    print(f"  Paper ID: {paper_id}")
+    
+    # Check if starting paper has community
+    start_comm = env.community_detector.get_community(paper_id)
+    if start_comm:
+        print(f"  ✓ Paper IS in cache with community: {start_comm}")
+    else:
+        print(f"  ⚠ Paper NOT in cache (will have community: None)")
     
     # Reset
     state = await env.reset(query_text, RelationType.CITED_BY, start_node_id=paper_id)
     
-    print(f"\n2. Initial community: {env.current_community}")
+    print(f"\n2. Initial community after reset: {env.current_community}")
     if env.use_communities and env.current_community:
         comm_size = env.community_detector.get_community_size(env.current_community)
         print(f"   Community size: {comm_size} nodes")
+    elif env.current_community is None:
+        print(f"   ⚠ Starting node not in any community (not in cache)")
     
     # Run episode
     print("\n3. Running episode with community tracking...\n")
@@ -46,6 +66,9 @@ async def test_community_rewards():
     total_reward = 0.0
     step = 0
     done = False
+    
+    nodes_checked = 0
+    nodes_with_community = 0
     
     while not done and step < 5:
         step += 1
@@ -77,6 +100,21 @@ async def test_community_rewards():
         
         print(f"Worker actions available: {len(worker_actions)}")
         
+        # Check how many worker actions have communities
+        actions_with_comm = 0
+        for node, _ in worker_actions[:min(5, len(worker_actions))]:
+            node_id = node.get('paper_id') or node.get('author_id')
+            if node_id:
+                nodes_checked += 1
+                if env.community_detector.get_community(node_id):
+                    actions_with_comm += 1
+                    nodes_with_community += 1
+        
+        if actions_with_comm > 0:
+            print(f"  ✓ {actions_with_comm}/{min(5, len(worker_actions))} checked nodes have communities")
+        else:
+            print(f"  ⚠ 0/{min(5, len(worker_actions))} checked nodes have communities (not in cache)")
+        
         chosen_node, _ = random.choice(worker_actions)
         node_text = (
             chosen_node.get('title') or 
@@ -84,7 +122,12 @@ async def test_community_rewards():
             'Unknown'
         )[:50]
         
+        chosen_id = chosen_node.get('paper_id') or chosen_node.get('author_id')
+        chosen_comm = env.community_detector.get_community(chosen_id) if chosen_id else None
+        
         print(f"Chose: {node_text}...")
+        print(f"  Node ID: {chosen_id}")
+        print(f"  Pre-step community lookup: {chosen_comm if chosen_comm else '❌ NOT IN CACHE'}")
         
         # Track community before step
         prev_community = env.current_community
@@ -99,15 +142,17 @@ async def test_community_rewards():
         
         # Show community tracking
         if env.use_communities:
-            if new_community != prev_community:
+            if new_community and new_community != prev_community:
                 print(f"  ✓ COMMUNITY SWITCH: {prev_community} → {new_community}")
                 print(f"    (Was in {prev_community} for {steps_in_comm_before} steps)")
-            else:
+            elif new_community:
                 print(f"  → Staying in community: {new_community}")
                 print(f"    (Now {env.steps_in_current_community} steps in this community)")
                 
                 if env.steps_in_current_community >= env.config.STUCK_THRESHOLD:
                     print(f"    ⚠ STUCK WARNING! ({env.steps_in_current_community} steps)")
+            else:
+                print(f"  ⚠ Still no community (node not in cache)")
         
         # Show trajectory info
         traj = env.trajectory_history[-1]
@@ -117,6 +162,28 @@ async def test_community_rewards():
         
         total_reward += worker_reward
         state = next_state
+    
+    # Cache coverage analysis
+    print("\n" + "=" * 80)
+    print("CACHE COVERAGE ANALYSIS")
+    print("=" * 80)
+    
+    if nodes_checked > 0:
+        coverage_pct = (nodes_with_community / nodes_checked) * 100
+        print(f"Nodes checked: {nodes_checked}")
+        print(f"Nodes with communities: {nodes_with_community}")
+        print(f"Coverage rate: {coverage_pct:.1f}%")
+        
+        if coverage_pct < 20:
+            print(f"\n❌ PROBLEM: Very low coverage ({coverage_pct:.1f}%)")
+            print(f"   Most nodes are not in the community cache.")
+            print(f"\n💡 SOLUTION:")
+            print(f"   Rebuild cache with more nodes:")
+            print(f"   rm communities.pkl")
+            print(f"   python -m RL.community_detection")
+        elif coverage_pct < 50:
+            print(f"\n⚠ WARNING: Low coverage ({coverage_pct:.1f}%)")
+            print(f"   Consider rebuilding cache with max_nodes=100000")
     
     # Episode summary
     print("\n" + "=" * 80)
@@ -165,25 +232,29 @@ async def test_community_rewards():
     print("EVALUATION")
     print("=" * 80)
     
-    if summary['community_switches'] >= 2:
+    if summary['unique_communities_visited'] == 0:
+        print("❌ No communities tracked - nodes not in cache")
+        print("\n💡 Run diagnosis:")
+        print("   python diagnose_community_issue.py")
+    elif summary['community_switches'] >= 2:
         print("✓ Good exploration diversity (multiple communities)")
     else:
         print("⚠ Low exploration diversity (stuck in local area)")
     
     if summary['max_steps_in_community'] <= 3:
         print("✓ Avoiding getting stuck")
-    else:
+    elif summary['max_steps_in_community'] > 0:
         print(f"⚠ Got stuck in one community for {summary['max_steps_in_community']} steps")
     
     if summary['community_loops'] == 0:
         print("✓ No community loops (efficient exploration)")
-    else:
+    elif summary['community_loops'] > 0:
         print(f"⚠ Detected {summary['community_loops']} community loops")
     
-    if total_reward > 3.0:
+    if total_reward > 3.0 and summary['unique_communities_visited'] > 0:
         print("\n✓✓✓ EXCELLENT! Community-aware rewards working well! ✓✓✓")
     elif total_reward > 0:
-        print("\n✓ Good - positive rewards")
+        print("\n✓ Good - positive rewards, but communities may not be tracked")
     else:
         print("\n⚠ Low rewards - agent getting stuck")
     
@@ -196,7 +267,7 @@ async def visualize_community_structure():
     print("COMMUNITY STRUCTURE VISUALIZATION")
     print("=" * 80)
     
-    from graph.database.comm_det import CommunityDetector
+    from RL.community_detection import CommunityDetector
     
     store = EnhancedStore()
     detector = CommunityDetector(store)
@@ -208,7 +279,7 @@ async def visualize_community_structure():
     
     stats = detector.get_statistics()
     
-    print(f"\n Overall Statistics:")
+    print(f"\n📊 Overall Statistics:")
     print(f"  Total communities: {stats['num_communities']}")
     print(f"  Total nodes: {stats['num_nodes']}")
     print(f"  Avg community size: {stats['avg_community_size']:.1f}")

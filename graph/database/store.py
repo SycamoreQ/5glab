@@ -383,7 +383,6 @@ class EnhancedStore:
             LIMIT $2
         """
         return await self._run_query_method(query, [author_id, limit])
->>>>>>> e5002b7a1318e748c31bab2abdf670c328ee3345
 
     async def get_author_uni_collab_count(self, author_id: str) -> int:
         query = """
@@ -433,8 +432,3 @@ class EnhancedStore:
         rows = await self._run_query_method(query, [])
         return rows[0] if rows else None
     
-
-    async def get_n_hop_neighbors(self , n:int) -> List[Dict]: 
-        query = """
-                MATCH 
-                """
