@@ -116,15 +116,14 @@ class AdvancedGraphTraversalEnv:
         """
         Constructs state vector: [Query Embedding (384) | Node Embedding (384) | Intent (5)]
         """
-        # Get node text - use multiple fallbacks
+        # Get node text - use multiple fallbacks (no abstract in your DB)
         title = self.current_node.get('title', '')
         name = self.current_node.get('name', '')
-        abstract = self.current_node.get('abstract', '')
         doi = self.current_node.get('doi', '')
         original_id = self.current_node.get('original_id', '')
         
         # Build text representation with all available info
-        node_text = f"{title} {name} {abstract} {doi} {original_id}".strip()
+        node_text = f"{title} {name} {doi} {original_id}".strip()
         
         if not node_text or node_text == '':
             # Last resort: use paper_id itself (which is the elementId)
@@ -328,25 +327,27 @@ class AdvancedGraphTraversalEnv:
         if author_id:
             self.visited.add(author_id)
         
-        # Worker reward: semantic similarity to query
+        # Worker reward: semantic similarity to query (no abstract in DB)
         title = self.current_node.get('title', '')
         name = self.current_node.get('name', '')
-        abstract = self.current_node.get('abstract', '')
         doi = self.current_node.get('doi', '')
         original_id = self.current_node.get('original_id', '')
         
-        node_text = f"{title} {name} {abstract} {doi} {original_id}".strip()
+        # Build text with all available info
+        node_text = f"{title} {name} {doi} {original_id}".strip()
         
         if not node_text or node_text == '':
             node_text = self.current_node.get('paper_id', 'unknown_node')
         
         node_emb = self.encoder.encode(node_text if node_text else "empty")
         
+        # Cosine similarity
         sem_reward = np.dot(self.query_embedding, node_emb) / (
             np.linalg.norm(self.query_embedding) * np.linalg.norm(node_emb) + 1e-9
         )
         
-        worker_reward = float(sem_reward)  
+        # Scale semantic reward to be more significant
+        worker_reward = float(sem_reward)  # Keep raw cosine similarity (-1 to 1)
         
         # Check if done
         done = self.current_step >= self.max_steps

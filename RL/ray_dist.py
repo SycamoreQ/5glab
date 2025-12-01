@@ -40,6 +40,7 @@ class SharedStorage:
         self.episode_count += 1
         self.episode_rewards.append(reward)
         
+        # Print more informative stats
         if self.episode_count % 10 == 0:
             recent_rewards = self.episode_rewards[-10:]
             avg_recent = sum(recent_rewards) / len(recent_rewards)
@@ -85,6 +86,7 @@ class Explorer:
         best_action_tuple = None
 
         for node_dict, rel_type in worker_actions:
+            # Extract text from node - use multiple fallbacks
             node_text = (
                 node_dict.get('title') or 
                 node_dict.get('name') or 
@@ -136,6 +138,7 @@ class Explorer:
             
             new_total_reward = new_sem_reward 
             
+            # Bonus for reaching final state
             if i == len(trajectory) - 1:
                 new_total_reward += 5.0 
             
@@ -155,27 +158,34 @@ class Explorer:
                 self.agent.policy_net.load_state_dict(weights)
                 self.agent.epsilon = max(0.05, 0.995**episode_idx)  # Slower decay
 
-            # Reset environment - Get ANY valid paper from database
+            # Reset environment - Get a well-connected paper from database
             initial_intent = RelationType.CITED_BY
             
             try:
-                # Get ANY paper from the database (since paper_id field doesn't exist)
-                print(f"[Explorer {self.worker_id}] Fetching a paper from database...")
-                any_paper = await self.store.get_any_paper()
+                # Get a well-connected paper (has both citations and references)
+                print(f"[Explorer {self.worker_id}] Fetching a well-connected paper...")
+                paper = await self.store.get_well_connected_paper()
                 
-                if not any_paper:
+                if not paper:
+                    print(f"[Explorer {self.worker_id}] No well-connected papers, using any paper...")
+                    paper = await self.store.get_any_paper()
+                
+                if not paper:
                     raise ValueError("Database has no papers!")
                 
-                paper_id = any_paper.get('paper_id')
+                paper_id = paper.get('paper_id')
                 if not paper_id:
                     raise ValueError("Paper has no paper_id field!")
                 
                 state = await self.env.reset(paper_id, initial_intent, start_node_id=paper_id)
                 
-                paper_title = any_paper.get('title', 'Unknown')[:60]
+                paper_title = paper.get('title', paper.get('original_id', 'Unknown'))[:60]
+                ref_count = paper.get('ref_count', 0)
+                cite_count = paper.get('cite_count', 0)
+                
                 print(f"[Explorer {self.worker_id}] Episode {episode_idx} started")
                 print(f"  Paper: {paper_title}...")
-                print(f"  ID: {paper_id}")
+                print(f"  Connectivity: {ref_count} refs, {cite_count} citations")
                 
             except Exception as e:
                 print(f"[Explorer {self.worker_id}] Failed to initialize: {e}")
@@ -213,6 +223,7 @@ class Explorer:
                 print(f"[Ep {episode_idx} Step {step_count}] Manager chose: {manager_action_reltype} | Reward: {manager_reward:.4f} | Terminal: {is_terminal}")
                 
                 if is_terminal: 
+                    # Create terminal experience
                     action_emb = np.zeros(self.agent.text_dim)
                     action_tuple = (action_emb, manager_action_reltype)
                     experience = (state, action_tuple, manager_reward, state, True, [])
@@ -221,10 +232,12 @@ class Explorer:
                     done = True 
                     break
 
+                # WORKER: Choose specific node
                 worker_actions = await self.env.get_worker_actions()
 
                 if not worker_actions:
                     print(f"[Ep {episode_idx} Step {step_count}] No worker actions available after manager chose {manager_action_reltype}. Continuing...")
+                    # Add experience with negative reward for dead-end
                     action_emb = np.zeros(self.agent.text_dim)
                     action_tuple = (action_emb, manager_action_reltype)
                     experience = (state, action_tuple, manager_reward - 0.5, state, False, [])
@@ -326,12 +339,15 @@ class Learner:
         )
 
         while True:
+            # Get batch from storage
             batch = await self.storage.get_batch.remote(self.batch_size)
             
             if not batch:
+                # Wait for more experiences
                 await asyncio.sleep(1)
                 continue
 
+            # Train on batch
             loss = self.agent.replay_batch(batch) 
 
             self.steps += 1
@@ -345,10 +361,12 @@ class Learner:
                 stats = await self.storage.get_stats.remote()
                 print(f"[Learner] Step {self.steps} | Loss: {loss:.4f} | Memory: {stats['memory_size']} | Avg Reward: {stats['avg_reward']:.4f}")
 
+            # Periodically update target network
             if self.steps % self.target_update_frequency == 0: 
                 self.agent.update_target()
                 print(f"[Learner] Step {self.steps} | Updated target network")
                 
+            # Save checkpoint periodically
             if self.steps % 500 == 0:
                 os.makedirs("models", exist_ok=True)
                 torch.save(
@@ -384,6 +402,7 @@ def run_training(num_explorers: int = 4, total_eps: int = 2000):
     learner_future = learner_actor.update_model.remote()  # Start learning loop in background
     print("[Main] Learner actor created and started")
 
+    # Launch episodes
     episode_futures = []
 
     for episode_idx in range(1, TOTAL_EPISODES + 1):
@@ -396,16 +415,19 @@ def run_training(num_explorers: int = 4, total_eps: int = 2000):
         if episode_idx % 50 == 0:
             print(f"[Main] Launched {episode_idx} / {TOTAL_EPISODES} episodes")
             
+        # Rate limiting to avoid overwhelming the system
         if episode_idx % 100 == 0:
             time.sleep(2)
 
     print("\n[Main] All exploration tasks launched. Waiting for completion...")
     
+    # Wait for all episodes to complete
     results = ray.get(episode_futures)
     
     print("\n=== Training Completed ===")
     print(f"Total Episodes Run: {len(results)}")
     
+    # Calculate statistics
     total_rewards = [r[1] for r in results if r and len(r) > 1]
     if total_rewards:
         avg_reward = sum(total_rewards) / len(total_rewards)
@@ -416,6 +438,7 @@ def run_training(num_explorers: int = 4, total_eps: int = 2000):
         print(f"Max Episode Reward: {max_reward:.4f}")
         print(f"Min Episode Reward: {min_reward:.4f}")
         
+        # Print reward distribution
         positive_rewards = sum(1 for r in total_rewards if r > 0)
         print(f"Episodes with positive reward: {positive_rewards} / {len(total_rewards)} ({100*positive_rewards/len(total_rewards):.1f}%)")
     
@@ -429,3 +452,8 @@ def run_training(num_explorers: int = 4, total_eps: int = 2000):
     
     ray.shutdown()
     print("[Main] Ray shutdown complete")
+
+
+if __name__ == "__main__":
+    # Run training with specified parameters
+    run_training(num_explorers=4, total_eps=100)  # Start with fewer episodes for testing

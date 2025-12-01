@@ -16,23 +16,35 @@ async def test_single_episode():
     env = AdvancedGraphTraversalEnv(store)
     agent = DDQLAgent(773, 384)
     
-    # Get a starting paper
-    print("\n1. Fetching starting paper...")
-    paper = await store.get_any_paper()
+    # Get a starting paper with good connectivity
+    print("\n1. Fetching well-connected paper...")
+    paper = await store.get_well_connected_paper()
     
     if not paper:
-        print("✗ No papers in database!")
-        return
+        print("✗ No well-connected papers in database!")
+        print("  Trying any paper...")
+        paper = await store.get_any_paper()
+        
+        if not paper:
+            print("✗ No papers in database at all!")
+            return
     
     paper_id = paper.get('paper_id')
     title = paper.get('title', paper.get('original_id', 'Unknown'))
+    ref_count = paper.get('ref_count', 0)
+    cite_count = paper.get('cite_count', 0)
+    
     print(f"✓ Starting paper: {title[:60]}...")
     print(f"  ID: {paper_id}")
+    print(f"  References: {ref_count}, Citations: {cite_count}")
     
-    # Reset environment
     print("\n2. Resetting environment...")
     initial_intent = RelationType.CITED_BY
-    state = await env.reset(paper_id, initial_intent, start_node_id=paper_id)
+    
+    query_text = paper.get('title') or paper.get('original_id') or 'machine learning'
+    print(f"  Query: {query_text[:60]}...")
+    
+    state = await env.reset(query_text, initial_intent, start_node_id=paper_id)
     print(f"✓ State shape: {state.shape}")
     print(f"  Expected: (773,)")
     
@@ -80,6 +92,7 @@ async def test_single_episode():
             print("✗ No worker actions!")
             continue
         
+        # Choose random worker action
         chosen_node, _ = random.choice(worker_actions)
         node_text = (
             chosen_node.get('title') or 
@@ -88,6 +101,7 @@ async def test_single_episode():
         )
         print(f"Worker chose: {node_text[:50]}...")
         
+        # Execute worker step
         next_state, worker_reward, done = await env.worker_step(chosen_node)
         print(f"Worker reward: {worker_reward:.4f}")
         print(f"Total step reward: {manager_reward + worker_reward:.4f}")

@@ -165,8 +165,7 @@ class EnhancedStore:
                    p.year, 
                    COALESCE(p.doi, p.id, '') as doi,
                    p.publication_name, 
-                   p.keywords, 
-                   p.abstract,
+                   p.keywords,
                    p.id as original_id
         """
         rows = await self._run_query_method(query, [paper_id])
@@ -190,8 +189,7 @@ class EnhancedStore:
                    p.year, 
                    COALESCE(p.doi, p.id, '') as doi,
                    p.publication_name, 
-                   p.keywords, 
-                   p.abstract,
+                   p.keywords,
                    p.id as original_id
         """
         rows = await self._run_query_method(query, [title])
@@ -401,9 +399,31 @@ class EnhancedStore:
                    p.year, 
                    COALESCE(p.doi, p.id, '') as doi,
                    p.publication_name, 
-                   p.keywords, 
-                   p.abstract,
+                   p.keywords,
                    p.id as original_id
+            LIMIT 1
+        """
+        rows = await self._run_query_method(query, [])
+        return rows[0] if rows else None
+    
+    async def get_well_connected_paper(self) -> Optional[Dict[str, Any]]:
+        """Get a paper with good connectivity (has both citations and references)"""
+        query = """
+            MATCH (p:Paper)
+            OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
+            OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
+            WITH p, count(DISTINCT ref) as ref_count, count(DISTINCT citing) as cite_count
+            WHERE ref_count > 0 AND cite_count > 0
+            RETURN elementId(p) as paper_id, 
+                   COALESCE(p.title, p.id, '') as title,
+                   p.year, 
+                   COALESCE(p.doi, p.id, '') as doi,
+                   p.publication_name, 
+                   p.keywords,
+                   p.id as original_id,
+                   ref_count,
+                   cite_count
+            ORDER BY (ref_count + cite_count) DESC
             LIMIT 1
         """
         rows = await self._run_query_method(query, [])
