@@ -1,10 +1,11 @@
 import ijson
 from neo4j import GraphDatabase
 from tqdm import tqdm
+import os 
 
-DB_URI = "neo4j://localhost:7687"
-DB_AUTH = ("neo4j", "diam0ndman@3") 
-driver = GraphDatabase.driver(DB_URI, auth=DB_AUTH)
+URI = os.environ.get("NEO4J_URI", "neo4j://localhost:7687")
+AUTH = ("neo4j", "diam0ndman@3")
+driver = GraphDatabase.driver(URI, auth=AUTH)
 BATCH_SIZE = 25000
 
 
