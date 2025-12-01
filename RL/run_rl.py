@@ -1,8 +1,8 @@
 from .ray_dist import run_training
 
 if __name__ == "__main__":
-    NUM_EXPLORERS = 8     
-    TOTAL_EPISODES = 2000
+    NUM_EXPLORERS = 2     
+    TOTAL_EPISODES = 1000
     
     run_training(
         num_explorers=NUM_EXPLORERS, 

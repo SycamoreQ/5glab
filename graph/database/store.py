@@ -39,7 +39,7 @@ class Neo4jConnectionPool:
     @asynccontextmanager
     async def get_connection(self):
         """Yields an async session."""
-        async with self._driver.session(database = "researchdb") as session:
+        async with self._driver.session(database="researchdb") as session:
             yield session
 
 
@@ -47,6 +47,8 @@ class EnhancedStore:
     """
     Store with async patterns and caching. All graph query functions are now 
     methods of this class.
+    
+    FIXED: Now uses elementId() for node identification since paper_id is None in your DB
     """
     def __init__(self, pool_size: int = 10, enable_cache: bool = True):
         self.pool = Neo4jConnectionPool(URI, AUTH, pool_size)
@@ -108,92 +110,162 @@ class EnhancedStore:
             return []
         return result.data
     
-
+    # CRITICAL FIX: All queries now use elementId() instead of paper_id
     
     async def get_papers_by_author(self, author_name: str) -> List[Dict[str, Any]]:
-        query = "MATCH (a:Author {name: $1})-[:WROTE]->(p:Paper) RETURN p.title, p.year, p.doi, p.paper_id ORDER BY p.year DESC"
+        query = """
+            MATCH (a:Author {name: $1})-[:WROTE]->(p:Paper) 
+            RETURN elementId(p) as paper_id, 
+                   COALESCE(p.title, p.id, '') as title,
+                   p.year, 
+                   COALESCE(p.doi, p.id, '') as doi,
+                   p.publication_name, 
+                   p.keywords,
+                   p.id as original_id
+            ORDER BY p.year DESC
+        """
         return await self._run_query_method(query, [author_name])
 
     async def get_authors_by_paper(self, paper_title: str) -> List[Dict[str, Any]]:
-        query = "MATCH (a:Author)-[:WROTE]->(p:Paper {title: $1}) RETURN a.name, a.author_id"
+        query = """
+            MATCH (a:Author)-[:WROTE]->(p:Paper {title: $1}) 
+            RETURN elementId(a) as author_id, a.name, a.affiliation
+        """
         return await self._run_query_method(query, [paper_title])
 
     async def get_authors_by_paper_id(self, paper_id: str) -> List[Dict[str, Any]]:
-        query = "MATCH (a:Author)-[:WROTE]->(p:Paper {paper_id: $1}) RETURN a.name, a.author_id"
+        query = """
+            MATCH (p:Paper), (a:Author)-[:WROTE]->(p)
+            WHERE elementId(p) = $1
+            RETURN elementId(a) as author_id, a.name, a.affiliation
+        """
         return await self._run_query_method(query, [paper_id])
 
     async def get_papers_by_author_id(self, author_id: str) -> List[Dict[str, Any]]:
-        query = "MATCH (a:Author {author_id: $1})-[:WROTE]->(p:Paper) RETURN p.title, p.year, p.doi, p.paper_id ORDER BY p.year DESC"
+        query = """
+            MATCH (a:Author), (a)-[:WROTE]->(p:Paper)
+            WHERE elementId(a) = $1
+            RETURN elementId(p) as paper_id, 
+                   COALESCE(p.title, p.id, '') as title,
+                   p.year, 
+                   COALESCE(p.doi, p.id, '') as doi,
+                   p.publication_name, 
+                   p.keywords,
+                   p.id as original_id
+            ORDER BY p.year DESC
+        """
         return await self._run_query_method(query, [author_id])
 
     async def get_paper_by_id(self, paper_id: str) -> Optional[Dict[str, Any]]:
-        query = "MATCH (p:Paper {paper_id: $1}) RETURN p.title, p.year, p.doi, p.paper_id, p.publication_name, p.keywords"
+        query = """
+            MATCH (p:Paper)
+            WHERE elementId(p) = $1
+            RETURN elementId(p) as paper_id, 
+                   COALESCE(p.title, p.id, '') as title,
+                   p.year, 
+                   COALESCE(p.doi, p.id, '') as doi,
+                   p.publication_name, 
+                   p.keywords, 
+                   p.abstract,
+                   p.id as original_id
+        """
         rows = await self._run_query_method(query, [paper_id])
         return rows[0] if rows else None
 
     async def get_author_by_id(self, author_id: str) -> Optional[Dict[str, Any]]:
-        query = "MATCH (a:Author {author_id: $1}) RETURN a.name, a.author_id, a.affiliation"
+        query = """
+            MATCH (a:Author)
+            WHERE elementId(a) = $1
+            RETURN elementId(a) as author_id, a.name, a.affiliation
+        """
         rows = await self._run_query_method(query, [author_id])
         return rows[0] if rows else None
 
-    async def get_paper_by_title(self, paper_id: str) -> List[Dict[str , Any]]:
-        query = "MATCH (p: Paper) WHERE p.title = $1 OR p.paper_id = $1 RETURN p.title"
-        rows = await self._run_query_method(query , [paper_id])
+    async def get_paper_by_title(self, title: str) -> List[Dict[str, Any]]:
+        query = """
+            MATCH (p:Paper) 
+            WHERE p.title = $1 OR p.id = $1
+            RETURN elementId(p) as paper_id, 
+                   COALESCE(p.title, p.id, '') as title,
+                   p.year, 
+                   COALESCE(p.doi, p.id, '') as doi,
+                   p.publication_name, 
+                   p.keywords, 
+                   p.abstract,
+                   p.id as original_id
+        """
+        rows = await self._run_query_method(query, [title])
         return rows
-
 
     async def get_citations_by_paper(self, paper_id: str) -> List[Dict[str, Any]]:
         """Get papers that cite THIS paper (Incoming edges)."""
         query = """
-            MATCH (citing:Paper)-[:CITES]->(cited:Paper {paper_id: $1})
-            RETURN citing.title, citing.year, citing.doi, citing.paper_id, citing.publication_name
+            MATCH (p:Paper), (citing:Paper)-[:CITES]->(p)
+            WHERE elementId(p) = $1
+            RETURN elementId(citing) as paper_id, 
+                   COALESCE(citing.title, citing.id, '') as title,
+                   citing.year, 
+                   COALESCE(citing.doi, citing.id, '') as doi,
+                   citing.publication_name, 
+                   citing.keywords,
+                   citing.id as original_id
             ORDER BY citing.year DESC
         """
         return await self._run_query_method(query, [paper_id])
     
-    async def get_citation_count(self , paper_id: str) -> int : 
-        citations = self.get_citations_by_paper(paper_id)
-
+    async def get_citation_count(self, paper_id: str) -> int: 
+        citations = await self.get_citations_by_paper(paper_id)
         return len(citations)
     
-    async def get_collab_count(self , author_id: str) -> int: 
-        collab = self.get_collabs_by_author(author_id)
-        
+    async def get_collab_count(self, author_id: str) -> int: 
+        collab = await self.get_collabs_by_author(author_id)
         return len(collab)
-    
 
     async def get_references_by_paper(self, paper_id: str) -> List[Dict[str, Any]]:
         """Get papers THIS paper cites (Outgoing edges)."""
         query = """
-            MATCH (source:Paper {paper_id: $1})-[:CITES]->(ref:Paper)
-            RETURN ref.title, ref.year, ref.doi, ref.paper_id, ref.publication_name
+            MATCH (p:Paper), (p)-[:CITES]->(ref:Paper)
+            WHERE elementId(p) = $1
+            RETURN elementId(ref) as paper_id, 
+                   COALESCE(ref.title, ref.id, '') as title,
+                   ref.year, 
+                   COALESCE(ref.doi, ref.id, '') as doi,
+                   ref.publication_name, 
+                   ref.keywords,
+                   ref.id as original_id
             ORDER BY ref.year DESC
         """
         return await self._run_query_method(query, [paper_id])
 
-    async def get_collabs_by_author(self, author_id: str) -> List[Dict[str , Any]]: 
+    async def get_collabs_by_author(self, author_id: str) -> List[Dict[str, Any]]: 
         query = """ 
-            MATCH (a1:Author {author_id: $1})-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
-            WHERE a1 <> a2
-            RETURN DISTINCT a2.name, a2.author_id, a2.affiliation
+            MATCH (a1:Author), (a1)-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
+            WHERE elementId(a1) = $1 AND a1 <> a2
+            RETURN DISTINCT elementId(a2) as author_id, a2.name, a2.affiliation
         """
         return await self._run_query_method(query, [author_id])
 
     async def get_papers_by_keyword(self, keyword: str, limit: int = 5, exclude_paper_id: str = None) -> List[Dict]: 
         query = """
             MATCH (p:Paper) 
-            WHERE toLower(p.keywords) CONTAINS toLower($1)
+            WHERE toLower(p.keywords) CONTAINS toLower($1) OR toLower(p.id) CONTAINS toLower($1)
         """
         params = [keyword]
         param_idx = 2
 
         if exclude_paper_id:
-            query += f" AND p.paper_id <> ${param_idx} "
+            query += f" AND elementId(p) <> ${param_idx} "
             params.append(exclude_paper_id)
             param_idx += 1
             
         query += f"""
-            RETURN p.title, p.year, p.doi, p.paper_id, p.publication_name
+            RETURN elementId(p) as paper_id, 
+                   COALESCE(p.title, p.id, '') as title,
+                   p.year, 
+                   COALESCE(p.doi, p.id, '') as doi,
+                   p.publication_name, 
+                   p.keywords,
+                   p.id as original_id
             ORDER BY p.year DESC
             LIMIT ${param_idx}
         """
@@ -201,7 +273,6 @@ class EnhancedStore:
         return await self._run_query_method(query, params)
 
     async def get_papers_by_venue(self, venue_name: str, exclude_paper_id: str = None, limit: int = 5) -> List[Dict]:
-        # Maps 'venue' to 'publication_name'
         query = """
             MATCH (p:Paper)
             WHERE toLower(p.publication_name) CONTAINS toLower($1)
@@ -210,12 +281,18 @@ class EnhancedStore:
         param_idx = 2
         
         if exclude_paper_id:
-            query += f" AND p.paper_id <> ${param_idx} "
+            query += f" AND elementId(p) <> ${param_idx} "
             params.append(exclude_paper_id)
             param_idx += 1
             
         query += f"""
-            RETURN p.title, p.year, p.doi, p.keywords, p.paper_id
+            RETURN elementId(p) as paper_id, 
+                   COALESCE(p.title, p.id, '') as title,
+                   p.year, 
+                   COALESCE(p.doi, p.id, '') as doi,
+                   p.keywords, 
+                   p.publication_name,
+                   p.id as original_id
             ORDER BY p.year DESC 
             LIMIT ${param_idx}             
         """
@@ -225,9 +302,14 @@ class EnhancedStore:
     async def get_older_references(self, paper_id: str) -> List[Dict]: 
         """Find references (outgoing) that are strictly older."""
         query = """
-            MATCH (p:Paper {paper_id: $1})-[:CITES]->(ref:Paper)
-            WHERE ref.year < p.year
-            RETURN ref.doi, ref.title, ref.publication_name, ref.keywords, ref.paper_id
+            MATCH (p:Paper), (p)-[:CITES]->(ref:Paper)
+            WHERE elementId(p) = $1 AND ref.year < p.year
+            RETURN elementId(ref) as paper_id, 
+                   COALESCE(ref.doi, ref.id, '') as doi,
+                   COALESCE(ref.title, ref.id, '') as title,
+                   ref.publication_name, 
+                   ref.keywords,
+                   ref.id as original_id
             ORDER BY ref.year ASC
         """
         return await self._run_query_method(query, [paper_id])
@@ -235,66 +317,94 @@ class EnhancedStore:
     async def get_newer_citations(self, paper_id: str) -> List[Dict]:
         """Find citations (incoming) that are strictly newer."""
         query = """
-            MATCH (p:Paper {paper_id: $1})<-[:CITES]-(citing:Paper)
-            WHERE citing.year > p.year 
-            RETURN citing.doi, citing.title, citing.publication_name, citing.keywords, citing.paper_id
+            MATCH (p:Paper), (p)<-[:CITES]-(citing:Paper)
+            WHERE elementId(p) = $1 AND citing.year > p.year 
+            RETURN elementId(citing) as paper_id, 
+                   COALESCE(citing.doi, citing.id, '') as doi,
+                   COALESCE(citing.title, citing.id, '') as title,
+                   citing.publication_name, 
+                   citing.keywords,
+                   citing.id as original_id
             ORDER BY citing.year DESC
         """
         return await self._run_query_method(query, [paper_id])
 
     async def get_second_degree_collaborators(self, author_id: str, limit: int = 20) -> List[Dict]:
         query = """
-            MATCH (a1:Author {author_id: $1})-[:WROTE]->(p1:Paper)<-[:WROTE]-(a2:Author)
+            MATCH (a1:Author), (a1)-[:WROTE]->(p1:Paper)<-[:WROTE]-(a2:Author)
+            WHERE elementId(a1) = $1
             MATCH (a2)-[:WROTE]->(p2:Paper)<-[:WROTE]-(a3:Author)
             WHERE a1 <> a3 AND a1 <> a2
-            RETURN DISTINCT a3.author_id, a3.name
+            RETURN DISTINCT elementId(a3) as author_id, a3.name
             LIMIT $2
         """
         return await self._run_query_method(query, [author_id, limit])
 
     async def get_co_cited_neighbors(self, paper_id: str, limit: int = 10) -> List[Dict]:
         query = """
-            MATCH (p1:Paper {paper_id: $1})<-[:CITES]-(citing:Paper)-[:CITES]->(p2:Paper)
-            WHERE p1 <> p2
-            RETURN p2.title, p2.year, p2.doi, p2.paper_id, count(citing) as co_citation_count
+            MATCH (p1:Paper), (p1)<-[:CITES]-(citing:Paper)-[:CITES]->(p2:Paper)
+            WHERE elementId(p1) = $1 AND p1 <> p2
+            RETURN elementId(p2) as paper_id, 
+                   COALESCE(p2.title, p2.id, '') as title,
+                   p2.year, 
+                   COALESCE(p2.doi, p2.id, '') as doi,
+                   count(citing) as co_citation_count,
+                   p2.id as original_id
             ORDER BY co_citation_count DESC
             LIMIT $2
         """
         return await self._run_query_method(query, [paper_id, limit])
 
-
-    async def count_prolific_publisher(self, paper_id: str , limit: int = 10) -> List[Dict]:
+    async def count_prolific_publisher(self, paper_id: str, limit: int = 10) -> List[Dict]:
         query = """
-                MATCH (p: Paper)
-                RETURN p.publisher AS publisher, count(p) AS count
-                ORDER BY count DESC 
-                LIMIT $1
-                """
-        return await self._run_query_method(query , [limit]) 
-
+            MATCH (p:Paper)
+            RETURN p.publisher AS publisher, count(p) AS count
+            ORDER BY count DESC 
+            LIMIT $1
+        """
+        return await self._run_query_method(query, [limit]) 
 
     async def get_influence_path_papers(self, author_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """
         Meta-Path Action: Finds papers cited by collaborators of the given author.
-        (Author) -[WROTE]-> (P1) <-[WROTE]- (Collaborator) -[CITES]-> (P_Influence)
         """
         query = """
-            MATCH (a1:Author {author_id: $1})-[:WROTE]->(:Paper)<-[:WROTE]-(collab:Author)
-            WHERE a1 <> collab
+            MATCH (a1:Author), (a1)-[:WROTE]->(:Paper)<-[:WROTE]-(collab:Author)
+            WHERE elementId(a1) = $1 AND a1 <> collab
             WITH collab
             MATCH (collab)-[:WROTE]->(p_collab:Paper)-[:CITES]->(p_influence:Paper)
-            RETURN DISTINCT p_influence.title, p_influence.year, p_influence.doi, p_influence.paper_id
+            RETURN DISTINCT elementId(p_influence) as paper_id, 
+                   COALESCE(p_influence.title, p_influence.id, '') as title,
+                   p_influence.year, 
+                   COALESCE(p_influence.doi, p_influence.id, '') as doi,
+                   p_influence.id as original_id
             ORDER BY p_influence.year DESC
             LIMIT $2
         """
         return await self._run_query_method(query, [author_id, limit])
 
-
     async def get_author_uni_collab_count(self, author_id: str) -> int:
         query = """
-            MATCH (a1:Author {author_id: $1})-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
-            WHERE a1 <> a2 AND a1.affiliation IS NOT NULL AND a1.affiliation = a2.affiliation
+            MATCH (a1:Author), (a1)-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
+            WHERE elementId(a1) = $1 AND a1 <> a2 AND a1.affiliation IS NOT NULL AND a1.affiliation = a2.affiliation
             RETURN count(DISTINCT a2) as uni_collaborator_count
         """
         rows = await self._run_query_method(query, [author_id])
         return rows[0]['uni_collaborator_count'] if rows else 0
+    
+    async def get_any_paper(self) -> Optional[Dict[str, Any]]:
+        """Get any random paper from the database (useful for initialization)"""
+        query = """
+            MATCH (p:Paper)
+            RETURN elementId(p) as paper_id, 
+                   COALESCE(p.title, p.id, '') as title,
+                   p.year, 
+                   COALESCE(p.doi, p.id, '') as doi,
+                   p.publication_name, 
+                   p.keywords, 
+                   p.abstract,
+                   p.id as original_id
+            LIMIT 1
+        """
+        rows = await self._run_query_method(query, [])
+        return rows[0] if rows else None
