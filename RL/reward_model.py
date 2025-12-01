@@ -36,10 +36,7 @@ class RewardModel:
 
         author_impact = 0.0
 
-        # Strict match for RL's traversal (intent)
         intent_bonus = 1.0 if action_node.get('relation') == intent_type else 0.0
-
-        # Final composite reward (tune weights as you wish)
         reward = (
             0.4 * sim_reward +
             0.2 * citation_score +
@@ -48,20 +45,4 @@ class RewardModel:
             0.1 * author_impact
         )
         return reward
-
-            
-
-        
-        
-
-        
-        
-
-
-        
-        
-        
-         
-
-
 
