@@ -54,6 +54,17 @@ class CommunityAwareRewardConfig:
     TEMPORAL_JUMP_PENALTY = -0.1        # Bonus for doing the opposite 
     COMMUNITY_SIZE_BONUS = 0.3         # Bonus for not being in small communities
     BRIDGE_NODE_BONUS = 0.5 
+
+    PROLIFIC_AUTHOR_BONUS = 0.4         # Bonus for authors with many papers
+    PROLIFIC_THRESHOLD = 20             # Min papers for "prolific"
+    COLLABORATION_BONUS = 0.3           # Bonus for well-connected authors
+    COLLABORATION_THRESHOLD = 10        # Min collaborators
+    AUTHOR_H_INDEX_BONUS = 0.35         # Bonus for high h-index (if available)
+    INSTITUTION_QUALITY_BONUS = 0.25    # Bonus for top institutions 
+
+    AUTHOR_COMMUNITY_SWITCH_BONUS = 0.7
+    AUTHOR_COMMUNITY_STUCK_PENALTY = -0.6
+    AUTHOR_COMMUNITY_LOOP_PENALTY = -0.9
     
     STUCK_THRESHOLD = 3                # Steps in same community = "stuck"
     SEVERE_STUCK_THRESHOLD = 5         # Very stuck threshold
