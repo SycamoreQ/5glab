@@ -17,6 +17,9 @@ class CommunityDetector:
         self.store = store
         self.cache_file = cache_file
         self.communities = {}  # node_id -> community_id
+        self.author_communities = {}
+
+        self.author_community_sizes = {}
         self.community_sizes = {}  # community_id -> size
         self.is_loaded = False
     
@@ -203,7 +206,133 @@ class CommunityDetector:
                 print(f"    {i}. {comm_id}: {size} papers ({percentage:.1f}%)")
 
 
-    
+
+    async def _build_author_communities(self, max_authors: int):
+        """Build author communities based on collaboration patterns."""
+        print("\n AUTHOR COMMUNITIES")
+        print("-" * 80)
+        
+        all_authors = []
+        
+        # Phase 1: Prolific authors (many papers)
+        print("  Phase 1/3: Fetching prolific authors (10+ papers)...")
+        query_prolific = """
+            MATCH (a:Author)-[:WROTE]->(p:Paper)
+            WITH a, elementId(a) as node_id, count(p) as paper_count
+            WHERE paper_count >= 10
+            OPTIONAL MATCH (a)-[:WROTE]->(:Paper)<-[:WROTE]-(collab:Author)
+            WHERE a <> collab
+            WITH node_id, paper_count, count(DISTINCT collab) as collab_count,
+                 a.name as name, a.affiliation as affiliation
+            RETURN node_id, paper_count, collab_count, name, affiliation
+            LIMIT 5000
+        """
+
+        try: 
+            prolific = await self.store._run_query_method(query_prolific , [])
+            all_authors.extend(prolific)
+            print(f"found {len(all_authors)} prolific authors")
+
+        except Exception as e:
+            print("Phase 1 failed")
+
+        if len(all_authors) < max_authors:
+            print("  Phase 2/3: Fetching active authors (5-9 papers)...")
+            remaining = max_authors - len(all_authors)
+            
+            query_active = """
+                MATCH (a:Author)-[:WROTE]->(p:Paper)
+                WITH a, elementId(a) as node_id, count(p) as paper_count
+                WHERE paper_count >= 5 AND paper_count < 10
+                OPTIONAL MATCH (a)-[:WROTE]->(:Paper)<-[:WROTE]-(collab:Author)
+                WHERE a <> collab
+                WITH node_id, paper_count, count(DISTINCT collab) as collab_count,
+                     a.name as name, a.affiliation as affiliation
+                RETURN node_id, paper_count, collab_count, name, affiliation
+                LIMIT $1
+            """
+            
+            try:
+                active = await self.store._run_query_method(query_active, [remaining])
+                all_authors.extend(active)
+                print(f"Found {len(active)} active authors")
+            except Exception as e:
+                print(f"Phase 2 failed: {e}")
+        
+        # Phase 3: Rest
+        if len(all_authors) < max_authors:
+            print("  Phase 3/3: Fetching remaining authors...")
+            remaining = max_authors - len(all_authors)
+            
+            query_rest = """
+                MATCH (a:Author)-[:WROTE]->(p:Paper)
+                WITH a, elementId(a) as node_id, count(p) as paper_count
+                OPTIONAL MATCH (a)-[:WROTE]->(:Paper)<-[:WROTE]-(collab:Author)
+                WHERE a <> collab
+                WITH node_id, paper_count, count(DISTINCT collab) as collab_count,
+                     a.name as name, a.affiliation as affiliation
+                RETURN node_id, paper_count, collab_count, name, affiliation
+                LIMIT $1
+            """
+            
+            try:
+                rest = await self.store._run_query_method(query_rest, [remaining])
+                all_authors.extend(rest)
+                print(f"Found {len(rest)} additional authors")
+            except Exception as e:
+                print(f"Phase 3 failed: {e}")  
+
+
+        for author in all_authors: 
+            node_id = author['node_id']
+            paper_count = author.get('paper_count' , 0)
+            collab_count = author.get('collab_count' , 0)
+            affiliation = author.get('affiliation' , 0)
+
+
+            # Productivity tier
+            if paper_count >= 50:
+                prod_tier = 5  # Very prolific
+            elif paper_count >= 20:
+                prod_tier = 4  # Prolific
+            elif paper_count >= 10:
+                prod_tier = 3  # Active
+            elif paper_count >= 5:
+                prod_tier = 2  # Moderate
+            else:
+                prod_tier = 1  # Occasional
+            
+            # Collaboration tier
+            if collab_count >= 50:
+                collab_tier = 3  # Highly collaborative
+            elif collab_count >= 10:
+                collab_tier = 2  # Collaborative
+            else:
+                collab_tier = 1  # Solo/small team
+            
+            if affiliation:
+                aff_bucket = affiliation[:3].upper() if len(affiliation) >= 3 else "UNK"
+            else:
+                aff_bucket = "UNK"
+            
+            # - A_5_3_MIT = Very prolific, highly collaborative MIT authors
+            # - A_2_1_UNK = Moderate productivity, solo researchers
+            comm_id = f"A_{prod_tier}_{collab_tier}"
+            
+            self.author_communities[node_id] = comm_id
+        
+        author_counter = Counter(self.author_communities.values())
+        self.author_community_sizes = dict(author_counter)
+        
+        print(f"\n Created {len(set(self.author_communities.values()))} author communities")
+        print(f"Covered {len(self.author_communities)} authors")
+        
+        top_author_comms = sorted(self.author_community_sizes.items(), key=lambda x: x[1], reverse=True)[:3]
+        print(f"\n  Top 3 author communities:")
+        for i, (comm_id, size) in enumerate(top_author_comms, 1):
+            print(f"    {i}. {comm_id}: {size} authors")
+
+            
     def _calculate_community_sizes(self):
         """Calculate the size of each community."""
         comm_counter = Counter(self.communities.values())
@@ -213,13 +342,15 @@ class CommunityDetector:
         """Save communities to disk for fast loading."""
         cache_data = {
             'communities': self.communities,
-            'community_sizes': self.community_sizes
+            'community_sizes': self.community_sizes,
+            'author_communities' : self.author_communities,
+            'author_community_sizes' : self.author_community_sizes
         }
         
         with open(self.cache_file, 'wb') as f:
             pickle.dump(cache_data, f)
         
-        print(f"✓ Communities cached to {self.cache_file}")
+        print(f"Communities cached to {self.cache_file}")
     
     def load_cache(self) -> bool:
         """Load precomputed communities from disk."""
@@ -232,12 +363,14 @@ class CommunityDetector:
             
             self.communities = cache_data['communities']
             self.community_sizes = cache_data['community_sizes']
+            self.author_communities = cache_data['author_communities']
+            self.author_community_sizes = cache_data['author_community_sizes']
             self.is_loaded = True
             
-            print(f"✓ Loaded {len(set(self.communities.values()))} communities from cache")
+            print(f"Loaded {len(set(self.communities.values()))} communities from cache")
             return True
         except Exception as e:
-            print(f"✗ Failed to load cache: {e}")
+            print(f"Failed to load cache: {e}")
             return False
     
     def get_community(self, node_id: str) -> Optional[str]:
@@ -305,7 +438,6 @@ async def build_and_cache_communities():
     store = EnhancedStore()
     detector = CommunityDetector(store)
     
-    # Try to load existing cache
     if detector.load_cache():
         print("\n✓ Communities already cached!")
         stats = detector.get_statistics()
