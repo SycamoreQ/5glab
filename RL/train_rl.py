@@ -62,6 +62,10 @@ async def train_single_process():
                 intent=1,  # CITED_BY intent
                 start_node_id=paper['paper_id']
             )
+
+            print(f"\n[DEBUG] Starting paper: {paper['title'][:50]}")
+            print(f"[DEBUG] Paper ID: {paper['paper_id']}")
+            print(f"[DEBUG] Current node in env: {env.current_node.get('paper_id', 'NONE')}")
             
             episode_reward = 0
             step = 0
@@ -80,7 +84,7 @@ async def train_single_process():
                 # Manager step: choose relation type
                 # For DDQN, we treat manager actions as part of the combined action space
                 # But for simplicity, let's just pick CITED_BY (1) if available, else random
-                if 1 in manager_actions:  # CITED_BY
+                if 1 in manager_actions:  
                     manager_action = 1
                 else:
                     manager_action = np.random.choice(manager_actions)
