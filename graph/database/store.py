@@ -29,7 +29,9 @@ class Neo4jConnectionPool:
         self._driver = AsyncGraphDatabase.driver(
             uri, 
             auth=auth, 
-            max_connection_pool_size=pool_size
+            max_connection_pool_size=pool_size,
+            max_connection_lifetime=3600,  
+            connection_acquisition_timeout=120.0
         )
         self.pool_size = pool_size
 
@@ -109,9 +111,7 @@ class EnhancedStore:
             logging.error(f"Database error during query: {result.error}")
             return []
         return result.data
-    
-    #All queries now use elementId() instead of paper_id
-    
+        
     async def get_papers_by_author(self, author_name: str) -> List[Dict[str, Any]]:
         query = """
             MATCH (a:Author {name: $1})-[:WROTE]->(p:Paper) 
@@ -338,7 +338,7 @@ class EnhancedStore:
         """
         return await self._run_query_method(query, [author_id, limit])
 
-    async def get_co_cited_neighbors(self, paper_id: str, limit: int = 10) -> List[Dict]:
+    async def get_co_cited_neighbors(self, paper_id: str, limit: int = 20) -> List[Dict]:
         query = """
             MATCH (p1:Paper), (p1)<-[:CITES]-(citing:Paper)-[:CITES]->(p2:Paper)
             WHERE elementId(p1) = $1 AND p1 <> p2
@@ -352,6 +352,16 @@ class EnhancedStore:
             LIMIT $2
         """
         return await self._run_query_method(query, [paper_id, limit])
+    
+
+    async def get_basic_neighbors(self , paper_id):
+        query = """
+                MATCH (p:Paper)-[:CITES|WROTE]-(neighbor)
+                WHERE elementId(p) = $1
+                RETURN DISTINCT elementId(neighbor) as neighbor_id
+                LIMIT 20
+            """
+        return await self._run_query_method(query, [paper_id])
 
     async def count_prolific_publisher(self, paper_id: str, limit: int = 10) -> List[Dict]:
         query = """
@@ -361,9 +371,6 @@ class EnhancedStore:
             LIMIT $1
         """
         return await self._run_query_method(query, [limit]) 
-
-
-
 
     async def get_influence_path_papers(self, author_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """
@@ -431,4 +438,30 @@ class EnhancedStore:
         """
         rows = await self._run_query_method(query, [])
         return rows[0] if rows else None
+    
+
+    async def get_well_connected_papers_from_list(self , cached_paper_ids) -> Optional[Dict[str , Any]]: 
+        query = """
+                MATCH (p: Paper)
+                WHERE elementId(p) = $1 
+                OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
+                OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
+                WITH p, count(DISTINCT ref) as ref_count , count(DISTINCT citing) as cite_count 
+                WHERE ref_count > 0 AND cite_count > 0
+                RETURN elementId(p) as paper_id, 
+                        COALESCE(p.title , p.id , '') as title,
+                        p.year, 
+                        COALESCE(p.doi , p.id , '') as doi,
+                        p.publication_name,
+                        p.keywords,
+                        p.id as original_id,
+                        ref_count,
+                        cite_count,
+                    ORDER BY (ref_count + cite_count) DESC 
+                    LIMIT 1 
+                """
+        rows = await self._run_query_method(query, [])
+        return rows[0] if rows else None
+        
+
     

@@ -31,14 +31,10 @@ class RelationType:
 
 
 class CommunityAwareRewardConfig:
-    """Enhanced reward configuration with community awareness."""
-    
-    # Manager rewards
     INTENT_MATCH_REWARD = 2.0
     INTENT_MISMATCH_PENALTY = -0.5
     DIVERSITY_BONUS = 0.5
     
-    # Worker rewards
     SEMANTIC_WEIGHT = 1.0
     NOVELTY_BONUS = 0.3
     DEAD_END_PENALTY = -1.0
@@ -54,6 +50,10 @@ class CommunityAwareRewardConfig:
     COMMUNITY_STUCK_PENALTY = -0.5     # Penalty per step stuck in same community
     COMMUNITY_LOOP_PENALTY = -1.0      # Severe penalty for returning to previous community
     DIVERSE_COMMUNITY_BONUS = 0.3      # Bonus for visiting many unique communities
+    TEMPORAL_JUMP_BONUS = 0.2        # Bonus for moving to a community which is recent 
+    TEMPORAL_JUMP_PENALTY = -0.1        # Bonus for doing the opposite 
+    COMMUNITY_SIZE_BONUS = 0.3         # Bonus for not being in small communities
+    BRIDGE_NODE_BONUS = 0.5 
     
     STUCK_THRESHOLD = 3                # Steps in same community = "stuck"
     SEVERE_STUCK_THRESHOLD = 5         # Very stuck threshold
@@ -80,37 +80,32 @@ class AdvancedGraphTraversalEnv:
         self.intent_dim = 5
         self.state_dim = self.text_dim * 2 + self.intent_dim
         
-        # Hierarchical RL state
         self.pending_manager_action = None
         self.available_worker_nodes = []
         
-        # Reward tracking
         self.config = CommunityAwareRewardConfig()
         self.trajectory_history = []
         self.relation_types_used = set()
         self.best_similarity_so_far = -1.0
         self.previous_node_embedding = None
         
-        # === COMMUNITY TRACKING ===
         self.use_communities = use_communities and COMMUNITY_AVAILABLE
         self.community_detector = None
         
         if self.use_communities:
             self.community_detector = CommunityDetector(store)
-            # Try to load cached communities
             if not self.community_detector.load_cache():
-                print("⚠ No community cache found. Run: python -m RL.community_detection")
-                print("  Continuing without community rewards...")
+                print("No community cache found. Run: python -m RL.community_detection")
+                print("Continuing without community rewards...")
                 self.use_communities = False
         
-        # Community tracking for current episode
         self.current_community = None
-        self.community_history = []  # List of (step, community_id)
-        self.community_visit_count = Counter()  # community_id -> visit count
+        self.community_history = []  
+        self.community_visit_count = Counter()  
+        self.comm_influence = {}
         self.steps_in_current_community = 0
         self.previous_community = None
         
-        # Episode statistics
         self.episode_stats = {
             'total_nodes_explored': 0,
             'unique_relation_types': 0,
@@ -139,14 +134,18 @@ class AdvancedGraphTraversalEnv:
             vec[intent_enum] = 1.0
         return vec
 
+
     def _update_community_tracking(self, node_id: str):
-        """Update community tracking when visiting a node."""
         if not self.use_communities:
             return
         
         new_community = self.community_detector.get_community(node_id)
         
         if new_community is None:
+            if self.current_community is not None: 
+                self.previous_community = self.current_community
+                self.current_community = None 
+                self.steps_in_current_community = 0 
             return
         
         if new_community != self.current_community:
@@ -155,22 +154,20 @@ class AdvancedGraphTraversalEnv:
             if new_community in [c for _, c in self.community_history[:-1]]:
                 self.episode_stats['community_loops'] += 1
             
-            # Update tracking
             self.previous_community = self.current_community
             self.current_community = new_community
             self.steps_in_current_community = 1
         else:
-            # Staying in same community
             self.steps_in_current_community += 1
             self.episode_stats['max_steps_in_community'] = max(
                 self.episode_stats['max_steps_in_community'],
                 self.steps_in_current_community
             )
         
-        # Record visit
         self.community_history.append((self.current_step, new_community))
         self.community_visit_count[new_community] += 1
         self.episode_stats['unique_communities_visited'] = len(self.community_visit_count)
+
 
     def _calculate_community_reward(self) -> Tuple[float, str]:
         """
@@ -180,12 +177,22 @@ class AdvancedGraphTraversalEnv:
         if not self.use_communities or self.current_community is None:
             return 0.0, "no_community"
         
+        if self.current_community is None:
+            if self.previous_community is not None:
+                return -0.1, "left_cache"
+            return 0.0, "no_community"
+        
+        if len(self.community_history) < 2:
+            return 0.0  , "no temporal history recorded"
+    
         reward = 0.0
         reasons = []
+
         
-        if self.previous_community and self.current_community != self.previous_community:
-            reward += self.config.COMMUNITY_SWITCH_BONUS
-            reasons.append(f"switch_bonus:+{self.config.COMMUNITY_SWITCH_BONUS:.2f}")
+        if self.steps_in_current_community == 1 and self.previous_community is not None:
+            if self.current_community != self.previous_community:
+                reward += self.config.COMMUNITY_SWITCH_BONUS
+                reasons.append(f"switch_bonus:+{self.config.COMMUNITY_SWITCH_BONUS:.2f}")
         
         if self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
             penalty = self.config.COMMUNITY_STUCK_PENALTY
@@ -198,19 +205,52 @@ class AdvancedGraphTraversalEnv:
             
             reward += penalty
         
-        if (self.previous_community and 
-            self.current_community in [c for _, c in self.community_history[:-2]]):
-            reward += self.config.COMMUNITY_LOOP_PENALTY
-            reasons.append(f"loop:{self.config.COMMUNITY_LOOP_PENALTY:.2f}")
+        if len(self.community_history) > 1:
+            previous_communities = [c for _, c in self.community_history[:-1]]
+            if self.current_community in previous_communities:
+                reward += self.config.COMMUNITY_LOOP_PENALTY
+                reasons.append(f"loop:{self.config.COMMUNITY_LOOP_PENALTY:.2f}")
+
+            if self.current_community: 
+                visit_count = self.community_visit_count[self.current_community]
+                
+                if visit_count > 2: 
+                    reward += self.config.REVISIT_PENALTY*(visit_count - 2)
+                    reasons.append(f"revisit penalty{self.config.REVISIT_PENALTY:.2f}")
         
         unique_communities = len(self.community_visit_count)
         if unique_communities >= 3:
             diversity_bonus = self.config.DIVERSE_COMMUNITY_BONUS * (unique_communities - 2)
             reward += diversity_bonus
             reasons.append(f"diversity:+{diversity_bonus:.2f}")
+
+
+        size = self.community_detector.get_community_size(self.current_community)
         
+        if 5 <= size <= 50: 
+            reward += self.config.COMMUNITY_SIZE_BONUS
+            reasons.append(f"size:{self.config.COMMUNITY_SIZE_BONUS:.2f}")
+
+        elif 50 <= size <= 200: 
+            reward += 0.1 
+
+        prev_comm = self.community_history[-2][1]
+        
+        try: 
+            prev_year = int(prev_comm.split('_')[0])
+            curr_year = int(self.current_community.split('_')[0])
+
+            if prev_year < curr_year: 
+                reward += self.config.TEMPORAL_JUMP_BONUS
+            else: 
+                reward += self.config.TEMPORAL_JUMP_PENALTY
+        
+        except: 
+            pass 
+                
         reason_str = ", ".join(reasons) if reasons else "none"
         return reward, reason_str
+
 
     async def reset(self, query: str, intent: int, start_node_id: str = None):
         """Reset environment with community tracking."""
@@ -220,14 +260,12 @@ class AdvancedGraphTraversalEnv:
         self.current_step = 0
         self.pending_manager_action = None
         self.available_worker_nodes = []
-        
-        # Reset reward tracking
+    
         self.trajectory_history = []
         self.relation_types_used = set()
         self.best_similarity_so_far = -1.0
         self.previous_node_embedding = None
         
-        # Reset community tracking
         self.current_community = None
         self.community_history = []
         self.community_visit_count = Counter()
@@ -361,6 +399,9 @@ class AdvancedGraphTraversalEnv:
         
         if relation_type == RelationType.STOP:
             self.current_step = self.max_steps
+
+            if self.previous_node_embedding is None: 
+                return True , -1.0 
             current_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
                 np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
             )
@@ -388,13 +429,35 @@ class AdvancedGraphTraversalEnv:
         paper_id = self.current_node.get('paper_id')
         author_id = self.current_node.get('author_id')
         raw_nodes = []
-        
-        # [Previous node fetching logic - unchanged]
+
         if relation_type == RelationType.CITES and paper_id:
             raw_nodes = await self.store.get_references_by_paper(paper_id)
         elif relation_type == RelationType.CITED_BY and paper_id:
             raw_nodes = await self.store.get_citations_by_paper(paper_id)
-        # ... (rest of the relation types)
+        elif relation_type == RelationType.WROTE and paper_id:
+            raw_nodes = await self.store.get_authors_by_paper_id(paper_id)
+        elif relation_type == RelationType.AUTHORED and author_id:
+            raw_nodes = await self.store.get_papers_by_author_id(author_id)
+        elif relation_type == RelationType.COLLAB and author_id:
+            raw_nodes = await self.store.get_collabs_by_author(author_id)
+        elif relation_type == RelationType.KEYWORD_JUMP and paper_id:
+            keywords = self.current_node.get('keywords', '')
+            if keywords:
+                keyword = keywords.split(',')[0].strip() if isinstance(keywords, str) else str(keywords[0])
+                raw_nodes = await self.store.get_papers_by_keyword(keyword, limit=5, exclude_paper_id=paper_id)
+        elif relation_type == RelationType.VENUE_JUMP and paper_id:
+            venue = self.current_node.get('publication_name') or self.current_node.get('venue')
+            if venue:
+                raw_nodes = await self.store.get_papers_by_venue(venue, exclude_paper_id=paper_id)
+        elif relation_type == RelationType.OLDER_REF and paper_id:
+            raw_nodes = await self.store.get_older_references(paper_id)
+        elif relation_type == RelationType.NEWER_CITED_BY and paper_id:
+            raw_nodes = await self.store.get_newer_citations(paper_id)
+        elif relation_type == RelationType.SECOND_COLLAB and author_id:
+            raw_nodes = await self.store.get_second_degree_collaborators(author_id)
+        elif relation_type == RelationType.INFLUENCE_PATH and author_id:
+            raw_nodes = await self.store.get_influence_path_papers(author_id)
+        
         
         normalized_nodes = [self._normalize_node_keys(node) for node in raw_nodes]
         self.available_worker_nodes = [(node, relation_type) for node in normalized_nodes]
@@ -443,7 +506,6 @@ class AdvancedGraphTraversalEnv:
             is_revisit = True
             self.episode_stats['revisits'] += 1
         
-        # Mark visited and UPDATE COMMUNITY TRACKING
         if paper_id:
             self.visited.add(paper_id)
             self._update_community_tracking(paper_id)
@@ -451,10 +513,9 @@ class AdvancedGraphTraversalEnv:
             self.visited.add(author_id)
             self._update_community_tracking(author_id)
         
-        # === CALCULATE WORKER REWARD ===
         worker_reward = 0.0
         
-        # 1. Semantic similarity
+        # Semantic similarity
         node_emb = await self._get_node_embedding(self.current_node)
         semantic_sim = np.dot(self.query_embedding, node_emb) / (
             np.linalg.norm(self.query_embedding) * np.linalg.norm(node_emb) + 1e-9
@@ -465,7 +526,7 @@ class AdvancedGraphTraversalEnv:
             self.best_similarity_so_far = semantic_sim
             self.episode_stats['max_similarity_achieved'] = semantic_sim
         
-        # 2. Progress reward
+        # Progress reward
         if self.previous_node_embedding is not None:
             prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
                 np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
@@ -475,28 +536,27 @@ class AdvancedGraphTraversalEnv:
             elif semantic_sim < prev_sim - 0.1:
                 worker_reward += self.config.STAGNATION_PENALTY
         
-        # 3. Novelty/revisit
+        # Novelty/revisit
         if not is_revisit and semantic_sim > 0.5:
             worker_reward += self.config.NOVELTY_BONUS
         if is_revisit:
             worker_reward += self.config.REVISIT_PENALTY
         
-        # 4. Citation bonus
+        # Citation bonus
         if paper_id:
             citation_count = await self.store.get_citation_count(paper_id)
             if citation_count > 100:
                 worker_reward += self.config.CITATION_COUNT_BONUS * np.log10(citation_count / 100)
         
-        # 5. Recency bonus
+        # Recency bonus
         year = self.current_node.get('year')
         if year and year >= 2020:
             worker_reward += self.config.RECENCY_BONUS
         
-        # === 6. COMMUNITY-AWARE REWARD ===
         community_reward, community_reason = self._calculate_community_reward()
         worker_reward += community_reward
-        
-        # Store for trajectory
+
+                    
         self.previous_node_embedding = node_emb
         self.trajectory_history.append({
             'node': self.current_node,
@@ -507,7 +567,6 @@ class AdvancedGraphTraversalEnv:
             'community_reason': community_reason
         })
         
-        # Check done
         done = self.current_step >= self.max_steps
         
         if done and semantic_sim > 0.7:
@@ -532,7 +591,6 @@ class AdvancedGraphTraversalEnv:
             )
         }
 
-    # Legacy methods (unchanged)
     async def get_valid_actions(self) -> List[Tuple[Dict, int]]:
         paper_id = self.current_node.get('paper_id')
         refs = await self.store.get_references_by_paper(paper_id)

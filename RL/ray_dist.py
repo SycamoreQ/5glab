@@ -40,7 +40,6 @@ class SharedStorage:
         self.episode_count += 1
         self.episode_rewards.append(reward)
         
-        # Print more informative stats
         if self.episode_count % 10 == 0:
             recent_rewards = self.episode_rewards[-10:]
             avg_recent = sum(recent_rewards) / len(recent_rewards)
@@ -65,11 +64,23 @@ class SharedStorage:
         }
 
 
+@ray.remote
+class SharedDatabase:
+    def __init__(self):
+        self.store = EnhancedStore(pool_size=100) 
+    
+    async def execute(self, method_name, *args, **kwargs):
+        method = getattr(self.store, method_name)
+        return await method(*args, **kwargs)
+
+
+
 @ray.remote(num_cpus=1) 
 class Explorer:
     def __init__(self, worker_id, storage_actor):
         self.worker_id = worker_id
         self.store = EnhancedStore() 
+        self.db = SharedDatabase.remote()
         self.env = AdvancedGraphTraversalEnv(self.store)
         self.agent = DDQLAgent(773, 384)
         self.storage = storage_actor
@@ -86,13 +97,14 @@ class Explorer:
         best_action_tuple = None
 
         for node_dict, rel_type in worker_actions:
-            # Extract text from node - use multiple fallbacks
+            # Extract text from node - handle both Paper and Author nodes
             node_text = (
                 node_dict.get('title') or 
-                node_dict.get('name') or 
+                node_dict.get('name') or  # For authors
                 node_dict.get('doi') or 
                 node_dict.get('original_id') or
                 node_dict.get('paper_id') or
+                node_dict.get('author_id') or
                 ''
             )
             
@@ -138,6 +150,7 @@ class Explorer:
             
             new_total_reward = new_sem_reward 
             
+            # Bonus for reaching final state
             if i == len(trajectory) - 1:
                 new_total_reward += 5.0 
             
@@ -146,35 +159,35 @@ class Explorer:
             self.storage.add_experience.remote(h_exp)
 
     async def run_episode(self, episode_idx: int): 
-        """
-        Runs a single episode of hierarchical exploration.
-        """
         try:
-            # Get latest weights from learner
             weights = await self.storage.get_weights.remote()
             
             if weights: 
                 self.agent.policy_net.load_state_dict(weights)
-                self.agent.epsilon = max(0.05, 0.995**episode_idx)  
-
+                self.agent.epsilon = max(0.05, 0.995**episode_idx) 
             initial_intent = RelationType.CITED_BY
             
             try:
                 print(f"[Explorer {self.worker_id}] Fetching a well-connected paper...")
-                paper = await self.store.get_well_connected_paper()
+                paper = await self.db.execute.remote('get_well_connected_paper')
                 
                 if not paper:
                     print(f"[Explorer {self.worker_id}] No well-connected papers, using any paper...")
-                    paper = await self.store.get_any_paper()
+                    paper = await self.db.execute.remote('get_any_paper')
                 
-                if not paper:
-                    raise ValueError("Database has no papers!")
+                if not paper or paper.get('title') or paper['title'] == '...':
+                    print(f"[Explorer {self.worker_id}] Skipping episode {episode_idx} - bad paper")
+                    return
+                
+                if paper.get('ref_count', 0) + paper.get('cite_count', 0) < 5:
+                    print(f"[Explorer {self.worker_id}] Skipping episode {episode_idx} - low connectivity")
+                    return
+                
                 
                 paper_id = paper.get('paper_id')
                 if not paper_id:
-                    raise ValueError("Paper has no paper_id field!")
+                    raise ValueError("Paper has no paper_id field")
                 
-                # Use the paper's title/id as query for semantic matching
                 query_text = paper.get('title') or paper.get('original_id') or 'research paper'
                 
                 state = await self.env.reset(query_text, initial_intent, start_node_id=paper_id)
@@ -201,7 +214,7 @@ class Explorer:
             
             print(f"[Ep {episode_idx}] Starting node: {self.env.current_node.get('title', 'Unknown')[:50]}")
             
-            while not done and step_count < 10:  
+            while not done and step_count < 10: 
                 step_count += 1
                 
                 valid_manager_actions = await self.env.get_manager_actions()
@@ -221,7 +234,6 @@ class Explorer:
                 print(f"[Ep {episode_idx} Step {step_count}] Manager chose: {manager_action_reltype} | Reward: {manager_reward:.4f} | Terminal: {is_terminal}")
                 
                 if is_terminal: 
-                    # Create terminal experience
                     action_emb = np.zeros(self.agent.text_dim)
                     action_tuple = (action_emb, manager_action_reltype)
                     experience = (state, action_tuple, manager_reward, state, True, [])
@@ -243,6 +255,7 @@ class Explorer:
 
                 print(f"[Ep {episode_idx} Step {step_count}] {len(worker_actions)} worker actions available")
 
+                # Worker action selection: epsilon-greedy
                 if random.random() < self.agent.epsilon:
                     chosen_node_dict, chosen_rel_type = random.choice(worker_actions)
                     selection_method = "random"
@@ -258,26 +271,27 @@ class Explorer:
 
                 chosen_title = (
                     chosen_node_dict.get('title') or 
-                    chosen_node_dict.get('name') or 
-                    chosen_node_dict.get('doi') or 
-                    chosen_node_dict.get('original_id') or
-                    chosen_node_dict.get('paper_id', '[Unknown]')
-                )
-                print(f"[Ep {episode_idx} Step {step_count}] Worker chose ({selection_method}): {chosen_title[:60]}")
-
-                # Encode chosen action
-                action_text = (
-                    chosen_node_dict.get('title') or 
-                    chosen_node_dict.get('name') or 
+                    chosen_node_dict.get('name') or  
                     chosen_node_dict.get('doi') or 
                     chosen_node_dict.get('original_id') or
                     chosen_node_dict.get('paper_id') or
+                    chosen_node_dict.get('author_id') or
+                    '[Unknown]'
+                )
+                print(f"[Ep {episode_idx} Step {step_count}] Worker chose ({selection_method}): {chosen_title[:60]}")
+
+                action_text = (
+                    chosen_node_dict.get('title') or 
+                    chosen_node_dict.get('name') or  # For authors
+                    chosen_node_dict.get('doi') or 
+                    chosen_node_dict.get('original_id') or
+                    chosen_node_dict.get('paper_id') or
+                    chosen_node_dict.get('author_id') or
                     'empty'
                 )
                 action_emb = self.agent.encoder.encode(action_text)
                 action_tuple = (action_emb, manager_action_reltype) 
 
-                # Execute worker step
                 next_state, worker_reward, done = await self.env.worker_step(chosen_node_dict)
                 
                 current_total_reward = manager_reward + worker_reward
@@ -285,19 +299,16 @@ class Explorer:
 
                 print(f"[Ep {episode_idx} Step {step_count}] Worker reward: {worker_reward:.4f} | Total step reward: {current_total_reward:.4f} | Done: {done}")
 
-                # Store experience
                 experience = (state, action_tuple, current_total_reward, next_state, done, worker_actions)
                 local_memory.append(experience)
                 
                 state = next_state
 
-            # Add experiences to shared storage
             print(f"[Ep {episode_idx}] Episode finished. Total reward: {total_reward:.4f} | Steps: {step_count} | Experiences: {len(local_memory)}")
             
             for exp in local_memory: 
                 self.storage.add_experience.remote(exp)
                 
-            # Generate HER experiences
             if len(local_memory) > 0: 
                 await self._process_hindsight_experience(local_memory)
                     
@@ -312,7 +323,7 @@ class Explorer:
             return episode_idx, 0.0, []
 
 
-@ray.remote(num_cpus=1)  # Changed from num_gpus=0.5 since GPU not available
+@ray.remote(num_cpus=1) 
 class Learner:
     def __init__(self, storage_actor):
         self.agent = DDQLAgent(773, 384)
@@ -351,11 +362,11 @@ class Learner:
                 stats = await self.storage.get_stats.remote()
                 print(f"[Learner] Step {self.steps} | Loss: {loss:.4f} | Memory: {stats['memory_size']} | Avg Reward: {stats['avg_reward']:.4f}")
 
+
             if self.steps % self.target_update_frequency == 0: 
                 self.agent.update_target()
                 print(f"[Learner] Step {self.steps} | Updated target network")
-
-
+                
             if self.steps % 500 == 0:
                 os.makedirs("models", exist_ok=True)
                 torch.save(
@@ -388,10 +399,9 @@ def run_training(num_explorers: int = 4, total_eps: int = 2000):
     
     # Create and start learner actor
     learner_actor = Learner.remote(storage_actor)
-    learner_future = learner_actor.update_model.remote()  # Start learning loop in background
+    learner_future = learner_actor.update_model.remote()  
     print("[Main] Learner actor created and started")
 
-    # Launch episodes
     episode_futures = []
 
     for episode_idx in range(1, TOTAL_EPISODES + 1):
@@ -404,7 +414,6 @@ def run_training(num_explorers: int = 4, total_eps: int = 2000):
         if episode_idx % 50 == 0:
             print(f"[Main] Launched {episode_idx} / {TOTAL_EPISODES} episodes")
             
-        # Rate limiting to avoid overwhelming the system
         if episode_idx % 100 == 0:
             time.sleep(2)
 
@@ -425,7 +434,6 @@ def run_training(num_explorers: int = 4, total_eps: int = 2000):
         print(f"Max Episode Reward: {max_reward:.4f}")
         print(f"Min Episode Reward: {min_reward:.4f}")
         
-        # Print reward distribution
         positive_rewards = sum(1 for r in total_rewards if r > 0)
         print(f"Episodes with positive reward: {positive_rewards} / {len(total_rewards)} ({100*positive_rewards/len(total_rewards):.1f}%)")
     

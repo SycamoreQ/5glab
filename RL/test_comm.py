@@ -1,12 +1,7 @@
-"""
-Test and visualize community-aware rewards.
-"""
-
 import asyncio
 from graph.database.store import EnhancedStore
 from RL.env import AdvancedGraphTraversalEnv, RelationType
-import random
-
+import random 
 
 async def test_community_rewards():
     print("=" * 80)
@@ -18,19 +13,27 @@ async def test_community_rewards():
     
     if not env.use_communities:
         print("\n⚠ Communities not available!")
-        print("Run: python -m RL.community_detection")
-        print("This will build the community cache.")
         return
     
-    # Show cache info
     print(f"✓ Communities loaded: {len(env.community_detector.communities)} nodes in cache")
     stats = env.community_detector.get_statistics()
     print(f"  Number of communities: {stats['num_communities']}")
     print(f"  Coverage: {stats['num_nodes']} nodes")
     
-    # Get starting paper
-    print("\n1. Fetching well-connected paper...")
+    print("\n1. Fetching well-connected paper from cache...")
+    
+    cached_paper_ids = list(env.community_detector.communities.keys())
+    
+    if not cached_paper_ids:
+        print("✗ No papers in cache!")
+        return
+    
     paper = await store.get_well_connected_paper()
+    
+    if not paper:
+        random_id = random.choice(cached_paper_ids)
+        paper = await store.get_paper_by_id(random_id)
+        print("  ⚠ Using random cached paper (no well-connected ones found)")
     
     if not paper:
         print("✗ No papers found!")
@@ -42,12 +45,16 @@ async def test_community_rewards():
     print(f"✓ Starting paper: {query_text[:60]}...")
     print(f"  Paper ID: {paper_id}")
     
-    # Check if starting paper has community
+    # Verify it's in cache
     start_comm = env.community_detector.get_community(paper_id)
     if start_comm:
         print(f"  ✓ Paper IS in cache with community: {start_comm}")
+        comm_size = env.community_detector.get_community_size(start_comm)
+        print(f"  ✓ Community size: {comm_size} nodes")
     else:
-        print(f"  ⚠ Paper NOT in cache (will have community: None)")
+        print(f"  ✗ ERROR: Paper should be in cache but isn't!")
+        print(f"     This shouldn't happen. Please report this bug.")
+        return
     
     # Reset
     state = await env.reset(query_text, RelationType.CITED_BY, start_node_id=paper_id)
@@ -175,7 +182,7 @@ async def test_community_rewards():
         print(f"Coverage rate: {coverage_pct:.1f}%")
         
         if coverage_pct < 20:
-            print(f"\n❌ PROBLEM: Very low coverage ({coverage_pct:.1f}%)")
+            print(f"\n PROBLEM: Very low coverage ({coverage_pct:.1f}%)")
             print(f"   Most nodes are not in the community cache.")
             print(f"\n💡 SOLUTION:")
             print(f"   Rebuild cache with more nodes:")
@@ -185,7 +192,6 @@ async def test_community_rewards():
             print(f"\n⚠ WARNING: Low coverage ({coverage_pct:.1f}%)")
             print(f"   Consider rebuilding cache with max_nodes=100000")
     
-    # Episode summary
     print("\n" + "=" * 80)
     print("EPISODE SUMMARY")
     print("=" * 80)
@@ -286,8 +292,7 @@ async def visualize_community_structure():
     print(f"  Largest community: {stats['max_community_size']} nodes")
     print(f"  Smallest community: {stats['min_community_size']} nodes")
     
-    # Show top communities
-    print(f"\n📈 Largest Communities:")
+    print(f"\n Largest Communities:")
     
     sorted_comms = sorted(
         detector.community_sizes.items(),
@@ -299,8 +304,7 @@ async def visualize_community_structure():
         percentage = (size / stats['num_nodes']) * 100
         print(f"  {i}. Community {comm_id}: {size} nodes ({percentage:.1f}%)")
     
-    # Sample some community neighbors
-    print(f"\n🔗 Community Connections (sample):")
+    print(f"\n Community Connections (sample):")
     
     for comm_id, _ in sorted_comms[:3]:
         neighbors = await detector.get_community_neighbors(comm_id, limit=5)

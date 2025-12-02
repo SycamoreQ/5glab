@@ -7,7 +7,7 @@ from collections import deque
 from typing import List, Tuple, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 import logging
-import torch.functional as F
+import torch.nn.functional as F
 
 
 class QNetwork(nn.Module):
@@ -36,8 +36,8 @@ class DDQLAgent:
     def __init__(self, state_dim, text_dim):
         self.state_dim = state_dim
         self.text_dim = text_dim
-        self.relation_dim = 5
-        self.device = torch.device
+        self.relation_dim = 13 
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         self.policy_net = QNetwork(state_dim, text_dim, self.relation_dim)
         self.target_net = QNetwork(state_dim, text_dim, self.relation_dim)
@@ -54,17 +54,22 @@ class DDQLAgent:
         self.epsilon_decay = 0.995
         self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
 
-    def _get_relation_onehot(self, r_type):
-        t = torch.zeros(1, self.relation_dim)
-        t[0][r_type] = 1.0
+
+    def _get_relation_onehot(self, r_type: int):
+        t = torch.zeros(1, 13)
+        if 0 <= r_type < 13:
+            t[0][r_type] = 1.0
+        else:
+            print(f"WARNING: Invalid relation type {r_type}")
         return t
+
     
     def act(self , state , valid_actions):
         if not valid_actions: 
             return None 
         
-        if np.random.rand < self.epsilon: 
-            return random.choise(valid_actions)
+        if np.random.rand() < self.epsilon: 
+            return random.choice(valid_actions)
         
         state_t = torch.FloatTensor(state).unsqueeze(0)
         best_q = -float('inf')
