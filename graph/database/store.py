@@ -460,8 +460,70 @@ class EnhancedStore:
                     ORDER BY (ref_count + cite_count) DESC 
                     LIMIT 1 
                 """
-        rows = await self._run_query_method(query, [])
+        rows = await self._run_query_method(query, [cached_paper_ids])
         return rows[0] if rows else None
         
 
+    async def get_prolific_authors(self) -> Optional[List]: 
+        query = """
+                MATCH (a:Author)-[:WROTE]->(p:Paper)
+                OPTIONAL MATCH (p)<-[:CITES]-(citing:Paper)
+                OPTIONAL MATCH (a)-[:WROTE]->(:Paper)<-[:WROTE]-(coauthor:Author)
+                WHERE elementId(a) <> elementId(coauthor)
+                WITH a,
+                    count(DISTINCT p) as paper_count,
+                    count(DISTINCT citing) as total_citations,
+                    count(DISTINCT coauthor) as collaborator_count
+                WHERE paper_count >= 5  // Filter for active authors
+                RETURN a.name as author_name,
+                    elementId(a) as author_id,
+                    paper_count,
+                    total_citations,
+                    collaborator_count,
+                    (paper_count + total_citations/10 + collaborator_count) as impact_score
+                ORDER BY impact_score DESC
+                """
+        
+        rows = await self._run_query_method(query , [])
+        return rows
+        
+
+    async def get_author_h_index(self, author_id: str) -> int:
+        query = """
+                MATCH (a:Author)-[:WROTE]->(p:Paper)
+                WHERE elementId(a) = $1
+                OPTIONAL MATCH (p)<-[:CITES]-(citing:Paper)
+                WITH p, count(citing) as citation_count
+                ORDER BY citation_count DESC
+                WITH collect(citation_count) as citation_counts
+                
+                UNWIND range(0, size(citation_counts)-1) as idx
+                WITH idx, citation_counts[idx] as citations
+                WHERE citations >= idx + 1
+                RETURN max(idx + 1) as h_index
+        """
+        
+        rows = await self._run_query_method(query, [author_id])
+        return rows[0].get('h_index', 0) if rows and rows[0].get('h_index') else 0
     
+    async def get_citation_velocity(self , author_id) -> int: 
+        query = """
+                MATCH (a:Author) -[:WROTE]-> (p:Paper)
+                WHERE elementId(a) = $1 AND p.year >= 2022
+                OPTIONAL MATCH (p)<-[:CITES]-(citing:Paper)
+                RETURN count(citing) as recent_citations
+                """ 
+        
+        recent_citations = await self._run_query_method(query , [author_id])
+        return recent_citations[0].get('recent_citations' , 0) if recent_citations and recent_citations[0].get('recent_citations') else 0
+    
+    async def get_pub_diversity(self , author_id) -> int:
+        query = """
+                MATCH (a: Author)-[:WROTE]->(p:Paper)
+                WHERE elementId(a) = $1
+                WITH count(DISTINCT p.keywords) as subjects AND count(DISTINCT a.publication_name) as publications
+                RETURN (subjects + publications) as diversity_score
+                """
+        
+        diversity_score = await self._run_query_method(query , [author_id])
+        return diversity_score[0].get('diversity_score' , 0) if diversity_score and diversity_score[0].get('diversity_score') else 0         

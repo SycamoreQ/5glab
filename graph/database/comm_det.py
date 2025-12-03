@@ -191,9 +191,9 @@ class CommunityDetector:
         try:
             prolific = await self.store._run_query_method(query_prolific, [])
             all_authors.extend(prolific)
-            print(f"    ✓ Found {len(prolific)} prolific authors")
+            print(f" Found {len(prolific)} prolific authors")
         except Exception as e:
-            print(f"    ⚠ Phase 1 failed: {e}")
+            print(f" Phase 1 failed: {e}")
         
         if len(all_authors) < max_authors:
             print("  Phase 2/3: Fetching active authors (5-9 papers)...")
@@ -282,12 +282,12 @@ class CommunityDetector:
             
             self.author_communities[node_id] = comm_id
         
-        # Calculate sizes
+
         author_counter = Counter(self.author_communities.values())
         self.author_community_sizes = dict(author_counter)
         
-        print(f"\n  ✓ Created {len(set(self.author_communities.values()))} author communities")
-        print(f"  ✓ Covered {len(self.author_communities)} authors")
+        print(f"\n Created {len(set(self.author_communities.values()))} author communities")
+        print(f" Covered {len(self.author_communities)} authors")
         
         # Show distribution
         top_author_comms = sorted(self.author_community_sizes.items(), key=lambda x: x[1], reverse=True)[:5]
