@@ -9,173 +9,131 @@ from graph.database.store import EnhancedStore
 
 class CommunityDetector:
     """
-    Detects and caches communities in the paper graph using Louvain algorithm.
-    Communities are precomputed and stored for fast lookup during training.
+    Detects communities for BOTH papers and authors.
+    
+    Paper Communities: Clustered by citation patterns + time period
+    Author Communities: Clustered by collaboration patterns + research area
     """
     
-    def __init__(self, store: EnhancedStore, cache_file: str = "communities.pkl"):
+    def __init__(self, store: EnhancedStore, cache_file: str = "communities_unified.pkl"):
         self.store = store
         self.cache_file = cache_file
-        self.communities = {}  # node_id -> community_id
-        self.author_communities = {}
-
+        
+        # Separate tracking for papers and authors
+        self.paper_communities = {}  # paper_id -> community_id
+        self.author_communities = {}  # author_id -> community_id
+        
+        self.paper_community_sizes = {}
         self.author_community_sizes = {}
-        self.community_sizes = {}  # community_id -> size
+        
         self.is_loaded = False
     
-    async def build_communities(self, method: str = "cypher", max_nodes: int = 50000):
-        """
-        Build community structure using Neo4j's native algorithms or Python-based clustering.
+    async def build_communities(self, max_papers: int = 50000, max_authors: int = 20000):
+        """Build communities for both papers and authors."""
+        print("=" * 80)
+        print("BUILDING UNIFIED COMMUNITIES (Papers + Authors)")
+        print("=" * 80)
         
-        Args:
-            method: "cypher" (fast, uses Neo4j GDS) or "networkx" (slower, more control)
-            max_nodes: Maximum nodes to process (for memory efficiency)
-        """
-        print(f"Building communities using {method} method...")
+        # Build paper communities
+        await self._build_paper_communities(max_papers)
         
-        if method == "cypher":
-            await self._build_with_cypher_gds(max_nodes)
-        else:
-            await self._build_simple_citation_based(max_nodes)
+        # Build author communities
+        await self._build_author_communities(max_authors)
         
         # Save to cache
         self._save_cache()
         self.is_loaded = True
         
-        print(f"✓ Found {len(set(self.communities.values()))} communities")
-        print(f"✓ Covering {len(self.communities)} nodes")
+        print("\n" + "=" * 80)
+        print("COMMUNITY DETECTION COMPLETE")
+        print("=" * 80)
+        print(f"✓ Paper communities: {len(set(self.paper_communities.values()))}")
+        print(f"✓ Author communities: {len(set(self.author_communities.values()))}")
+        print(f"✓ Total papers covered: {len(self.paper_communities)}")
+        print(f"✓ Total authors covered: {len(self.author_communities)}")
     
-    async def _build_with_cypher_gds(self, max_nodes: int):
-        print("Attempting to use Neo4j GDS Louvain")
+    async def _build_paper_communities(self, max_papers: int):
+        """Build paper communities based on citation patterns."""
+        print("\nPAPER COMMUNITIES")
+        print("-" * 80)
         
-        check_query = "CALL gds.list() YIELD name RETURN count(*) as count"
-        try:
-            result = await self.store._run_query_method(check_query, [])
-            if not result or result[0].get('count', 0) == 0:
-                print("⚠ GDS not available, falling back to simple method")
-                await self._build_simple_citation_based(max_nodes)
-                return
-        except Exception as e:
-            print(f"⚠ GDS check failed: {e}, using simple method")
-            await self._build_simple_citation_based(max_nodes)
-            return
+        all_papers = []
         
-
-        project_query = f"""
-                CALL gds.graph.project.cypher(
-                    'paper-citation-graph',
-                    'MATCH (p:Paper) WHERE COUNT {{ (p)<-[:CITES]-() }} > 5 RETURN id(p) AS id',
-                    'MATCH (p1:Paper)-[:CITES]->(p2:Paper) 
-                    WHERE COUNT {{ (p1)<-[:CITES]-() }} > 5 
-                    AND COUNT {{ (p2)<-[:CITES]-() }} > 5 
-                    RETURN id(p1) AS source, id(p2) AS target'
-                )
-                YIELD graphName, nodeCount, relationshipCount
-                RETURN graphName, nodeCount, relationshipCount
-                """
-
-        
-        try:
-            drop_query = "CALL gds.graph.drop('paper-citation-graph', false)"
-            await self.store._run_query_method(drop_query, [])
-        except:
-            pass
-        
-        try:
-            result = await self.store._run_query_method(project_query, [])
-            print(f"✓ Graph projected: {result[0]['nodeCount']} nodes, {result[0]['relationshipCount']} edges")
-        except Exception as e:
-            print(f"✗ Graph projection failed: {e}")
-            await self._build_simple_citation_based(max_nodes)
-            return
-        
-        louvain_query = """
-            CALL gds.leiden.stream('paper-citation-graph', {
-                maxLevels: 10,
-                tolerance: 0.0001,
-                gamma: 1.0
-            })
-            YIELD nodeId, communityId
-            MATCH (p:Paper) WHERE id(p) = nodeId
-            RETURN elementId(p) as node_id, 
-                communityId as community_id,
-                COUNT { (p)<-[:CITES]-() } as cites,
-                p.year as year
-            LIMIT $1
-            """
-        
-        try:
-            results = await self.store._run_query_method(louvain_query, [max_nodes])
-            
-            for row in results:
-                node_id = row['node_id']
-                comm_id = row['community_id']
-                self.communities[node_id] = comm_id
-            
-            self._calculate_community_sizes()
-            
-            drop_query = "CALL gds.graph.drop('paper-citation-graph')"
-            await self.store._run_query_method(drop_query, [])
-            
-        except Exception as e:
-            print(f"✗ Louvain failed: {e}")
-            await self._build_simple_citation_based(max_nodes)
-
-
-
-
-    async def _build_simple_citation_based(self, max_nodes: int):
-
-        print("Building connected ego-network communities...")
-        
-        query = """
-        MATCH (center:Paper)
-        WHERE center.year IS NOT NULL 
-        AND COUNT { (center)<-[:CITES]-() } > 10
-        WITH center
-        ORDER BY COUNT { (center)<-[:CITES]-() } DESC
-        LIMIT 500
-        
-        // Get center + its 1-hop neighborhood
-        CALL {
-            WITH center
-            MATCH (center)-[:CITES|CITED_BY]-(neighbor:Paper)
-            RETURN DISTINCT elementId(neighbor) as node_id,
-                COUNT { (neighbor)<-[:CITES]-() } as cites,
-                neighbor.year as year
-            LIMIT 100
-            
-            UNION
-            
-            WITH center
-            RETURN elementId(center) as node_id,
-                COUNT { (center)<-[:CITES]-() } as cites,
-                center.year as year
-        }
-        
-        RETURN DISTINCT node_id, cites, year
-        LIMIT $1
+        # Phase 1: Highly cited papers
+        print("  Phase 1/3: Fetching highly-cited papers (100+ citations)...")
+        query_highly_cited = """
+            MATCH (p:Paper)<-[r:CITES]-(citing:Paper)
+            WITH p, elementId(p) as node_id, count(r) as cite_count
+            WHERE cite_count >= 100
+            OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
+            WITH node_id, cite_count, count(ref) as ref_count, p.year as year,
+                 COALESCE(p.title, p.id, '') as title
+            RETURN node_id, ref_count as refs, cite_count as cites, year, title
+            LIMIT 5000
         """
         
-        papers = await self.store._run_query_method(query, [max_nodes])
+        try:
+            highly_cited = await self.store._run_query_method(query_highly_cited, [])
+            all_papers.extend(highly_cited)
+            print(f"    ✓ Found {len(highly_cited)} highly-cited papers")
+        except Exception as e:
+            print(f"    ⚠ Phase 1 failed: {e}")
         
-        if not papers:
-            print("✗ No papers found")
-            return
+        # Phase 2: Medium cited papers
+        if len(all_papers) < max_papers:
+            print("  Phase 2/3: Fetching medium-cited papers (5-99 citations)...")
+            remaining = max_papers - len(all_papers)
+            
+            query_medium = """
+                MATCH (p:Paper)<-[r:CITES]-(citing:Paper)
+                WITH p, elementId(p) as node_id, count(r) as cite_count
+                WHERE cite_count >= 5 AND cite_count < 100
+                OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
+                WITH node_id, cite_count, count(ref) as ref_count, p.year as year,
+                     COALESCE(p.title, p.id, '') as title
+                RETURN node_id, ref_count as refs, cite_count as cites, year, title
+                LIMIT $1
+            """
+            
+            try:
+                medium = await self.store._run_query_method(query_medium, [remaining])
+                all_papers.extend(medium)
+                print(f"Found {len(medium)} medium-cited papers")
+            except Exception as e:
+                print(f"Phase 2 failed: {e}")
         
-        print(f"✓ Fetched {len(papers):,} papers from database")
+        # Phase 3: Rest
+        if len(all_papers) < max_papers:
+            print("  Phase 3/3: Fetching remaining papers...")
+            remaining = max_papers - len(all_papers)
+            
+            query_rest = """
+                MATCH (p:Paper)
+                OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
+                OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
+                WITH p, elementId(p) as node_id, 
+                     count(DISTINCT ref) as refs, 
+                     count(DISTINCT citing) as cites
+                WHERE refs > 0 OR cites > 0
+                RETURN node_id, refs, cites, p.year as year,
+                       COALESCE(p.title, p.id, '') as title
+                LIMIT $1
+            """
+            
+            try:
+                rest = await self.store._run_query_method(query_rest, [remaining])
+                all_papers.extend(rest)
+                print(f"    ✓ Found {len(rest)} additional papers")
+            except Exception as e:
+                print(f"    ⚠ Phase 3 failed: {e}")
         
-        if papers:
-            sample = papers[0]
-            print(f"  Sample node_id format: {sample.get('node_id')}")
-        
-        # Assign communities
-        for paper in papers:
+        # Assign paper communities
+        for paper in all_papers:
             node_id = paper['node_id']
             cites = paper.get('cites', 0)
             year = paper.get('year', 2000)
             
-            # Assign community based on citation patterns
+            # Citation tier
             if cites >= 1000:
                 cite_tier = 5
             elif cites >= 100:
@@ -188,33 +146,35 @@ class CommunityDetector:
                 cite_tier = 1
             
             year_bucket = (year // 5) * 5 if year else 2000
-            comm_id = f"{year_bucket}_{cite_tier}"
             
-            self.communities[node_id] = comm_id
+            comm_id = f"P_{year_bucket}_{cite_tier}"
+            self.paper_communities[node_id] = comm_id
         
-        self._calculate_community_sizes()
-        num_communities = len(set(self.communities.values()))
-        print(f"✓ Created {num_communities} citation-based communities")
-        print(f"✓ Covered {len(self.communities)} papers")
+        paper_counter = Counter(self.paper_communities.values())
+        self.paper_community_sizes = dict(paper_counter)
         
-        if self.community_sizes:
-            sorted_sizes = sorted(self.community_sizes.items(), 
-                                key=lambda x: x[1], reverse=True)[:5]
-            print(f"\n  Top 5 largest communities:")
-            for i, (comm_id, size) in enumerate(sorted_sizes, 1):
-                percentage = (size / len(self.communities)) * 100
-                print(f"    {i}. {comm_id}: {size} papers ({percentage:.1f}%)")
-
-
-
+        print(f"\n  ✓ Created {len(set(self.paper_communities.values()))} paper communities")
+        print(f"  ✓ Covered {len(self.paper_communities)} papers")
+        
+        # Show distribution
+        top_paper_comms = sorted(self.paper_community_sizes.items(), key=lambda x: x[1], reverse=True)[:3]
+        print(f"\n  Top 3 paper communities:")
+        for i, (comm_id, size) in enumerate(top_paper_comms, 1):
+            print(f"    {i}. {comm_id}: {size} papers")
+    
     async def _build_author_communities(self, max_authors: int):
-        """Build author communities based on collaboration patterns."""
-        print("\n AUTHOR COMMUNITIES")
+        """
+        Build author communities based on collaboration patterns.
+        
+        IMPORTANT: Authors have NO direct edges. Collaboration is computed via:
+        (a1:Author)-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
+        """
+        print("\nAUTHOR COMMUNITIES")
         print("-" * 80)
+        print("  Note: Computing collaboration via co-authorship (shared papers)")
         
         all_authors = []
         
-        # Phase 1: Prolific authors (many papers)
         print("  Phase 1/3: Fetching prolific authors (10+ papers)...")
         query_prolific = """
             MATCH (a:Author)-[:WROTE]->(p:Paper)
@@ -227,15 +187,14 @@ class CommunityDetector:
             RETURN node_id, paper_count, collab_count, name, affiliation
             LIMIT 5000
         """
-
-        try: 
-            prolific = await self.store._run_query_method(query_prolific , [])
+        
+        try:
+            prolific = await self.store._run_query_method(query_prolific, [])
             all_authors.extend(prolific)
-            print(f"found {len(all_authors)} prolific authors")
-
+            print(f"    ✓ Found {len(prolific)} prolific authors")
         except Exception as e:
-            print("Phase 1 failed")
-
+            print(f"    ⚠ Phase 1 failed: {e}")
+        
         if len(all_authors) < max_authors:
             print("  Phase 2/3: Fetching active authors (5-9 papers)...")
             remaining = max_authors - len(all_authors)
@@ -255,11 +214,10 @@ class CommunityDetector:
             try:
                 active = await self.store._run_query_method(query_active, [remaining])
                 all_authors.extend(active)
-                print(f"Found {len(active)} active authors")
+                print(f"    ✓ Found {len(active)} active authors")
             except Exception as e:
-                print(f"Phase 2 failed: {e}")
+                print(f"    ⚠ Phase 2 failed: {e}")
         
-        # Phase 3: Rest
         if len(all_authors) < max_authors:
             print("  Phase 3/3: Fetching remaining authors...")
             remaining = max_authors - len(all_authors)
@@ -278,18 +236,24 @@ class CommunityDetector:
             try:
                 rest = await self.store._run_query_method(query_rest, [remaining])
                 all_authors.extend(rest)
-                print(f"Found {len(rest)} additional authors")
+                print(f"    ✓ Found {len(rest)} additional authors")
             except Exception as e:
-                print(f"Phase 3 failed: {e}")  
-
-
-        for author in all_authors: 
+                print(f"    ⚠ Phase 3 failed: {e}")
+        
+        print(f"\n  ✓ Total authors fetched: {len(all_authors)}")
+        
+        if all_authors:
+            sample = all_authors[0]
+            print(f"  Sample author: {sample.get('name', 'Unknown')[:40]}")
+            print(f"    Papers: {sample.get('paper_count', 0)}")
+            print(f"    Collaborators (via shared papers): {sample.get('collab_count', 0)}")
+        
+        
+        for author in all_authors:
             node_id = author['node_id']
-            paper_count = author.get('paper_count' , 0)
-            collab_count = author.get('collab_count' , 0)
-            affiliation = author.get('affiliation' , 0)
-
-
+            paper_count = author.get('paper_count', 0)
+            collab_count = author.get('collab_count', 0)
+            
             # Productivity tier
             if paper_count >= 50:
                 prod_tier = 5  # Very prolific
@@ -302,7 +266,7 @@ class CommunityDetector:
             else:
                 prod_tier = 1  # Occasional
             
-            # Collaboration tier
+            # Collaboration tier (via co-authorship)
             if collab_count >= 50:
                 collab_tier = 3  # Highly collaborative
             elif collab_count >= 10:
@@ -310,50 +274,62 @@ class CommunityDetector:
             else:
                 collab_tier = 1  # Solo/small team
             
-            if affiliation:
-                aff_bucket = affiliation[:3].upper() if len(affiliation) >= 3 else "UNK"
-            else:
-                aff_bucket = "UNK"
-            
-            # - A_5_3_MIT = Very prolific, highly collaborative MIT authors
-            # - A_2_1_UNK = Moderate productivity, solo researchers
+            # Community ID: "A_{productivity}_{collaboration}"
+            # Examples:
+            # - A_5_3 = Very prolific (50+ papers), highly collaborative (50+ co-authors)
+            # - A_2_1 = Moderate (5-9 papers), solo researcher
             comm_id = f"A_{prod_tier}_{collab_tier}"
             
             self.author_communities[node_id] = comm_id
         
+        # Calculate sizes
         author_counter = Counter(self.author_communities.values())
         self.author_community_sizes = dict(author_counter)
         
-        print(f"\n Created {len(set(self.author_communities.values()))} author communities")
-        print(f"Covered {len(self.author_communities)} authors")
+        print(f"\n  ✓ Created {len(set(self.author_communities.values()))} author communities")
+        print(f"  ✓ Covered {len(self.author_communities)} authors")
         
-        top_author_comms = sorted(self.author_community_sizes.items(), key=lambda x: x[1], reverse=True)[:3]
-        print(f"\n  Top 3 author communities:")
+        # Show distribution
+        top_author_comms = sorted(self.author_community_sizes.items(), key=lambda x: x[1], reverse=True)[:5]
+        print(f"\n  Top 5 author communities:")
         for i, (comm_id, size) in enumerate(top_author_comms, 1):
-            print(f"    {i}. {comm_id}: {size} authors")
-
-            
-    def _calculate_community_sizes(self):
-        """Calculate the size of each community."""
-        comm_counter = Counter(self.communities.values())
-        self.community_sizes = dict(comm_counter)
+            # Decode community ID
+            parts = comm_id.split('_')
+            if len(parts) == 3:
+                prod = parts[1]
+                collab = parts[2]
+                prod_label = {
+                    '5': 'Very Prolific (50+)',
+                    '4': 'Prolific (20-49)',
+                    '3': 'Active (10-19)',
+                    '2': 'Moderate (5-9)',
+                    '1': 'Occasional (<5)'
+                }.get(prod, prod)
+                collab_label = {
+                    '3': 'Highly Collab (50+)',
+                    '2': 'Collaborative (10-49)',
+                    '1': 'Solo/Small (<10)'
+                }.get(collab, collab)
+                print(f"    {i}. {comm_id}: {size} authors ({prod_label}, {collab_label})")
+            else:
+                print(f"    {i}. {comm_id}: {size} authors")
     
     def _save_cache(self):
-        """Save communities to disk for fast loading."""
+        """Save unified cache."""
         cache_data = {
-            'communities': self.communities,
-            'community_sizes': self.community_sizes,
-            'author_communities' : self.author_communities,
-            'author_community_sizes' : self.author_community_sizes
+            'paper_communities': self.paper_communities,
+            'author_communities': self.author_communities,
+            'paper_community_sizes': self.paper_community_sizes,
+            'author_community_sizes': self.author_community_sizes
         }
         
         with open(self.cache_file, 'wb') as f:
             pickle.dump(cache_data, f)
         
-        print(f"Communities cached to {self.cache_file}")
+        print(f"\n✓ Unified communities cached to {self.cache_file}")
     
     def load_cache(self) -> bool:
-        """Load precomputed communities from disk."""
+        """Load unified cache."""
         if not os.path.exists(self.cache_file):
             return False
         
@@ -361,83 +337,65 @@ class CommunityDetector:
             with open(self.cache_file, 'rb') as f:
                 cache_data = pickle.load(f)
             
-            self.communities = cache_data['communities']
-            self.community_sizes = cache_data['community_sizes']
+            self.paper_communities = cache_data['paper_communities']
             self.author_communities = cache_data['author_communities']
+            self.paper_community_sizes = cache_data['paper_community_sizes']
             self.author_community_sizes = cache_data['author_community_sizes']
             self.is_loaded = True
             
-            print(f"Loaded {len(set(self.communities.values()))} communities from cache")
+            print(f"✓ Loaded unified communities from cache")
+            print(f"  Papers: {len(self.paper_communities)} in {len(set(self.paper_communities.values()))} communities")
+            print(f"  Authors: {len(self.author_communities)} in {len(set(self.author_communities.values()))} communities")
             return True
         except Exception as e:
-            print(f"Failed to load cache: {e}")
+            print(f"✗ Failed to load cache: {e}")
             return False
     
-    def get_community(self, node_id: str) -> Optional[str]:
-        """Get community ID for a node."""
-        return self.communities.get(node_id, None)
+    def get_community(self, node_id: str, node_type: str = None) -> Optional[str]:
+        """
+        Get community for a node.
+        Auto-detects type from paper/author communities if node_type not provided.
+        """
+        if node_type == "paper" or node_id in self.paper_communities:
+            return self.paper_communities.get(node_id)
+        elif node_type == "author" or node_id in self.author_communities:
+            return self.author_communities.get(node_id)
+        else:
+            # Try both
+            return self.paper_communities.get(node_id) or self.author_communities.get(node_id)
     
     def get_community_size(self, community_id: str) -> int:
-        """Get size of a community."""
-        return self.community_sizes.get(community_id, 0)
+        """Get size of a community (works for both paper and author communities)."""
+        if community_id.startswith('P_'):
+            return self.paper_community_sizes.get(community_id, 0)
+        elif community_id.startswith('A_'):
+            return self.author_community_sizes.get(community_id, 0)
+        else:
+            return 0
     
     def get_statistics(self) -> Dict:
-        """Get community statistics."""
-        num_communities = len(set(self.communities.values()))
-        avg_size = np.mean(list(self.community_sizes.values())) if self.community_sizes else 0
-        max_size = max(self.community_sizes.values()) if self.community_sizes else 0
-        min_size = min(self.community_sizes.values()) if self.community_sizes else 0
-        
+        """Get unified statistics."""
         return {
-            'num_communities': num_communities,
-            'num_nodes': len(self.communities),
-            'avg_community_size': avg_size,
-            'max_community_size': max_size,
-            'min_community_size': min_size,
-            'coverage': len(self.communities) 
+            'num_paper_communities': len(set(self.paper_communities.values())),
+            'num_author_communities': len(set(self.author_communities.values())),
+            'num_papers': len(self.paper_communities),
+            'num_authors': len(self.author_communities),
+            'avg_paper_community_size': np.mean(list(self.paper_community_sizes.values())) if self.paper_community_sizes else 0,
+            'avg_author_community_size': np.mean(list(self.author_community_sizes.values())) if self.author_community_sizes else 0,
         }
-    
-    async def get_community_neighbors(self, community_id: str, limit: int = 10) -> List[str]:
-        """
-        Get neighboring communities (communities connected to this one).
-        Useful for understanding community structure.
-        """
-        nodes_in_comm = [nid for nid, cid in self.communities.items() if cid == community_id]
-        
-        if not nodes_in_comm:
-            return []
-        
-        sample_nodes = nodes_in_comm[:min(10, len(nodes_in_comm))]
-        
-        neighbor_communities = set()
-        
-        for node_id in sample_nodes:
-            query = """
-                MATCH (p:Paper)-[:CITES|CITED_BY]-(neighbor:Paper)
-                WHERE elementId(p) = $1
-                RETURN DISTINCT elementId(neighbor) as neighbor_id
-                LIMIT 20
-            """
-            
-            neighbors = await self.store._run_query_method(query, [node_id])
-            
-            for n in neighbors:
-                n_id = n['neighbor_id']
-                n_comm = self.get_community(n_id)
-                if n_comm and n_comm != community_id:
-                    neighbor_communities.add(n_comm)
-        
-        return list(neighbor_communities)[:limit]
 
 
-async def build_and_cache_communities():
+async def build_and_cache_unified_communities():
+    """Build unified communities for papers and authors."""
     print("=" * 80)
-    print("COMMUNITY DETECTION - Building Graph Communities")
+    print("UNIFIED COMMUNITY DETECTION")
+    print("Building communities for Papers AND Authors")
     print("=" * 80)
     
     store = EnhancedStore()
     detector = CommunityDetector(store)
     
+    # Try to load existing cache
     if detector.load_cache():
         print("\n✓ Communities already cached!")
         stats = detector.get_statistics()
@@ -446,32 +404,18 @@ async def build_and_cache_communities():
             print(f"  {key}: {value}")
     else:
         print("\n⚠ No cache found, building communities...")
-        print("This may take 5-10 minutes for large graphs...")
+        print("This may take 10-15 minutes for large graphs...")
         
-        await detector.build_communities(method="simple", max_nodes=1000000)
+        await detector.build_communities(max_papers=50000, max_authors=20000)
         
         stats = detector.get_statistics()
-        print(f"\n✓ Community detection complete!")
-        print(f"\nStatistics:")
+        print(f"\nFinal Statistics:")
         for key, value in stats.items():
             print(f"  {key}: {value}")
-    
-    print(f"\n" + "=" * 80)
-    print("SAMPLE COMMUNITIES")
-    print("=" * 80)
-    
-    communities = defaultdict(list)
-    for node_id, comm_id in list(detector.communities.items())[:100]:
-        communities[comm_id].append(node_id)
-    
-    for i, (comm_id, nodes) in enumerate(list(communities.items())[:5], 1):
-        print(f"\nCommunity {comm_id}:")
-        print(f"  Size: {detector.get_community_size(comm_id)}")
-        print(f"  Sample nodes: {len(nodes)}")
     
     await store.pool.close()
     print("\n✓ Done!")
 
 
 if __name__ == "__main__":
-    asyncio.run(build_and_cache_communities())
+    asyncio.run(build_and_cache_unified_communities())
