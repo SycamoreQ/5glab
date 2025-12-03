@@ -5,6 +5,9 @@ from collections import deque, Counter
 from typing import List, Tuple, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 import logging
+from utils.coldstart import ColdStartHandler
+from utils.diversity import DiversitySelector
+from utils.userfeedback import UserFeedbackTracker
 
 try:
     from graph.database.comm_det import CommunityDetector
@@ -90,7 +93,7 @@ class AdvancedGraphTraversalEnv:
     """
     
     def __init__(self, store, embedding_model_name="all-MiniLM-L6-v2", 
-                 use_communities=True):
+                 use_communities=True , use_feedback = True):
         self.store = store
         self.encoder = SentenceTransformer(embedding_model_name)
         self.query_embedding = None
@@ -138,6 +141,13 @@ class AdvancedGraphTraversalEnv:
         self.author_influence = {}
         self.previous_author = None 
         self.h_index_cache = {}
+
+        self.use_feedback = use_feedback
+        if use_feedback:
+            self.feedback_tracker = UserFeedbackTracker()
+            self.diversity_selector = DiversitySelector()
+            self.cold_start_handler = ColdStartHandler(store, self.config)
+
         self.episode_stats = {
             'total_nodes_explored': 0,
             'unique_relation_types': 0,
@@ -706,8 +716,19 @@ class AdvancedGraphTraversalEnv:
             pub_name = self.current_node.get('publication_name') or ''
             if pub_name and any(top_venue.lower() in pub_name.lower() for top_venue in self.config.TOP_VENUES):
                 worker_paper_reward += 0.3
-        
 
+
+            if self.use_feedback:
+                feedback_reward = self.feedback_tracker.get_feedback_reward(paper_id)
+                worker_paper_reward += feedback_reward * 0.5
+
+                self.feedback_tracker.simulate_feedback(paper_id , semantic_sim)
+                
+
+            if self.use_feedback and self.cold_start_handler.is_cold_start(self.current_node):
+                cold_reward = self.cold_start_handler.get_cold_start_reward(paper_id , self.current_node)
+                worker_paper_reward += cold_reward
+                
         # === AUTHOR-SPECIFIC REWARDS ===
         elif author_id:
             worker_author_reward += semantic_sim * self.config.SEMANTIC_WEIGHT * 0.8
@@ -766,7 +787,6 @@ class AdvancedGraphTraversalEnv:
         elif author_id:
             (author_reward, node_type), community_reason = self._calculate_community_reward()
             worker_author_reward += author_reward
-        
 
         worker_reward = worker_paper_reward + worker_author_reward
         
@@ -795,6 +815,33 @@ class AdvancedGraphTraversalEnv:
         self.available_worker_nodes = []
         
         return next_state, worker_reward, done
+    
+
+    def get_diverse_results(self , trajectory: List[Dict]) -> List[Dict]: 
+        if not self.use_feedback: 
+            return trajectory
+        
+        papers_with_emb = []
+        for step in trajectory:
+            node = step['node']
+            if node.get('paper_id'):
+                papers_with_emb.append({
+                    **node,
+                    'embedding': step.get('node_embedding')  
+                })
+        
+        diverse_papers = self.diversity_selector.select_diverse_papers(
+            papers_with_emb,
+            self.query_embedding,
+            k=10
+        )
+        
+        return diverse_papers
+    
+
+    
+        
+
 
 
     def get_episode_summary(self) -> Dict[str, Any]:
