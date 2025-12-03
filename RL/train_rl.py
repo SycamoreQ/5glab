@@ -8,6 +8,7 @@ from RL.env import AdvancedGraphTraversalEnv
 from RL.ddqn import DDQLAgent
 import matplotlib.pyplot as plt
 from collections import deque
+from utils.userfeedback import UserFeedbackTracker 
 
 async def train_single_process():
     """Simple single-process training with DDQN agent."""
@@ -169,10 +170,13 @@ async def train_single_process():
             
             # Logging
             if episode % 10 == 0:
+                env.feedback_tracker.save_feedback()
+                total_clicks = sum(env.feedback_tracker.clicks.values())
+                total_saves = sum(env.feedback_tracker.saves.values())
                 avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
                 avg_steps = np.mean(episode_steps[-100:]) if len(episode_steps) >= 100 else np.mean(episode_steps)
                 avg_sim = np.mean(episode_similarities[-100:]) if len(episode_similarities) >= 100 else np.mean(episode_similarities)
-                
+                print(f"  Feedback: {total_clicks} clicks, {total_saves} saves")
                 print(f"Episode {episode:4d} | "
                       f"Reward: {episode_reward:+7.2f} | "
                       f"Avg(100): {avg_reward:+7.2f} | "
