@@ -53,7 +53,7 @@ class CommunityAwareRewardConfig:
     TEMPORAL_JUMP_BONUS = 0.2        # Bonus for moving to a community which is recent 
     TEMPORAL_JUMP_PENALTY = -0.1        # Bonus for doing the opposite 
     COMMUNITY_SIZE_BONUS = 0.3         # Bonus for not being in small communities
-    BRIDGE_NODE_BONUS = 0.5 
+    NODE_TYPE_SWITCH = 0.1
 
     PROLIFIC_AUTHOR_BONUS = 0.4         # Bonus for authors with many papers
     PROLIFIC_THRESHOLD = 20             # Min papers for "prolific"
@@ -61,14 +61,26 @@ class CommunityAwareRewardConfig:
     COLLABORATION_THRESHOLD = 10        # Min collaborators
     AUTHOR_H_INDEX_BONUS = 0.35         # Bonus for high h-index (if available)
     INSTITUTION_QUALITY_BONUS = 0.25    # Bonus for top institutions 
-
-    AUTHOR_COMMUNITY_SWITCH_BONUS = 0.7
-    AUTHOR_COMMUNITY_STUCK_PENALTY = -0.6
-    AUTHOR_COMMUNITY_LOOP_PENALTY = -0.9
+    CITATION_VELOCITY_BONUS = 0.3
     
     STUCK_THRESHOLD = 3                # Steps in same community = "stuck"
     SEVERE_STUCK_THRESHOLD = 5         # Very stuck threshold
     SEVERE_STUCK_MULTIPLIER = 2.0      # Multiply penalty when severely stuck
+
+
+    TOP_VENUES = {
+    'Nature', 'Science', 'Cell', 'PNAS',
+    'CVPR', 'ICCV', 'ECCV', 'NeurIPS', 'ICML', 'ICLR',
+    'ACL', 'EMNLP', 'NAACL', 'TACL',
+    'SIGIR', 'WWW', 'KDD', 'ICDE',
+    'AAAI', 'IJCAI', 'AAMAS'
+    }
+
+    TOP_INSTITUTIONS = {
+    'MIT', 'Stanford', 'Berkeley', 'CMU', 'Harvard',
+    'Oxford', 'Cambridge', 'ETH', 'Imperial',
+    'Google', 'Microsoft', 'Meta', 'DeepMind', 'OpenAI'
+    }
 
 
 class AdvancedGraphTraversalEnv:
@@ -101,9 +113,12 @@ class AdvancedGraphTraversalEnv:
         self.previous_node_embedding = None
         
         self.use_communities = use_communities and COMMUNITY_AVAILABLE
+        self.use_authors = use_communities and COMMUNITY_AVAILABLE
         self.community_detector = None
         
-        if self.use_communities:
+        if self.use_communities and self.use_authors:
+            self.current_comm_node = None
+            self.prev_comm_node = None
             self.community_detector = CommunityDetector(store)
             if not self.community_detector.load_cache():
                 print("No community cache found. Run: python -m RL.community_detection")
@@ -116,7 +131,13 @@ class AdvancedGraphTraversalEnv:
         self.comm_influence = {}
         self.steps_in_current_community = 0
         self.previous_community = None
-        
+
+        self.current_author = None 
+        self.author_hist = []
+        self.author_visit_count = Counter()
+        self.author_influence = {}
+        self.previous_author = None 
+        self.h_index_cache = {}
         self.episode_stats = {
             'total_nodes_explored': 0,
             'unique_relation_types': 0,
@@ -128,6 +149,19 @@ class AdvancedGraphTraversalEnv:
             'max_steps_in_community': 0,
             'community_loops': 0
         }
+
+        self.author_stats = {
+            'total_authors_explored': 0, 
+            'dead_end_hits': 0,
+            'revisits': 0,
+            'max_similarity_acheived': 0,
+            'unique_communitites_visited': 0,
+            'community_switches': 0,
+            'max_steps_in_community':0,
+            'community_loops': 0, 
+            'max_h_index': 0, 
+        }
+
 
     def _normalize_node_keys(self, node: Dict[str, Any]) -> Dict[str, Any]:
         """Normalizes Neo4j query results."""
@@ -180,89 +214,168 @@ class AdvancedGraphTraversalEnv:
         self.episode_stats['unique_communities_visited'] = len(self.community_visit_count)
 
 
-    def _calculate_community_reward(self) -> Tuple[float, str]:
+    def _calculate_community_reward(self) -> Tuple[Tuple[float , str] , str]:
         """
         Calculate reward/penalty based on community exploration patterns.
-        Returns: (reward, reason)
+        Returns: (node_type_reward, node_type) , reason
         """
         if not self.use_communities or self.current_community is None:
-            return 0.0, "no_community"
+            return (0.0, "None") , "no_community"
         
         if self.current_community is None:
             if self.previous_community is not None:
-                return -0.1, "left_cache"
-            return 0.0, "no_community"
+                return (-0.1, "None") ,  "left_cache"
+            return (0.0, "None") ,  "no_community"
         
         if len(self.community_history) < 2:
-            return 0.0  , "no temporal history recorded"
+            return (0.0 , "Papers") ,  "no temporal history recorded for papers"
+        
+        if len(self.author_hist) < 2: 
+            return (0.0 , "Authors") , "no temporal history recorded for authors"
     
-        reward = 0.0
+        paper_reward = 0.0
+        author_reward = 0.0
         reasons = []
+
+        paper_id = self.current_comm_node.get('paper_id')
+        author_id = self.current_comm_node.get('author_id')
+
+        if self.steps_in_current_community == 1 and self.previous_community: 
+            if self.previous_community != self.current_community: 
+                if self.current_comm_node is paper_id : 
+                    paper_reward += self.config.COMMUNITY_SWITCH_BONUS
+                
+                else: 
+                    author_reward += self.config.COMMUNITY_SWITCH_BONUS
+
 
         
         if self.steps_in_current_community == 1 and self.previous_community is not None:
             if self.current_community != self.previous_community:
-                reward += self.config.COMMUNITY_SWITCH_BONUS
-                reasons.append(f"switch_bonus:+{self.config.COMMUNITY_SWITCH_BONUS:.2f}")
-        
+                if paper_id:
+                    paper_reward += self.config.COMMUNITY_SWITCH_BONUS
+                    reasons.append(f"switch_bonus:+{self.config.COMMUNITY_SWITCH_BONUS:.2f}")
+
+                elif author_id: 
+                    author_reward += self.config.COMMUNITY_SWITCH_BONUS
+                    reasons.append(f"switch_bonus:+{self.config.COMMUNITY_SWITCH_BONUS}")
+                    
+    
         if self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
-            penalty = self.config.COMMUNITY_STUCK_PENALTY
+            paper_penalty = self.config.COMMUNITY_STUCK_PENALTY
+            author_penalty = self.config.COMMUNITY_STUCK_PENALTY
+
+            if paper_id: 
+                if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
+                    paper_penalty *= self.config.SEVERE_STUCK_MULTIPLIER
+                    reasons.append(f"severe_stuck:{paper_penalty:.2f}")
+                else: 
+                    reasons.append(f"stuck: {paper_penalty}")
+
+            elif author_id: 
+                if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
+                    paper_penalty *= self.config.SEVERE_STUCK_MULTIPLIER
+                    reasons.append(f"severe_stuck:{paper_penalty:.2f}")        
+                else:
+                    reasons.append(f"stuck:{author_penalty:.2f}")
             
-            if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
-                penalty *= self.config.SEVERE_STUCK_MULTIPLIER
-                reasons.append(f"severe_stuck:{penalty:.2f}")
-            else:
-                reasons.append(f"stuck:{penalty:.2f}")
+            paper_reward += paper_penalty
+            author_reward += author_penalty
+        
+        if len(self.community_history) and len(self.author_hist)> 1:
+            if paper_id:
+                previous_communities = [c for _, c in self.community_history[:-1]]
+                if self.current_community in previous_communities:
+                    paper_reward += self.config.COMMUNITY_LOOP_PENALTY
+                    reasons.append(f"loop:{self.config.COMMUNITY_LOOP_PENALTY:.2f}")
+
+            if author_id:
+                previous_communities = [c for _, c in self.community_history[:-1]]
+                if self.current_community in previous_communities:
+                    paper_reward += self.config.COMMUNITY_LOOP_PENALTY
+                    reasons.append(f"loop:{self.config.COMMUNITY_LOOP_PENALTY:.2f}")
+                
+            if self.current_community and self.current_author: #might need to separate visit lists. 
+                visit_count_paper = self.community_visit_count[self.current_community]
+
+            if self.current_author: 
+                visit_count_author = self.author_visit_count[self.current_author]
+                
+                if visit_count_paper and visit_count_author > 2: 
+                    if paper_id:
+                        paper_reward += self.config.REVISIT_PENALTY*(visit_count_paper - 2)
+                        reasons.append(f"revisit penalty{self.config.REVISIT_PENALTY:.2f}")
+                    if author_id:
+                        author_reward += self.config.REVISIT_PENALTY*(visit_count_author -2)
+                        reasons.append(f"revisit penalty{self.config.REVISIT_PENALTY}")
+                    
+        unique_paper_communities = len(self.community_visit_count)
+        unique_author_communities = len(self.author_visit_count)
+        if unique_paper_communities and unique_author_communities >= 3:
+            if paper_id: 
+                diversity_bonus = self.config.DIVERSE_COMMUNITY_BONUS * (unique_paper_communities - 2)
+                paper_reward += diversity_bonus
+                reasons.append(f"diversity:+{diversity_bonus:.2f}")
+            if author_id: 
+                diversity_bonus = self.config.DIVERSE_COMMUNITY_BONUS*(unique_paper_communities-2)
+                author_reward += diversity_bonus
+                reasons.append(f"diversity+{self.config.DIVERSE_COMMUNITY_BONUS}")
+
+        if paper_id:
+            size = self.community_detector.get_community_size(self.current_community)
+        
+            if 5 <= size <= 50: 
+                paper_reward += self.config.COMMUNITY_SIZE_BONUS
+                reasons.append(f"size:{self.config.COMMUNITY_SIZE_BONUS:.2f}")
+
+            elif 50 <= size <= 200: 
+                paper_reward += 0.1 
+
+        elif author_id:
+            size = self.community_detector.get_community_size(self.current_community)
+        
+            if 5 <= size <= 50: 
+                author_reward += self.config.COMMUNITY_SIZE_BONUS
+                reasons.append(f"size:{self.config.COMMUNITY_SIZE_BONUS:.2f}")
+
+            elif 50 <= size <= 200: 
+                author_reward += 0.1 
+        
+        if paper_id: 
+
+            prev_comm = self.community_history[-2][1]
             
-            reward += penalty
-        
-        if len(self.community_history) > 1:
-            previous_communities = [c for _, c in self.community_history[:-1]]
-            if self.current_community in previous_communities:
-                reward += self.config.COMMUNITY_LOOP_PENALTY
-                reasons.append(f"loop:{self.config.COMMUNITY_LOOP_PENALTY:.2f}")
+            try: 
+                prev_year = int(prev_comm.split('_')[0])
+                curr_year = int(self.current_community.split('_')[0])
 
-            if self.current_community: 
-                visit_count = self.community_visit_count[self.current_community]
-                
-                if visit_count > 2: 
-                    reward += self.config.REVISIT_PENALTY*(visit_count - 2)
-                    reasons.append(f"revisit penalty{self.config.REVISIT_PENALTY:.2f}")
-        
-        unique_communities = len(self.community_visit_count)
-        if unique_communities >= 3:
-            diversity_bonus = self.config.DIVERSE_COMMUNITY_BONUS * (unique_communities - 2)
-            reward += diversity_bonus
-            reasons.append(f"diversity:+{diversity_bonus:.2f}")
+                if prev_year < curr_year: 
+                    paper_reward += self.config.TEMPORAL_JUMP_BONUS
+                else: 
+                    paper_reward += self.config.TEMPORAL_JUMP_PENALTY
+            
+            except: 
+                pass 
 
+        elif author_id:
+            prev_comm = self.community_history[-2][1]
+            
+            try: 
+                prev_year = int(prev_comm.split('_')[0])
+                curr_year = int(self.current_community.split('_')[0])
 
-        size = self.community_detector.get_community_size(self.current_community)
-        
-        if 5 <= size <= 50: 
-            reward += self.config.COMMUNITY_SIZE_BONUS
-            reasons.append(f"size:{self.config.COMMUNITY_SIZE_BONUS:.2f}")
+                if prev_year < curr_year: 
+                    paper_reward += self.config.TEMPORAL_JUMP_BONUS
+                else: 
+                    paper_reward += self.config.TEMPORAL_JUMP_PENALTY
+            
+            except: 
+                pass 
 
-        elif 50 <= size <= 200: 
-            reward += 0.1 
-
-        prev_comm = self.community_history[-2][1]
-        
-        try: 
-            prev_year = int(prev_comm.split('_')[0])
-            curr_year = int(self.current_community.split('_')[0])
-
-            if prev_year < curr_year: 
-                reward += self.config.TEMPORAL_JUMP_BONUS
-            else: 
-                reward += self.config.TEMPORAL_JUMP_PENALTY
-        
-        except: 
-            pass 
-                
         reason_str = ", ".join(reasons) if reasons else "none"
-        return reward, reason_str
+        return ((paper_reward , "Paper") , reason_str) if paper_id else ((author_reward , "Author") , reason_str)
 
-
+    
     async def reset(self, query: str, intent: int, start_node_id: str = None):
         """Reset environment with community tracking."""
         self.query_embedding = self.encoder.encode(query)
@@ -325,21 +438,44 @@ class AdvancedGraphTraversalEnv:
         self.previous_node_embedding = await self._get_node_embedding(self.current_node)
         
         return await self._get_state()
+    
 
     async def _get_node_embedding(self, node: Dict[str, Any]) -> np.ndarray:
-        """Get embedding for a node."""
-        title = node.get('title', '')
-        name = node.get('name', '')
-        doi = node.get('doi', '')
-        original_id = node.get('original_id', '')
-        affiliation = node.get('affiliation', '')
+        """Get embedding for a node. ALWAYS returns valid ndarray, never None."""
+        if not node:
+            logging.warning("Empty node passed to _get_node_embedding")
+            return np.zeros(self.text_dim, dtype=np.float32)
+        
+        title = str(node.get('title', '')) if node.get('title') else ''
+        name = str(node.get('name', '')) if node.get('name') else ''
+        doi = str(node.get('doi', '')) if node.get('doi') else ''
+        original_id = str(node.get('original_id', '')) if node.get('original_id') else ''
+        affiliation = str(node.get('affiliation', '')) if node.get('affiliation') else ''
         
         node_text = f"{title} {name} {doi} {original_id} {affiliation}".strip()
         
-        if not node_text:
-            node_text = node.get('paper_id') or node.get('author_id') or 'unknown_node'
+        if not node_text or node_text == '':
+            paper_id = node.get('paper_id')
+            author_id = node.get('author_id')
+            node_text = str(paper_id) if paper_id else str(author_id) if author_id else 'unknown_node'
         
-        return self.encoder.encode(node_text if node_text else "empty")
+        try:
+            embedding = self.encoder.encode(node_text)
+            
+            if embedding is None:
+                logging.warning(f"Encoder returned None for text: {node_text[:50]}")
+                return np.zeros(self.text_dim, dtype=np.float32)
+            
+            if not isinstance(embedding, np.ndarray):
+                logging.warning(f"Encoder returned non-ndarray: {type(embedding)}")
+                return np.zeros(self.text_dim, dtype=np.float32)
+            
+            return embedding
+            
+        except Exception as e:
+            logging.error(f"Encoding exception: {e}. Node: {node.get('paper_id', 'unknown')}")
+            return np.zeros(self.text_dim, dtype=np.float32)
+
 
     async def _get_state(self):
         """Constructs state vector."""
@@ -367,7 +503,7 @@ class AdvancedGraphTraversalEnv:
             if authors:
                 valid_relations.append(RelationType.WROTE)
             
-            keywords = self.current_node.get('keywords', '')
+            keywords = self.current_node.get('keywords' , '')
             if keywords:
                 valid_relations.append(RelationType.KEYWORD_JUMP)
             
@@ -495,21 +631,18 @@ class AdvancedGraphTraversalEnv:
     async def get_worker_actions(self) -> List[Tuple[Dict, int]]:
         """Get worker actions."""
         return self.available_worker_nodes
-
+    
     async def worker_step(self, chosen_node: Dict) -> Tuple[np.ndarray, float, bool]:
-        """
-        Worker step with COMMUNITY-AWARE rewards.
-        """
+        """Worker step with COMMUNITY-AWARE rewards."""
         self.current_step += 1
         self.episode_stats['total_nodes_explored'] += 1
         
         self.current_node = self._normalize_node_keys(chosen_node)
         
-        # Check revisit
-        is_revisit = False
         paper_id = self.current_node.get('paper_id')
         author_id = self.current_node.get('author_id')
         
+        is_revisit = False
         if paper_id and paper_id in self.visited:
             is_revisit = True
             self.episode_stats['revisits'] += 1
@@ -524,64 +657,137 @@ class AdvancedGraphTraversalEnv:
             self.visited.add(author_id)
             self._update_community_tracking(author_id)
         
-        worker_reward = 0.0
+        worker_paper_reward = 0.0
+        worker_author_reward = 0.0
         
-        # Semantic similarity
         node_emb = await self._get_node_embedding(self.current_node)
+        
+        if node_emb is None or not isinstance(node_emb, np.ndarray):
+            logging.error(f"Invalid embedding for node {paper_id or author_id}")
+            node_emb = np.zeros(self.text_dim, dtype=np.float32)
+        
         semantic_sim = np.dot(self.query_embedding, node_emb) / (
             np.linalg.norm(self.query_embedding) * np.linalg.norm(node_emb) + 1e-9
         )
-        worker_reward += semantic_sim * self.config.SEMANTIC_WEIGHT
         
         if semantic_sim > self.best_similarity_so_far:
             self.best_similarity_so_far = semantic_sim
             self.episode_stats['max_similarity_achieved'] = semantic_sim
         
-        # Progress reward
-        if self.previous_node_embedding is not None:
-            prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
-                np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
-            )
-            if semantic_sim > prev_sim + 0.05:
-                worker_reward += self.config.PROGRESS_REWARD
-            elif semantic_sim < prev_sim - 0.1:
-                worker_reward += self.config.STAGNATION_PENALTY
-        
-        # Novelty/revisit
-        if not is_revisit and semantic_sim > 0.5:
-            worker_reward += self.config.NOVELTY_BONUS
-        if is_revisit:
-            worker_reward += self.config.REVISIT_PENALTY
-        
-        # Citation bonus
         if paper_id:
+            worker_paper_reward += semantic_sim * self.config.SEMANTIC_WEIGHT
+            
+            if self.previous_node_embedding is not None:
+                prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
+                    np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
+                )
+                if semantic_sim > prev_sim + 0.05:
+                    worker_paper_reward += self.config.PROGRESS_REWARD
+                elif semantic_sim < prev_sim - 0.1:
+                    worker_paper_reward += self.config.STAGNATION_PENALTY
+            
+            # Novelty/revisit
+            if not is_revisit and semantic_sim > 0.5:
+                worker_paper_reward += self.config.NOVELTY_BONUS
+            if is_revisit:
+                worker_paper_reward += self.config.REVISIT_PENALTY
+            
+            # Citation bonus
             citation_count = await self.store.get_citation_count(paper_id)
             if citation_count > 100:
-                worker_reward += self.config.CITATION_COUNT_BONUS * np.log10(citation_count / 100)
+                worker_paper_reward += self.config.CITATION_COUNT_BONUS * np.log10(citation_count / 100)
+            
+            # Recency bonus
+            year = self.current_node.get('year')
+            if year and year >= 2020:
+                worker_paper_reward += self.config.RECENCY_BONUS
+            
+            # Top venue bonus
+            pub_name = self.current_node.get('publication_name') or ''
+            if pub_name and any(top_venue.lower() in pub_name.lower() for top_venue in self.config.TOP_VENUES):
+                worker_paper_reward += 0.3
         
-        # Recency bonus
-        year = self.current_node.get('year')
-        if year and year >= 2020:
-            worker_reward += self.config.RECENCY_BONUS
-        
-        community_reward, community_reason = self._calculate_community_reward()
-        worker_reward += community_reward
 
-                    
+        # === AUTHOR-SPECIFIC REWARDS ===
+        elif author_id:
+            worker_author_reward += semantic_sim * self.config.SEMANTIC_WEIGHT * 0.8
+            
+            # Progress reward
+            if self.previous_node_embedding is not None:
+                prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
+                    np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
+                )
+                if semantic_sim > prev_sim + 0.05:
+                    worker_author_reward += self.config.PROGRESS_REWARD
+                elif semantic_sim < prev_sim - 0.1:
+                    worker_author_reward += self.config.STAGNATION_PENALTY
+            
+            # Revisit penalty
+            if is_revisit:
+                worker_author_reward += self.config.REVISIT_PENALTY
+            
+            # Prolific author bonus
+            try:
+                papers = await self.store.get_papers_by_author_id(author_id)
+                if len(papers) >= self.config.PROLIFIC_THRESHOLD:
+                    worker_author_reward += self.config.PROLIFIC_AUTHOR_BONUS
+            except:
+                pass
+            
+            # Collaboration bonus
+            try:
+                collab_count = await self.store.get_collab_count(author_id)
+                if collab_count >= self.config.COLLABORATION_THRESHOLD:
+                    worker_author_reward += self.config.COLLABORATION_BONUS
+            except:
+                pass
+            
+            # Institution bonus
+            affiliation = self.current_node.get('affiliation') or ''
+            if affiliation and any(inst.lower() in affiliation.lower() for inst in self.config.TOP_INSTITUTIONS):
+                worker_author_reward += self.config.INSTITUTION_QUALITY_BONUS
+            
+            # H-index bonus
+            if author_id not in self.h_index_cache:
+                self.h_index_cache[author_id] = await self.store.get_author_h_index(author_id)
+            
+            h_index = self.h_index_cache[author_id]
+            if h_index > 0:
+                h_index_reward = self.config.AUTHOR_H_INDEX_BONUS * min(1.0, np.log10(h_index + 1) / 2.0)
+                worker_author_reward += h_index_reward
+                
+                if h_index > self.author_stats['max_h_index']:
+                    self.author_stats['max_h_index'] = h_index
+        
+        # === COMMUNITY REWARDS ===
+        if paper_id:
+            (paper_reward, node_type), community_reason = self._calculate_community_reward()
+            worker_paper_reward += paper_reward
+        elif author_id:
+            (author_reward, node_type), community_reason = self._calculate_community_reward()
+            worker_author_reward += author_reward
+        
+
+        worker_reward = worker_paper_reward + worker_author_reward
+        
         self.previous_node_embedding = node_emb
         self.trajectory_history.append({
             'node': self.current_node,
+            'node_type': 'paper' if paper_id else 'author',
             'similarity': semantic_sim,
             'reward': worker_reward,
             'community': self.current_community,
-            'community_reward': community_reward,
-            'community_reason': community_reason
+            'community_reward': worker_paper_reward if paper_id else worker_author_reward,
+            'community_reason': community_reason if paper_id or author_id else "none"
         })
         
         done = self.current_step >= self.max_steps
         
-        if done and semantic_sim > 0.7:
-            worker_reward += self.config.GOAL_REACHED_BONUS * semantic_sim
+        if done:
+            if paper_id and semantic_sim > 0.7:
+                worker_reward += self.config.GOAL_REACHED_BONUS * semantic_sim
+            elif author_id and semantic_sim > 0.6:
+                worker_reward += self.config.GOAL_REACHED_BONUS * semantic_sim * 0.8
         
         next_state = await self._get_state()
         
@@ -589,6 +795,7 @@ class AdvancedGraphTraversalEnv:
         self.available_worker_nodes = []
         
         return next_state, worker_reward, done
+
 
     def get_episode_summary(self) -> Dict[str, Any]:
         """Get detailed episode summary with community stats."""
