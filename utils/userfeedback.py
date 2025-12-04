@@ -1,40 +1,74 @@
 import json 
 import pickle 
-from typing import Dict , List , Optional 
+from typing import Dict , List , Optional , Any 
 from collections import defaultdict
 import numpy as np 
 from datetime import datetime
+import os 
+import logging 
 
 
 class UserFeedbackTracker: 
     """Tracks and rewards based on historical user interactions."""
 
-    def __init__(self , feedback_file: str = 'feedback.json'):
+    def __init__(self , feedback_file: str = 'feedback_cache.json'):
         self.feedback_file = feedback_file
         self.clicks = defaultdict(int)
         self.dwell_time = defaultdict(list)
         self.saves = defaultdict(int)
         self.citations = defaultdict(int)
-
-        # Session tracking
         self.current_session = []
         self.session_history = []
         
-        # Load existing feedback
         self.load_feedback()
 
-    def load_feedback(self): 
-        """Load historical feedback from disk."""
+
+    def load_feedback(self):
+        """Load feedback from JSON file, create empty if doesn't exist."""
+        if not os.path.exists(self.feedback_file):
+            logging.info(f"No feedback cache found. Creating empty cache at {self.feedback_file}")
+            self._create_empty_cache()
+            return
+        
         try:
             with open(self.feedback_file, 'r') as f:
                 data = json.load(f)
+                
                 self.clicks = defaultdict(int, data.get('clicks', {}))
-                self.dwell_time = defaultdict(list, data.get('dwell_time', {}))
                 self.saves = defaultdict(int, data.get('saves', {}))
-                self.citations = defaultdict(int, data.get('citations', {}))
-                print(f"Loaded feedback for {len(self.clicks)} papers")
-        except FileNotFoundError:
-            print("No existing feedback file, starting fresh")
+                self.dwell_times = defaultdict(list, data.get('dwell_times', {}))
+                self.skips = defaultdict(int, data.get('skips', {}))
+                
+                logging.info(f"Loaded feedback cache from {self.feedback_file}")
+        
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.warning(f"Corrupted feedback cache: {e}")
+            
+            backup = self.feedback_file + '.corrupted'
+            try:
+                os.rename(self.feedback_file, backup)
+                logging.info(f"Moved corrupted cache to {backup}")
+            except OSError:
+                pass
+            
+            self._create_empty_cache()
+
+
+    def _create_empty_cache(self):
+        """Create an empty feedback cache file."""
+        empty_data = {
+            'clicks': {},
+            'saves': {},
+            'dwell_times': {},
+            'skips': {}
+        }
+        
+        try:
+            with open(self.feedback_file, 'w') as f:
+                json.dump(empty_data, f, indent=2)
+            logging.info(f"Created empty feedback cache at {self.feedback_file}")
+        except IOError as e:
+            logging.error(f"Failed to create feedback cache: {e}")
     
     def save_feedback(self):
         """Persist feedback to disk."""
@@ -44,6 +78,9 @@ class UserFeedbackTracker:
             'saves': dict(self.saves),
             'citations': dict(self.citations)
         }
+
+        data = self._convert_json_serialize(data)
+
         with open(self.feedback_file, 'w') as f:
             json.dump(data, f, indent=2)
 
@@ -143,3 +180,20 @@ class UserFeedbackTracker:
             
             dwell_seconds = relevance_score * 120  
             self.record_dwell(paper_id, dwell_seconds)
+
+
+    def _convert_json_serialize(self, obj: Any) -> Any:
+        """Recursively convert NumPy types to JSON-serializable types."""
+        if isinstance(obj, dict):
+            return {key: self._convert_json_serialize(value) 
+                    for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_json_serialize(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return obj
