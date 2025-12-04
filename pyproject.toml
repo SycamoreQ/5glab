@@ -12,6 +12,7 @@ dependencies = [
     "langchain-community>=0.4.1",
     "logger>=1.4",
     "neo4j>=6.0.3",
+    "ollama>=0.6.1",
     "paperscraper>=0.3.3",
     "preprocess>=2.0.0",
     "pytest>=8.4.2",

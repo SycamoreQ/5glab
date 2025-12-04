@@ -8,6 +8,7 @@ import logging
 from utils.coldstart import ColdStartHandler
 from utils.diversity import DiversitySelector
 from utils.userfeedback import UserFeedbackTracker
+from model.llm.parser.unified import ParserType , UnifiedQueryParser , QueryRewardCalculator
 
 try:
     from graph.database.comm_det import CommunityDetector
@@ -93,7 +94,7 @@ class AdvancedGraphTraversalEnv:
     """
     
     def __init__(self, store, embedding_model_name="all-MiniLM-L6-v2", 
-                 use_communities=True , use_feedback = True):
+                 use_communities=True , use_feedback = True , use_llm_parser = True , parser_type: str = 'dspy' , **kwargs):
         self.store = store
         self.encoder = SentenceTransformer(embedding_model_name)
         self.query_embedding = None
@@ -171,6 +172,21 @@ class AdvancedGraphTraversalEnv:
             'community_loops': 0, 
             'max_h_index': 0, 
         }
+
+        parser_type_enum = {
+            'dspy': ParserType.DSPY,
+            'llm': ParserType.LLM_MANUAL,
+            'rule': ParserType.RULE_BASED
+        }.get(parser_type, ParserType.DSPY)
+        
+        self.query_parser = UnifiedQueryParser(
+            primary_parser=parser_type_enum,
+            model="llama3.2",
+            fallback_on_error=True 
+        )
+        
+        self.query_reward_calc = QueryRewardCalculator(self.config)
+        self.current_query_facets = None
 
 
     def _normalize_node_keys(self, node: Dict[str, Any]) -> Dict[str, Any]:
@@ -417,18 +433,61 @@ class AdvancedGraphTraversalEnv:
             'max_steps_in_community': 0,
             'community_loops': 0
         }
-        
-        if start_node_id:
-            node = await self.store.get_paper_by_id(start_node_id)
-            if not node:
-                raise ValueError(f"Paper with ID '{start_node_id}' not found.")
-            self.current_node = self._normalize_node_keys(node)
-        else:
-            candidates = await self.store.get_paper_by_title(query)
-            if not candidates:
-                raise ValueError(f"No starting node found for query: '{query}'")
-            self.current_node = self._normalize_node_keys(candidates[0])
 
+        self.current_query_facets = self.query_parser.parse(query)
+    
+        if self.current_query_facets['paper_search_mode']:
+            paper_title = self.current_query_facets['paper_title']
+            paper_candidates = await self.store.get_paper_by_title(paper_title)
+            
+            if paper_candidates:
+                self.current_node = self._normalize_node_keys(paper_candidates[0])
+                operation = self.current_query_facets['paper_operation']
+                
+                if operation == 'citations':
+                    semantic_query = f"papers citing {paper_title}"
+                elif operation == 'references':
+                    semantic_query = f"references of {paper_title}"
+                elif operation == 'related':
+                    semantic_query = self.current_node.get('abstract', paper_title)
+                elif operation == 'coauthors':
+                    semantic_query = f"authors of {paper_title}"
+                else:
+                    semantic_query = paper_title
+                
+                self.query_embedding = self.encoder.encode(semantic_query)
+            else:
+                semantic_query = self.current_query_facets['semantic'] or paper_title
+                self.query_embedding = self.encoder.encode(semantic_query)
+                candidates = await self.store.get_paper_by_title(semantic_query)
+                if candidates:
+                    self.current_node = self._normalize_node_keys(candidates[0])
+        
+        elif self.current_query_facets['author_search_mode']:
+            author_name = self.current_query_facets['author']
+            # Note: You need get_author_by_name in store.py (we'll add it)
+            # For now, fallback to paper search
+            semantic_query = self.current_query_facets['semantic']
+            self.query_embedding = self.encoder.encode(semantic_query)
+            candidates = await self.store.get_paper_by_title(semantic_query)
+            if candidates:
+                self.current_node = self._normalize_node_keys(candidates[0])
+        
+        else:
+            semantic_query = self.current_query_facets['semantic']
+            self.query_embedding = self.encoder.encode(semantic_query)
+            
+            if start_node_id:
+                node = await self.store.get_paper_by_id(start_node_id)
+                if not node:
+                    raise ValueError(f"Paper with ID '{start_node_id}' not found.")
+                self.current_node = self._normalize_node_keys(node)
+            else:
+                candidates = await self.store.get_paper_by_title(query)
+                if not candidates:
+                    raise ValueError(f"No starting node found for query: '{query}'")
+                self.current_node = self._normalize_node_keys(candidates[0])
+        
         if not self.current_node:
             raise ValueError(f"Failed to initialize current_node")
         
@@ -446,7 +505,7 @@ class AdvancedGraphTraversalEnv:
             self._update_community_tracking(author_id)
         
         self.previous_node_embedding = await self._get_node_embedding(self.current_node)
-        
+            
         return await self._get_state()
     
 
@@ -554,6 +613,7 @@ class AdvancedGraphTraversalEnv:
         """Manager step with standard rewards."""
         self.pending_manager_action = relation_type
         
+        relation = RelationType()
         if relation_type == RelationType.STOP:
             self.current_step = self.max_steps
 
@@ -571,7 +631,35 @@ class AdvancedGraphTraversalEnv:
                 return True, -1.0
         
         manager_reward = 0.0
-        
+
+        if self.current_query_facets and self.current_query_facets.get('relation_focus'):
+            focus = self.current_query_facets['relation_focus']
+            
+            # Map relation_type int to relation name
+            relation_map = {
+                RelationType.CITES: 'CITES',
+                RelationType.CITED_BY: 'CITED_BY',
+                RelationType.WROTE: 'WROTE',
+                RelationType.AUTHORED: 'WROTE',
+                RelationType.COLLAB: 'COLLAB',
+                RelationType.SECOND_COLLAB: 'COLLAB',
+            }
+            
+            current_relation_name = relation_map.get(relation_type)
+            
+            # Bonus if manager chose the query-desired relation
+            if current_relation_name == focus:
+                manager_reward += 2.0
+                logging.info(f" Manager chose query-aligned relation: {focus}")
+            
+            # Paper operation bonus
+            if self.current_query_facets.get('paper_operation') == 'citations':
+                if relation_type == RelationType.CITED_BY:
+                    manager_reward += 1.5
+            elif self.current_query_facets.get('paper_operation') == 'references':
+                if relation_type == RelationType.CITES:
+                    manager_reward += 1.5
+            
         if relation_type == self.current_intent:
             manager_reward += self.config.INTENT_MATCH_REWARD
         else:
@@ -646,6 +734,7 @@ class AdvancedGraphTraversalEnv:
         """Worker step with COMMUNITY-AWARE rewards."""
         self.current_step += 1
         self.episode_stats['total_nodes_explored'] += 1
+        community_reason = "none"
         
         self.current_node = self._normalize_node_keys(chosen_node)
         
@@ -726,8 +815,8 @@ class AdvancedGraphTraversalEnv:
                 
 
             if self.use_feedback and self.cold_start_handler.is_cold_start(self.current_node):
-                cold_reward = self.cold_start_handler.get_cold_start_reward(paper_id , self.current_node)
-                worker_paper_reward += cold_reward
+                cold_reward = await self.cold_start_handler.get_cold_start_reward(paper_id , self.current_node)
+                worker_paper_reward += cold_reward * 0.8
                 
         # === AUTHOR-SPECIFIC REWARDS ===
         elif author_id:
@@ -780,7 +869,6 @@ class AdvancedGraphTraversalEnv:
                 if h_index > self.author_stats['max_h_index']:
                     self.author_stats['max_h_index'] = h_index
         
-        # === COMMUNITY REWARDS ===
         if paper_id:
             (paper_reward, node_type), community_reason = self._calculate_community_reward()
             worker_paper_reward += paper_reward
@@ -788,7 +876,25 @@ class AdvancedGraphTraversalEnv:
             (author_reward, node_type), community_reason = self._calculate_community_reward()
             worker_author_reward += author_reward
 
+
         worker_reward = worker_paper_reward + worker_author_reward
+
+        if self.current_query_facets: 
+            facet_rewards = self.query_reward_calc.calculate_facet_rewards(
+                self.current_node , 
+                self.current_query_facets, 
+                semantic_sim
+            )
+
+            worker_reward += facet_rewards['temporal']
+            worker_reward += facet_rewards['venue']
+            worker_reward += facet_rewards['intent']
+            
+            if self.current_query_facets['institutional'] and paper_id:
+                authors = await self.store.get_authors_by_paper_id(paper_id)
+                if any(self.current_query_facets['institutional'] in a.get('affiliation', '')
+                        for a in authors):
+                    worker_reward += 0.8
         
         self.previous_node_embedding = node_emb
         self.trajectory_history.append({
@@ -798,7 +904,7 @@ class AdvancedGraphTraversalEnv:
             'reward': worker_reward,
             'community': self.current_community,
             'community_reward': worker_paper_reward if paper_id else worker_author_reward,
-            'community_reason': community_reason if paper_id or author_id else "none"
+            'community_reason': community_reason
         })
         
         done = self.current_step >= self.max_steps
@@ -839,11 +945,6 @@ class AdvancedGraphTraversalEnv:
         return diverse_papers
     
 
-    
-        
-
-
-
     def get_episode_summary(self) -> Dict[str, Any]:
         """Get detailed episode summary with community stats."""
         return {
@@ -853,7 +954,8 @@ class AdvancedGraphTraversalEnv:
             'community_diversity_ratio': (
                 self.episode_stats['unique_communities_visited'] / 
                 max(1, self.episode_stats['total_nodes_explored'])
-            )
+            ),
+            'query_facets': self.current_query_facets 
         }
 
     async def get_valid_actions(self) -> List[Tuple[Dict, int]]:

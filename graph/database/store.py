@@ -527,3 +527,16 @@ class EnhancedStore:
         
         diversity_score = await self._run_query_method(query , [author_id])
         return diversity_score[0].get('diversity_score' , 0) if diversity_score and diversity_score[0].get('diversity_score') else 0         
+    
+
+    async def get_author_by_name(self, author_name: str) -> List[Dict[str, Any]]:
+        """Find author by name (fuzzy match)."""
+        query = """
+        MATCH (a:Author)
+        WHERE toLower(a.name) CONTAINS toLower($author_name)
+        RETURN elementId(a) as author_id, 
+            a.name as name,
+            a.affiliation as affiliation
+        LIMIT 5
+        """
+        return await self._run_query_method(query, [author_name])
