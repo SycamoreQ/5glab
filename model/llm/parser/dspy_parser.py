@@ -3,6 +3,7 @@ from typing import Dict, Any, List, Optional , Literal
 from datetime import datetime
 from pydantic import BaseModel, Field
 from unified import UnifiedQueryParser
+from pydantic import BaseModel
 
 
 class QueryFacets(BaseModel):
