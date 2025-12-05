@@ -376,7 +376,7 @@ class Learner:
                 print(f"[Learner] Saved checkpoint at step {self.steps}")
 
 
-def run_training(num_explorers: int = 4, total_eps: int = 2000): 
+def run_training(num_explorers: int = 4, total_eps: int = 100): 
     """
     Main training loop using Ray for distributed RL.
     """
