@@ -1,20 +1,19 @@
-# cache_training_papers.py
 import asyncio
 import pickle
 import random
 from graph.database.store import EnhancedStore
+
 
 async def build_training_cache():
     """Cache high-quality papers using memory-efficient streaming."""
     print("Building training paper cache...")
     
     store = EnhancedStore(pool_size=20)
-
     
     print("Phase 1: Sampling papers with connectivity...")
     
-    batch_size = 1000
-    max_batches = 10
+    batch_size = 5000
+    max_batches = 100
     all_papers = []
     
     for batch_num in range(max_batches):
@@ -58,7 +57,8 @@ async def build_training_cache():
             all_papers.extend(batch)
             print(f"  Batch {batch_num + 1}: Found {len(batch)} papers (total: {len(all_papers)})")
             
-            if len(all_papers) >= 5000:
+            if len(all_papers) >= 50000:
+                print(f"  Reached 50k papers, stopping...")
                 break
                 
         except Exception as e:
@@ -67,7 +67,6 @@ async def build_training_cache():
     
     print(f"\nPhase 2: Filtering quality papers...")
     
-    # Filter for quality
     valid_papers = []
     for p in all_papers:
         title = p.get('title', '')
@@ -77,13 +76,13 @@ async def build_training_cache():
         if (title and 
             len(title) > 10 and
             title not in ['...', 'research paper', ''] and
-            (ref_count + cite_count) >= 5):
+            (ref_count + cite_count) >= 3):
             valid_papers.append(p)
     
     print(f"  Valid papers: {len(valid_papers)}")
     
     if not valid_papers:
-        print("\n❌ ERROR: No valid papers found!")
+        print("\nERROR: No valid papers found!")
         await store.pool.close()
         return
     
@@ -103,7 +102,6 @@ async def build_training_cache():
         print(f"  {i}. {p['title'][:60]}")
         print(f"     Refs: {p['ref_count']}, Cites: {p['cite_count']}, Total: {total_conn}")
     
-    # Statistics
     total_refs = sum(p['ref_count'] for p in cached_papers)
     total_cites = sum(p['cite_count'] for p in cached_papers)
     avg_refs = total_refs / len(cached_papers)
@@ -118,6 +116,7 @@ async def build_training_cache():
     
     await store.pool.close()
     print("\n✓ Done!")
+
 
 if __name__ == "__main__":
     asyncio.run(build_training_cache())

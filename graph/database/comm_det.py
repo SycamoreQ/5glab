@@ -51,86 +51,91 @@ class CommunityDetector:
         print(f"Total papers covered: {len(self.paper_communities)}")
         print(f"Total authors covered: {len(self.author_communities)}")
 
-
     async def _build_paper_communities(self, max_papers: Optional[int]):
         """
-        Build paper communities for ALL papers in database using batch processing.
-        
-        Args:
-            max_papers: If None, fetch ALL papers. Otherwise limit to this number.
+        Build paper communities for TRAINING papers specifically.
         """
         print("\nPAPER COMMUNITIES")
-        print("-" * 80)
         
-        if max_papers is None:
-            print("Fetching ALL papers from database in batches...")
-        else:
-            print(f"Fetching up to {max_papers:,} papers in batches...")
-        
-        # BATCH PROCESSING: Fetch papers in chunks to avoid memory issues
-        batch_size = 50000  
-        skip = 0
-        all_papers = []
-        
-        while True:
-            print(f"  ⏳ Fetching batch {skip//batch_size + 1} (papers {skip:,} - {skip+batch_size:,})...")
+        training_file = "training_papers.pkl"
+        if os.path.exists(training_file):
+            print(f"✓ Loading training papers from {training_file}...")
+            with open(training_file, 'rb') as f:
+                training_papers = pickle.load(f)
             
-            query_batch = """
+            paper_ids = [p['paper_id'] for p in training_papers]
+            print(f"  Found {len(paper_ids)} training papers")
+            print(f"  Sample IDs: {paper_ids[:3]}")
+            
+            print(f"\n  Fetching metadata for training papers...")
+            
+            query_training = """
                 MATCH (p:Paper)
-                WITH p, elementId(p) as node_id
-                ORDER BY node_id
-                SKIP $1
-                LIMIT $2
+                WHERE elementId(p) IN $1
                 OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
                 OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
-                WITH node_id,
-                    count(DISTINCT ref) as ref_count,
-                    count(DISTINCT citing) as cite_count,
+                RETURN elementId(p) as node_id,
+                    count(DISTINCT ref) as refs,
+                    count(DISTINCT citing) as cites,
                     p.year as year,
                     COALESCE(p.title, p.id, '') as title
-                RETURN node_id, ref_count as refs, cite_count as cites, year, title
             """
             
-            try:
-                batch = await self.store._run_query_method(query_batch, [skip, batch_size])
+            all_papers = await self.store._run_query_method(query_training, [paper_ids])
+            print(f"  ✓ Fetched {len(all_papers)} papers")
+            
+        else:
+            print(f" No training_papers.pkl found, falling back to batch fetch...")
+            batch_size = 50000  
+            skip = 0
+            all_papers = []
+            
+            while True:
+                print(f" Fetching batch {skip//batch_size + 1}...")
+                
+                query_batch = """
+                    MATCH (p:Paper)
+                    WITH p, elementId(p) as node_id
+                    ORDER BY node_id
+                    SKIP $skip
+                    LIMIT $limit
+                    OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
+                    OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
+                    WITH node_id,
+                        count(DISTINCT ref) as ref_count,
+                        count(DISTINCT citing) as cite_count,
+                        p.year as year,
+                        COALESCE(p.title, p.id, '') as title
+                    RETURN node_id, ref_count as refs, cite_count as cites, year, title
+                """
+                
+                batch = await self.store._run_query_method(query_batch)
                 
                 if not batch:
-                    print(f"No more papers found. Total fetched: {len(all_papers):,}")
                     break
                 
                 all_papers.extend(batch)
-                print(f"Fetched {len(batch):,} papers (total so far: {len(all_papers):,})")
+                print(f"  Fetched {len(batch):,} papers (total: {len(all_papers):,})")
                 
                 skip += batch_size
                 
                 if max_papers and len(all_papers) >= max_papers:
                     all_papers = all_papers[:max_papers]
-                    print(f"  ✓ Reached limit of {max_papers:,} papers")
                     break
                 
                 await asyncio.sleep(0.1)
-                
-            except Exception as e:
-                print(f" Batch failed at skip={skip}: {e}")
-                if not all_papers:
-                    return
-                else:
-                    print(f" Continuing with {len(all_papers):,} papers fetched so far...")
-                    break
         
         if not all_papers:
-            print("  No papers found in database!")
+            print("  No papers found!")
             return
         
         # Show sample
         if all_papers:
-            # Find paper with most citations
             top_cited = max(all_papers, key=lambda p: p.get('cites', 0))
-            print(f"\n  Sample paper (highest citations in sample):")
+            print(f"\n  Sample paper (highest citations):")
             print(f"    Title: {top_cited.get('title', 'Unknown')[:60]}")
             print(f"    ID: {top_cited['node_id']}")
             print(f"    Citations: {top_cited.get('cites', 0)}, References: {top_cited.get('refs', 0)}")
-            print(f"    Year: {top_cited.get('year', 'N/A')}")
         
         print(f"\n  Assigning {len(all_papers):,} papers to communities...")
         
@@ -155,19 +160,18 @@ class CommunityDetector:
             comm_id = f"P_{year_bucket}_{cite_tier}"
             self.paper_communities[node_id] = comm_id
             
-            if (i + 1) % 10000 == 0:
-                print(f"    Progress: {i+1:,}/{len(all_papers):,} papers...")
+            if (i + 1) % 100 == 0:
+                print(f"    Progress: {i+1}/{len(all_papers)} papers...")
         
         paper_counter = Counter(self.paper_communities.values())
         self.paper_community_sizes = dict(paper_counter)
         
-        print(f"\n Created {len(set(self.paper_communities.values()))} paper communities")
-        print(f"  Covered {len(self.paper_communities):,} papers")
+        print(f"\n  ✓ Created {len(set(self.paper_communities.values()))} paper communities")
+        print(f"  ✓ Covered {len(self.paper_communities):,} papers")
         
-        # Show distribution
         top_paper_comms = sorted(self.paper_community_sizes.items(), 
                                 key=lambda x: x[1], reverse=True)[:5]
-        print(f"\n Top 5 paper communities:")
+        print(f"\n  Top 5 paper communities:")
         for i, (comm_id, size) in enumerate(top_paper_comms, 1):
             parts = comm_id.split('_')
             year = parts[1] if len(parts) > 1 else "?"
@@ -180,6 +184,7 @@ class CommunityDetector:
                 '1': '<5 cites'
             }.get(tier, tier)
             print(f"    {i}. {comm_id}: {size:,} papers (Year ~{year}, {tier_label})")
+
 
     
     async def _build_author_communities(self, max_authors: int):
@@ -206,9 +211,9 @@ class CommunityDetector:
         try:
             prolific = await self.store._run_query_method(query_prolific, [])
             all_authors.extend(prolific)
-            print(f"    ✓ Found {len(prolific)} prolific authors")
+            print(f" Found {len(prolific)} prolific authors")
         except Exception as e:
-            print(f"    ⚠️ Phase 1 failed: {e}")
+            print(f" Phase 1 failed: {e}")
         
         if len(all_authors) < max_authors:
             print("  Phase 2/3: Fetching active authors (5-9 papers)...")

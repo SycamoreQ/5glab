@@ -10,6 +10,7 @@ from collections import deque
 from utils.userfeedback import UserFeedbackTracker 
 import argparse
 import logging
+from utils.batchencoder import BatchEncoder
 import os 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -52,7 +53,7 @@ async def diagnose_communities(env, store):
         sample_papers = await store._run_query_method(query)
         
         if not sample_papers:
-            print("⚠️  No papers found in database!")
+            print("No papers found in database!")
             print("="*70 + "\n")
             return
         
@@ -96,7 +97,7 @@ async def diagnose_communities(env, store):
         print("Analysis:")
         
         if found_count == 0:
-            print("❌ CRITICAL: No communities found for any papers!")
+            print("CRITICAL: No communities found for any papers!")
             print("\nPossible issues:")
             print("  1. ID format mismatch between cache and Neo4j")
             print("     - Cache uses one format, Neo4j returns another")
@@ -150,6 +151,8 @@ async def train_single_process():
     
     print("\nInitializing environment...")
     store = EnhancedStore(pool_size=20)
+    encoder = BatchEncoder()
+    precomputed_embeddings = encoder.precompute_paper_embeddings(cached_papers)
     env = AdvancedGraphTraversalEnv(store, use_communities=True)
     
     if not args.skip_diagnostic:
@@ -167,10 +170,11 @@ async def train_single_process():
     text_dim = 384   
     
     agent = DDQLAgent(state_dim=state_dim, text_dim=text_dim)
-    print(f"✓ Agent initialized (state_dim={state_dim}, text_dim={text_dim})")
+    agent.use_prioritized = True 
+    print(f"Agent initialized (state_dim={state_dim}, text_dim={text_dim})")
     
     num_episodes = args.episodes
-    target_update_freq = 10
+    target_update_freq = 5
     save_freq = 100
     
     episode_rewards = []
@@ -265,15 +269,13 @@ async def train_single_process():
             summary = env.get_episode_summary()
             episode_similarities.append(summary.get('max_similarity_achieved', 0.0))
             
-            # Train agent
             if len(agent.memory) >= agent.batch_size:
-                import random
-                batch = random.sample(list(agent.memory), agent.batch_size)
-                loss = agent.replay_batch(batch)
-                losses.append(loss)
+                if agent.use_prioritized: 
+                    loss = agent.replay_prioritized()
+                else: 
+                    loss = agent.replay()
                 
-
-                agent.epsilon = max(0.3, agent.epsilon * 0.995) 
+                losses.append(loss)
             else:
                 loss = 0.0
             

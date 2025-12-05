@@ -39,15 +39,15 @@ class CommunityAwareRewardConfig:
     INTENT_MISMATCH_PENALTY = -0.5
     DIVERSITY_BONUS = 0.5
     
-    SEMANTIC_WEIGHT = 1.0
-    NOVELTY_BONUS = 0.3
-    DEAD_END_PENALTY = -1.0
-    REVISIT_PENALTY = -0.8
-    HIGH_DEGREE_BONUS = 0.3
-    CITATION_COUNT_BONUS = 0.2
+    SEMANTIC_WEIGHT = 20.0
+    NOVELTY_BONUS = 5.0
+    DEAD_END_PENALTY = -0.5
+    REVISIT_PENALTY = -0.3
+    HIGH_DEGREE_BONUS = 1.0
+    CITATION_COUNT_BONUS = 0.1
     RECENCY_BONUS = 0.2
-    PROGRESS_REWARD = 0.5
-    STAGNATION_PENALTY = -0.3
+    PROGRESS_REWARD = 2.0
+    STAGNATION_PENALTY = -3.0
     GOAL_REACHED_BONUS = 5.0
     
     COMMUNITY_SWITCH_BONUS = 3.0       # Bonus for jumping to different community
@@ -94,14 +94,15 @@ class AdvancedGraphTraversalEnv:
     """
     
     def __init__(self, store, embedding_model_name="all-MiniLM-L6-v2", 
-                 use_communities=True , use_feedback = True , use_llm_parser = True , parser_type: str = 'dspy' , **kwargs):
+                use_communities=True , use_feedback = True , use_llm_parser = True , parser_type: str = 'dspy' , 
+                use_manager_policy:bool = True , precomputed_embeddings: Dict = None , **kwargs):
         self.store = store
         self.encoder = SentenceTransformer(embedding_model_name)
         self.query_embedding = None
         self.current_intent = None
         self.current_node = None
         self.visited = set()
-        self.max_steps = 10
+        self.max_steps = 15
         self.current_step = 0
         self.text_dim = 384
         self.intent_dim = 5
@@ -128,6 +129,16 @@ class AdvancedGraphTraversalEnv:
                 print("No community cache found. Run: python -m RL.community_detection")
                 print("Continuing without community rewards...")
                 self.use_communities = False
+            else:
+                num_papers = len(self.community_detector.paper_communities)
+                num_authors = len(self.community_detector.author_communities)
+
+                if num_papers == 0:
+                    print(f"Cache loaded but empty! Papers: {num_papers}")
+                    self.use_communities = False
+                else:
+                    print(f"Community cache validated: {num_papers:,} papers, {num_authors:,} authors")
+        
         
         self.current_community = None
         self.community_history = []  
@@ -189,6 +200,19 @@ class AdvancedGraphTraversalEnv:
         self.query_reward_calc = QueryRewardCalculator(self.config)
         self.current_query_facets = None
 
+        
+        if use_manager_policy: 
+            from RL.manager_policy import AdaptiveManagerPolicy
+            self.manager_policy = AdaptiveManagerPolicy(state_dim=self.state_dim)
+        else:
+            self.use_manager_policy = False
+
+        self.precomputed_embeddings = precomputed_embeddings or {}
+        if torch.cuda.is_available():
+            from utils.batchencoder import BatchEncoder
+            self.encoder = BatchEncoder()
+            print("Using GPU-accelerated encoder")
+
 
     def _normalize_node_keys(self, node: Dict[str, Any]) -> Dict[str, Any]:
         """Normalizes Neo4j query results."""
@@ -211,7 +235,18 @@ class AdvancedGraphTraversalEnv:
         if not self.use_communities:
             return
         
+        #if len(self.community_history) == 0:
+        #    print(f"[DEBUG] First community lookup for node: {node_id}")
+
+
         new_community = self.community_detector.get_community(node_id)
+
+        #if len(self.community_history) == 0:
+        #    print(f"[DEBUG] Community result: {new_community}")
+        #    if new_community is None:
+        #        print(f"[DEBUG] Node ID format: {node_id}")
+        #        sample = list(self.community_detector.paper_communities.keys())[:3]
+        #        print(f"[DEBUG] Sample cache IDs: {sample}")
         
         if new_community is None:
             return
@@ -533,8 +568,9 @@ class AdvancedGraphTraversalEnv:
     async def _get_node_embedding(self, node: Dict[str, Any]) -> np.ndarray:
         """Get embedding for a node. ALWAYS returns valid ndarray, never None."""
         if not node:
-            logging.warning("Empty node passed to _get_node_embedding")
+            logging.warning("Empty node passed to function")
             return np.zeros(self.text_dim, dtype=np.float32)
+        
         
         title = str(node.get('title', '')) if node.get('title') else ''
         name = str(node.get('name', '')) if node.get('name') else ''
@@ -548,9 +584,15 @@ class AdvancedGraphTraversalEnv:
             paper_id = node.get('paper_id')
             author_id = node.get('author_id')
             node_text = str(paper_id) if paper_id else str(author_id) if author_id else 'unknown_node'
+
+            if paper_id and paper_id in self.precomputed_embeddings:
+                return self.precomputed_embeddings[paper_id]
         
         try:
-            embedding = self.encoder.encode(node_text)
+            if hasattr(self.encoder , 'encode_with_cache'): 
+                return self.encoder.encode_with_cache(text , cache_keys= paper_id)
+            else:
+                embedding = self.encoder.encode(node_text)
             
             if embedding is None:
                 logging.warning(f"Encoder returned None for text: {node_text[:50]}")
@@ -738,9 +780,50 @@ class AdvancedGraphTraversalEnv:
             self.episode_stats['dead_ends_hit'] += 1
         elif num_available > 10:
             manager_reward += self.config.HIGH_DEGREE_BONUS
+        elif num_available >= 5: 
+            manager_reward += 0.5 
         
         return False, manager_reward
+    
+    async def manager_step_with_policy(self , state: np.ndarray) -> Tuple[bool , float , int]: 
+        if not self.use_manager_policy or self.use_manager_policy is None:
+            relation_type = 1 if 1 in await self.get_manager_actions() else None
+            if relation_type is None: 
+                return True, -1.0, None 
+            is_terminal, reward = await self.manager_step(relation_type)
 
+
+        manager_actions = await self.get_manager_actions()
+        if not manager_actions:
+            return True, -1.0, None
+        
+        episode_progress = self.current_step/self.max_steps
+
+        strategy = self.manager_policy.select_strategy(
+            state, 
+            episode_progress,
+            visited_communities= len(self.visited_communities),
+            current_reward= sum(t['reward'] for t in self.trajectory_history) 
+        )
+
+        env_state = {
+            'current_community': self.current_community,
+            'visited_communities': self.visited_communities
+        }
+        
+        relation_type = self.manager_policy.get_relation_for_strategy(
+            strategy,
+            manager_actions,
+            env_state
+        )
+
+        is_terminal , reward = self.manager_step(relation_type)
+
+        self.manager_policy.update_policy(state, strategy, reward)
+        
+        return is_terminal, reward, relation_type        
+        
+    
     def _is_visited(self, node: Dict[str, Any]) -> bool:
         """Check if visited."""
         paper_id = node.get('paper_id')
@@ -796,6 +879,16 @@ class AdvancedGraphTraversalEnv:
         
         if paper_id:
             worker_paper_reward += semantic_sim * self.config.SEMANTIC_WEIGHT
+
+            if semantic_sim > 0.7: 
+                worker_paper_reward += 10.0
+            elif semantic_sim > 0.5:
+                worker_paper_reward += 5.0
+            elif semantic_sim > 0.3: 
+                worker_paper_reward += 2.0
+
+            else: 
+                worker_paper_reward += -2.0  
             
             if self.previous_node_embedding is not None:
                 prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
@@ -815,10 +908,9 @@ class AdvancedGraphTraversalEnv:
             # Citation bonus
             citation_count = await self.store.get_citation_count(paper_id)
             if citation_count > 100:
-                worker_paper_reward += self.config.CITATION_COUNT_BONUS * np.log10(citation_count / 100)
-            if citation_count > 500:  # Highly influential paper
+                worker_paper_reward += self.config.CITATION_COUNT_BONUS * min(1.0 , np.log10(citation_count / 100))
+            if citation_count > 500: 
                 worker_paper_reward += 0.5
-            # Recency bonus
             year = self.current_node.get('year')
             if year and year >= 2020:
                 worker_paper_reward += self.config.RECENCY_BONUS
@@ -893,13 +985,16 @@ class AdvancedGraphTraversalEnv:
         
         if paper_id:
             (paper_reward, node_type), community_reason = self._calculate_community_reward()
-            worker_paper_reward += paper_reward
+            worker_paper_reward += paper_reward *0.5
         elif author_id:
             (author_reward, node_type), community_reason = self._calculate_community_reward()
-            worker_author_reward += author_reward
+            worker_author_reward += author_reward * 0.5
 
 
         worker_reward = worker_paper_reward + worker_author_reward
+
+        if self.current_step >= 8:
+            worker_reward += 2.0  
 
         if self.current_query_facets: 
             facet_rewards = self.query_reward_calc.calculate_facet_rewards(

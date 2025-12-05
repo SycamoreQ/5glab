@@ -1,0 +1,27 @@
+cluster_name: heterogeneous_ml_cluster
+
+head_node:
+  type: laptop
+  resources:
+    CPU: 8
+    GPU: 1
+    memory: 16000000000  # 16GB
+
+worker_nodes:
+  - name: samsung_worker_1
+    type: desktop
+    resources:
+      CPU: 6
+      GPU: 1
+      memory: 8000000000  # 8GB
+      custom_resources:
+        jetson: 1 
+  
+  - name: samsung_worker_2
+    type: desktop
+    resources:
+      CPU: 4
+      memory: 4000000000  # 4GB
+      custom_resources:
+        pi: 1
+  
