@@ -8,3 +8,5 @@ wheels/
 
 # Virtual environments
 .venv
+communities_unified.pkl
+*.pkl
