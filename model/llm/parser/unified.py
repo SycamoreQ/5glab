@@ -1,8 +1,3 @@
-"""
-Unified Query Parser Factory
-Provides consistent interface for all parser types with automatic fallback
-"""
-
 from typing import Dict, Any, Optional
 from enum import Enum
 import logging

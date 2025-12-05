@@ -50,11 +50,11 @@ class CommunityAwareRewardConfig:
     STAGNATION_PENALTY = -0.3
     GOAL_REACHED_BONUS = 5.0
     
-    COMMUNITY_SWITCH_BONUS = 0.8       # Bonus for jumping to different community
-    COMMUNITY_STUCK_PENALTY = -0.5     # Penalty per step stuck in same community
+    COMMUNITY_SWITCH_BONUS = 3.0       # Bonus for jumping to different community
+    COMMUNITY_STUCK_PENALTY = -1.0    # Penalty per step stuck in same community
     COMMUNITY_LOOP_PENALTY = -1.0      # Severe penalty for returning to previous community
-    DIVERSE_COMMUNITY_BONUS = 0.3      # Bonus for visiting many unique communities
-    TEMPORAL_JUMP_BONUS = 0.2        # Bonus for moving to a community which is recent 
+    DIVERSE_COMMUNITY_BONUS = 2.0    # Bonus for visiting many unique communities
+    TEMPORAL_JUMP_BONUS = 0.7        # Bonus for moving to a community which is recent 
     TEMPORAL_JUMP_PENALTY = -0.1        # Bonus for doing the opposite 
     COMMUNITY_SIZE_BONUS = 0.3         # Bonus for not being in small communities
     NODE_TYPE_SWITCH = 0.1
@@ -67,8 +67,8 @@ class CommunityAwareRewardConfig:
     INSTITUTION_QUALITY_BONUS = 0.25    # Bonus for top institutions 
     CITATION_VELOCITY_BONUS = 0.3
     
-    STUCK_THRESHOLD = 3                # Steps in same community = "stuck"
-    SEVERE_STUCK_THRESHOLD = 5         # Very stuck threshold
+    STUCK_THRESHOLD = 2               # Steps in same community = "stuck"
+    SEVERE_STUCK_THRESHOLD = 4         # Very stuck threshold
     SEVERE_STUCK_MULTIPLIER = 2.0      # Multiply penalty when severely stuck
 
 
@@ -101,7 +101,7 @@ class AdvancedGraphTraversalEnv:
         self.current_intent = None
         self.current_node = None
         self.visited = set()
-        self.max_steps = 5
+        self.max_steps = 10
         self.current_step = 0
         self.text_dim = 384
         self.intent_dim = 5
@@ -135,6 +135,7 @@ class AdvancedGraphTraversalEnv:
         self.comm_influence = {}
         self.steps_in_current_community = 0
         self.previous_community = None
+        self.visited_communities = set()
 
         self.current_author = None 
         self.author_hist = []
@@ -204,7 +205,7 @@ class AdvancedGraphTraversalEnv:
         if intent_enum < self.intent_dim:
             vec[intent_enum] = 1.0
         return vec
-
+    
 
     def _update_community_tracking(self, node_id: str):
         if not self.use_communities:
@@ -213,17 +214,15 @@ class AdvancedGraphTraversalEnv:
         new_community = self.community_detector.get_community(node_id)
         
         if new_community is None:
-            if self.current_community is not None: 
-                self.previous_community = self.current_community
-                self.current_community = None 
-                self.steps_in_current_community = 0 
             return
         
         if new_community != self.current_community:
             self.episode_stats['community_switches'] += 1
             
-            if new_community in [c for _, c in self.community_history[:-1]]:
+            if new_community in self.visited_communities:
                 self.episode_stats['community_loops'] += 1
+            else:
+                self.visited_communities.add(new_community)
             
             self.previous_community = self.current_community
             self.current_community = new_community
@@ -235,9 +234,8 @@ class AdvancedGraphTraversalEnv:
                 self.steps_in_current_community
             )
         
-        self.community_history.append((self.current_step, new_community))
-        self.community_visit_count[new_community] += 1
-        self.episode_stats['unique_communities_visited'] = len(self.community_visit_count)
+        self.community_history.append(new_community)
+        self.episode_stats['unique_communities_visited'] = len(self.visited_communities)
 
 
     def _calculate_community_reward(self) -> Tuple[Tuple[float , str] , str]:
@@ -275,7 +273,6 @@ class AdvancedGraphTraversalEnv:
                     author_reward += self.config.COMMUNITY_SWITCH_BONUS
 
 
-        
         if self.steps_in_current_community == 1 and self.previous_community is not None:
             if self.current_community != self.previous_community:
                 if paper_id:
@@ -321,7 +318,7 @@ class AdvancedGraphTraversalEnv:
                     paper_reward += self.config.COMMUNITY_LOOP_PENALTY
                     reasons.append(f"loop:{self.config.COMMUNITY_LOOP_PENALTY:.2f}")
                 
-            if self.current_community and self.current_author: #might need to separate visit lists. 
+            if self.current_community and self.current_author: 
                 visit_count_paper = self.community_visit_count[self.current_community]
 
             if self.current_author: 
@@ -397,6 +394,30 @@ class AdvancedGraphTraversalEnv:
             
             except: 
                 pass 
+
+        if self.use_communities:
+            current_comm = self.community_detector.get_community(self.current_paper_id)
+            
+            new_communities_available = 0
+            for node_dict, _ in self.available_worker_nodes:
+                node_id = node_dict.get('paper_id')
+                if node_id:
+                    node_comm = self.community_detector.get_community(node_id)
+                    if node_comm and node_comm != current_comm:
+                        if node_comm not in self.visited:
+                            new_communities_available += 1
+            
+            if new_communities_available > 0:
+                if paper_id:
+                    paper_reward += 1.0 * min(new_communities_available, 3)  
+                else:
+                    author_reward += 1.0 * min(new_communities_available, 3)  
+                
+            elif current_comm and len(self.visited) < 5:
+                if paper_id:
+                    paper_reward += 0.3 
+                else: 
+                    author_reward += 0.3
 
         reason_str = ", ".join(reasons) if reasons else "none"
         return ((paper_reward , "Paper") , reason_str) if paper_id else ((author_reward , "Author") , reason_str)
@@ -795,7 +816,8 @@ class AdvancedGraphTraversalEnv:
             citation_count = await self.store.get_citation_count(paper_id)
             if citation_count > 100:
                 worker_paper_reward += self.config.CITATION_COUNT_BONUS * np.log10(citation_count / 100)
-            
+            if citation_count > 500:  # Highly influential paper
+                worker_paper_reward += 0.5
             # Recency bonus
             year = self.current_node.get('year')
             if year and year >= 2020:
