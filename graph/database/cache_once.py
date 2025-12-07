@@ -12,7 +12,7 @@ async def build_training_cache():
     
     print("Phase 1: Sampling papers with connectivity...")
     
-    batch_size = 5000
+    batch_size = 50000
     max_batches = 100
     all_papers = []
     
@@ -57,7 +57,7 @@ async def build_training_cache():
             all_papers.extend(batch)
             print(f"  Batch {batch_num + 1}: Found {len(batch)} papers (total: {len(all_papers)})")
             
-            if len(all_papers) >= 50000:
+            if len(all_papers) >= 200000:
                 print(f"  Reached 50k papers, stopping...")
                 break
                 
@@ -89,7 +89,7 @@ async def build_training_cache():
     print("\nPhase 3: Sorting by connectivity...")
     valid_papers.sort(key=lambda x: x['ref_count'] + x['cite_count'], reverse=True)
     
-    cached_papers = valid_papers[:5000]
+    cached_papers = valid_papers[:20000]
     
     with open('training_papers.pkl', 'wb') as f:
         pickle.dump(cached_papers, f)
@@ -107,7 +107,7 @@ async def build_training_cache():
     avg_refs = total_refs / len(cached_papers)
     avg_cites = total_cites / len(cached_papers)
     
-    print(f"\n📊 Cache statistics:")
+    print(f"\nCache statistics:")
     print(f"  Total papers: {len(cached_papers)}")
     print(f"  Avg references: {avg_refs:.1f}")
     print(f"  Avg citations: {avg_cites:.1f}")

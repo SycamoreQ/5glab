@@ -571,26 +571,62 @@ class AdvancedGraphTraversalEnv:
             logging.warning("Empty node passed to function")
             return np.zeros(self.text_dim, dtype=np.float32)
         
+        paper_id = node.get('paper_id')
+        author_id = node.get('author_id')
+        
+        if paper_id and paper_id in self.precomputed_embeddings:
+            return self.precomputed_embeddings[paper_id]
         
         title = str(node.get('title', '')) if node.get('title') else ''
         name = str(node.get('name', '')) if node.get('name') else ''
-        doi = str(node.get('doi', '')) if node.get('doi') else ''
-        original_id = str(node.get('original_id', '')) if node.get('original_id') else ''
         affiliation = str(node.get('affiliation', '')) if node.get('affiliation') else ''
         
-        node_text = f"{title} {name} {doi} {original_id} {affiliation}".strip()
+        INVALID_TITLES = {'', 'N/A', '...', 'Unknown', 'null', 'None', 'undefined'}
         
-        if not node_text or node_text == '':
-            paper_id = node.get('paper_id')
-            author_id = node.get('author_id')
-            node_text = str(paper_id) if paper_id else str(author_id) if author_id else 'unknown_node'
-
-            if paper_id and paper_id in self.precomputed_embeddings:
-                return self.precomputed_embeddings[paper_id]
+        node_text = None
+        
+        if title and title not in INVALID_TITLES and len(title) > 3:
+            keywords = str(node.get('keywords', '')) if node.get('keywords') else ''
+            abstract = str(node.get('abstract', '')) if node.get('abstract') else ''
+            pub_name = str(node.get('publication_name', '')) if node.get('publication_name') else ''
+            
+            parts = [title]
+            if keywords:
+                parts.append(keywords)
+            if abstract and len(abstract) > 20:  
+                parts.append(abstract[:500]) 
+            elif pub_name: 
+                parts.append(pub_name)
+            
+            node_text = " ".join(parts).strip()
+    
+        elif name and name not in INVALID_TITLES and len(name) > 2:
+            parts = [name]
+            if affiliation:
+                parts.append(affiliation)
+            node_text = " ".join(parts).strip()
+        
+        if not node_text or len(node_text) < 5:
+            doi = str(node.get('doi', '')) if node.get('doi') else ''
+            original_id = str(node.get('original_id', '')) if node.get('original_id') else ''
+            
+            if doi and doi not in INVALID_TITLES:
+                node_text = f"Document {doi}"
+            elif original_id and original_id not in INVALID_TITLES:
+                node_text = f"Paper {original_id}"
+            else:
+                if paper_id:
+                    node_text = f"Research paper {paper_id[-10:]}"  
+                elif author_id:
+                    node_text = f"Researcher {author_id[-10:]}"
+                else:
+                    if self.current_step <= 3:
+                        logging.warning(f"Node has no usable text: {paper_id or author_id}")
+                    return np.zeros(self.text_dim, dtype=np.float32)
         
         try:
-            if hasattr(self.encoder , 'encode_with_cache'): 
-                return self.encoder.encode_with_cache(text , cache_keys= paper_id)
+            if hasattr(self.encoder, 'encode_with_cache'):
+                embedding = self.encoder.encode_with_cache(node_text, cache_keys=paper_id)
             else:
                 embedding = self.encoder.encode(node_text)
             
@@ -605,8 +641,10 @@ class AdvancedGraphTraversalEnv:
             return embedding
             
         except Exception as e:
-            logging.error(f"Encoding exception: {e}. Node: {node.get('paper_id', 'unknown')}")
+            logging.error(f"Encoding exception: {e}. Node: {paper_id or author_id}")
             return np.zeros(self.text_dim, dtype=np.float32)
+
+
 
 
     async def _get_state(self):
@@ -671,7 +709,7 @@ class AdvancedGraphTraversalEnv:
         valid_relations.append(RelationType.STOP)
         
         return valid_relations
-
+    
     async def manager_step(self, relation_type: int) -> Tuple[bool, float]:
         """Manager step with standard rewards."""
         self.pending_manager_action = relation_type
@@ -679,9 +717,10 @@ class AdvancedGraphTraversalEnv:
         relation = RelationType()
         if relation_type == RelationType.STOP:
             self.current_step = self.max_steps
-
-            if self.previous_node_embedding is None: 
-                return True , -1.0 
+            
+            if self.previous_node_embedding is None:
+                return True, -1.0
+            
             current_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
                 np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
             )
@@ -694,11 +733,11 @@ class AdvancedGraphTraversalEnv:
                 return True, -1.0
         
         manager_reward = 0.0
-
+        
+        # Query-aligned relation bonus
         if self.current_query_facets and self.current_query_facets.get('relation_focus'):
             focus = self.current_query_facets['relation_focus']
             
-            # Map relation_type int to relation name
             relation_map = {
                 RelationType.CITES: 'CITES',
                 RelationType.CITED_BY: 'CITED_BY',
@@ -710,10 +749,9 @@ class AdvancedGraphTraversalEnv:
             
             current_relation_name = relation_map.get(relation_type)
             
-            # Bonus if manager chose the query-desired relation
             if current_relation_name == focus:
                 manager_reward += 2.0
-                logging.info(f" Manager chose query-aligned relation: {focus}")
+                logging.info(f"✓ Manager chose query-aligned relation: {focus}")
             
             # Paper operation bonus
             if self.current_query_facets.get('paper_operation') == 'citations':
@@ -722,22 +760,24 @@ class AdvancedGraphTraversalEnv:
             elif self.current_query_facets.get('paper_operation') == 'references':
                 if relation_type == RelationType.CITES:
                     manager_reward += 1.5
-            
+        
+        # Intent match reward
         if relation_type == self.current_intent:
             manager_reward += self.config.INTENT_MATCH_REWARD
         else:
             manager_reward += self.config.INTENT_MISMATCH_PENALTY
         
+        # Diversity bonus
         if relation_type not in self.relation_types_used:
             manager_reward += self.config.DIVERSITY_BONUS
             self.relation_types_used.add(relation_type)
             self.episode_stats['unique_relation_types'] += 1
         
-        # Fetch nodes (same as before)
+        # Fetch nodes based on relation type
         paper_id = self.current_node.get('paper_id')
         author_id = self.current_node.get('author_id')
         raw_nodes = []
-
+        
         if relation_type == RelationType.CITES and paper_id:
             raw_nodes = await self.store.get_references_by_paper(paper_id)
         elif relation_type == RelationType.CITED_BY and paper_id:
@@ -766,9 +806,35 @@ class AdvancedGraphTraversalEnv:
         elif relation_type == RelationType.INFLUENCE_PATH and author_id:
             raw_nodes = await self.store.get_influence_path_papers(author_id)
         
-        
+        # Normalize all nodes
         normalized_nodes = [self._normalize_node_keys(node) for node in raw_nodes]
-        self.available_worker_nodes = [(node, relation_type) for node in normalized_nodes]
+        
+        # ===== CRITICAL FILTER SECTION =====
+        # Filter out nodes with invalid titles/names
+        INVALID_VALUES = {'', 'N/A', '...', 'Unknown', 'null', 'None', 'undefined'}
+        valid_nodes = []
+        
+        for node in normalized_nodes:
+            title = str(node.get('title', '')) if node.get('title') else ''
+            name = str(node.get('name', '')) if node.get('name') else ''
+            
+            # Validate title (for papers)
+            title_valid = (title and 
+                        title not in INVALID_VALUES and 
+                        len(title.strip()) > 3 and
+                        not title.strip().startswith('N/A'))
+            
+            # Validate name (for authors)
+            name_valid = (name and 
+                        name not in INVALID_VALUES and 
+                        len(name.strip()) > 2)
+            
+            # Keep node if either is valid
+            if title_valid or name_valid:
+                valid_nodes.append(node)
+        
+        self.available_worker_nodes = [(node, relation_type) for node in valid_nodes]
+        
         self.available_worker_nodes = [
             (node, r_type) for node, r_type in self.available_worker_nodes 
             if not self._is_visited(node)
@@ -780,11 +846,12 @@ class AdvancedGraphTraversalEnv:
             self.episode_stats['dead_ends_hit'] += 1
         elif num_available > 10:
             manager_reward += self.config.HIGH_DEGREE_BONUS
-        elif num_available >= 5: 
-            manager_reward += 0.5 
+        elif num_available >= 5:
+            manager_reward += 0.5
         
         return False, manager_reward
-    
+
+
     async def manager_step_with_policy(self , state: np.ndarray) -> Tuple[bool , float , int]: 
         if not self.use_manager_policy or self.use_manager_policy is None:
             relation_type = 1 if 1 in await self.get_manager_actions() else None
@@ -872,6 +939,10 @@ class AdvancedGraphTraversalEnv:
         semantic_sim = np.dot(self.query_embedding, node_emb) / (
             np.linalg.norm(self.query_embedding) * np.linalg.norm(node_emb) + 1e-9
         )
+
+        if self.current_step <= 3 and len(self.trajectory_history) < 30:
+            print(f"  [DEBUG] Step {self.current_step}: sim={semantic_sim:.3f}, "
+            f"node={self.current_node.get('title', 'N/A')[:50]}")
         
         if semantic_sim > self.best_similarity_so_far:
             self.best_similarity_so_far = semantic_sim
@@ -880,27 +951,45 @@ class AdvancedGraphTraversalEnv:
         if paper_id:
             worker_paper_reward += semantic_sim * self.config.SEMANTIC_WEIGHT
 
-            if semantic_sim > 0.7: 
-                worker_paper_reward += 10.0
+            if semantic_sim > 0.7:
+                worker_paper_reward += 15.0  # Huge bonus for excellent matches
+            elif semantic_sim > 0.6:
+                worker_paper_reward += 10.0  # Great matches
             elif semantic_sim > 0.5:
-                worker_paper_reward += 5.0
-            elif semantic_sim > 0.3: 
-                worker_paper_reward += 2.0
-
-            else: 
-                worker_paper_reward += -2.0  
+                worker_paper_reward += 7.0   # Good matches
+            elif semantic_sim > 0.4:
+                worker_paper_reward += 4.0   # Decent matches
+            elif semantic_sim > 0.3:
+                worker_paper_reward += 2.0   # OK matches
+            elif semantic_sim > 0.2:
+                worker_paper_reward += 0.5   # Weak matches (small bonus)
+            else:
+                worker_paper_reward -= 1.0   # Only penalize very low similarity
             
             if self.previous_node_embedding is not None:
                 prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
                     np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
                 )
-                if semantic_sim > prev_sim + 0.05:
-                    worker_paper_reward += self.config.PROGRESS_REWARD
-                elif semantic_sim < prev_sim - 0.1:
-                    worker_paper_reward += self.config.STAGNATION_PENALTY
+
+                similarity_delta = semantic_sim - prev_sim
+
+                if semantic_sim > 0.5:  # Was 0.7 - excellent for title-only
+                    worker_paper_reward += 20.0
+                elif semantic_sim > 0.4:  # Was 0.6 - great
+                    worker_paper_reward += 15.0
+                elif semantic_sim > 0.35:  # Was 0.5 - good
+                    worker_paper_reward += 10.0
+                elif semantic_sim > 0.3:  # Was 0.4 - decent
+                    worker_paper_reward += 6.0
+                elif semantic_sim > 0.25:  # Was 0.3 - OK
+                    worker_paper_reward += 3.0
+                elif semantic_sim > 0.2:  # Was 0.2 - weak but positive
+                    worker_paper_reward += 1.0
+                else:
+                    worker_paper_reward -= 0.5  # Only small penalty for low sim
             
             # Novelty/revisit
-            if not is_revisit and semantic_sim > 0.5:
+            if not is_revisit and semantic_sim > 0.3:
                 worker_paper_reward += self.config.NOVELTY_BONUS
             if is_revisit:
                 worker_paper_reward += self.config.REVISIT_PENALTY
@@ -908,7 +997,7 @@ class AdvancedGraphTraversalEnv:
             # Citation bonus
             citation_count = await self.store.get_citation_count(paper_id)
             if citation_count > 100:
-                worker_paper_reward += self.config.CITATION_COUNT_BONUS * min(1.0 , np.log10(citation_count / 100))
+                worker_paper_reward += self.config.CITATION_COUNT_BONUS * min(2.0 , np.log10(citation_count / 100))
             if citation_count > 500: 
                 worker_paper_reward += 0.5
             year = self.current_node.get('year')
@@ -918,7 +1007,7 @@ class AdvancedGraphTraversalEnv:
             # Top venue bonus
             pub_name = self.current_node.get('publication_name') or ''
             if pub_name and any(top_venue.lower() in pub_name.lower() for top_venue in self.config.TOP_VENUES):
-                worker_paper_reward += 0.3
+                worker_paper_reward += 0.5
 
 
             if self.use_feedback:
@@ -941,9 +1030,9 @@ class AdvancedGraphTraversalEnv:
                 prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
                     np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
                 )
-                if semantic_sim > prev_sim + 0.05:
+                if semantic_sim > prev_sim + 0.03:
                     worker_author_reward += self.config.PROGRESS_REWARD
-                elif semantic_sim < prev_sim - 0.1:
+                elif semantic_sim < prev_sim - 0.05:
                     worker_author_reward += self.config.STAGNATION_PENALTY
             
             # Revisit penalty
@@ -985,16 +1074,13 @@ class AdvancedGraphTraversalEnv:
         
         if paper_id:
             (paper_reward, node_type), community_reason = self._calculate_community_reward()
-            worker_paper_reward += paper_reward *0.5
+            worker_paper_reward += paper_reward *0.2
         elif author_id:
             (author_reward, node_type), community_reason = self._calculate_community_reward()
-            worker_author_reward += author_reward * 0.5
+            worker_author_reward += author_reward * 0.2
 
 
         worker_reward = worker_paper_reward + worker_author_reward
-
-        if self.current_step >= 8:
-            worker_reward += 2.0  
 
         if self.current_query_facets: 
             facet_rewards = self.query_reward_calc.calculate_facet_rewards(
@@ -1003,9 +1089,9 @@ class AdvancedGraphTraversalEnv:
                 semantic_sim
             )
 
-            worker_reward += facet_rewards['temporal']
-            worker_reward += facet_rewards['venue']
-            worker_reward += facet_rewards['intent']
+            worker_reward += facet_rewards['temporal']*0.3
+            worker_reward += facet_rewards['venue']*0.3
+            worker_reward += facet_rewards['intent']*0.3
             
             if self.current_query_facets['institutional'] and paper_id:
                 authors = await self.store.get_authors_by_paper_id(paper_id)
@@ -1027,10 +1113,12 @@ class AdvancedGraphTraversalEnv:
         done = self.current_step >= self.max_steps
         
         if done:
-            if paper_id and semantic_sim > 0.7:
+            if paper_id and semantic_sim > 0.4:
                 worker_reward += self.config.GOAL_REACHED_BONUS * semantic_sim
-            elif author_id and semantic_sim > 0.6:
-                worker_reward += self.config.GOAL_REACHED_BONUS * semantic_sim * 0.8
+            elif paper_id and semantic_sim > 0.3:  # Was no second tier
+                worker_reward += self.config.GOAL_REACHED_BONUS * semantic_sim
+            elif author_id and semantic_sim > 0.35:  
+                worker_reward += self.config.GOAL_REACHED_BONUS * semantic_sim * 1.5
         
         next_state = await self._get_state()
         

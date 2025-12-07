@@ -119,6 +119,118 @@ async def diagnose_communities(env, store):
         traceback.print_exc()
 
 
+async def diagnose_embeddings(env, store, cached_papers):
+    """
+    Diagnose why similarity scores are low.
+    """
+    print("\n" + "="*80)
+    print("EMBEDDING DIAGNOSTIC")
+    print("="*80)
+    
+    # Test 1: Check query embedding
+    test_query = "machine learning neural networks"
+    query_emb = env.encoder.encode(test_query)
+    print(f"\n1. Query Embedding Test:")
+    print(f"   Query: '{test_query}'")
+    print(f"   Shape: {query_emb.shape}")
+    print(f"   Norm: {np.linalg.norm(query_emb):.3f}")
+    print(f"   Non-zero elements: {np.count_nonzero(query_emb)}/{query_emb.shape[0]}")
+    
+    # Test 2: Check precomputed embeddings
+    print(f"\n2. Precomputed Embeddings:")
+    print(f"   Total: {len(env.precomputed_embeddings)}")
+    
+    if env.precomputed_embeddings:
+        sample_id = list(env.precomputed_embeddings.keys())[0]
+        sample_emb = env.precomputed_embeddings[sample_id]
+        print(f"   Sample ID: {sample_id}")
+        print(f"   Sample shape: {sample_emb.shape}")
+        print(f"   Sample norm: {np.linalg.norm(sample_emb):.3f}")
+    
+    # Test 3: Check cached papers
+    print(f"\n3. Cached Papers Analysis:")
+    papers_with_keywords = sum(1 for p in cached_papers if p.get('keywords'))
+    papers_with_abstract = sum(1 for p in cached_papers if p.get('abstract'))
+    papers_with_valid_title = sum(1 for p in cached_papers 
+                                  if p.get('title') and len(p.get('title', '')) > 10)
+    
+    print(f"   Total papers: {len(cached_papers)}")
+    print(f"   With valid titles: {papers_with_valid_title}")
+    print(f"   With keywords: {papers_with_keywords} ({papers_with_keywords/len(cached_papers)*100:.1f}%)")
+    print(f"   With abstracts: {papers_with_abstract} ({papers_with_abstract/len(cached_papers)*100:.1f}%)")
+    
+    # Test 4: Simulate embedding retrieval
+    print(f"\n4. Embedding Retrieval Test:")
+    test_paper = cached_papers[0]
+    print(f"   Paper: {test_paper['title'][:60]}")
+    print(f"   Has keywords: {bool(test_paper.get('keywords'))}")
+    print(f"   Has abstract: {bool(test_paper.get('abstract'))}")
+    
+    # Simulate _get_node_embedding
+    paper_id = test_paper['paper_id']
+    
+    # Check if in precomputed
+    if paper_id in env.precomputed_embeddings:
+        print(f"   ✓ Found in precomputed embeddings")
+        emb = env.precomputed_embeddings[paper_id]
+    else:
+        print(f"   ✗ NOT in precomputed embeddings!")
+        # Try encoding manually
+        title = test_paper.get('title', '')
+        keywords = test_paper.get('keywords', '')
+        text = f"{title} {keywords}".strip() if keywords else title
+        print(f"   Encoding text: {text[:80]}")
+        emb = env.encoder.encode(text)
+    
+    print(f"   Embedding norm: {np.linalg.norm(emb):.3f}")
+    
+    # Test 5: Similarity between query and paper
+    print(f"\n5. Similarity Test:")
+    sim = np.dot(query_emb, emb) / (
+        np.linalg.norm(query_emb) * np.linalg.norm(emb) + 1e-9
+    )
+    print(f"   Query: '{test_query}'")
+    print(f"   Paper: '{test_paper['title'][:60]}'")
+    print(f"   Similarity: {sim:.3f}")
+    
+    # Test 6: Check for zero embeddings in trajectory
+    print(f"\n6. Zero Embedding Check:")
+    zero_count = 0
+    for pid, emb in list(env.precomputed_embeddings.items())[:100]:
+        if np.abs(emb).sum() < 0.01:
+            zero_count += 1
+    
+    print(f"   Zero embeddings in first 100: {zero_count}/100")
+    
+    # Test 7: Related paper similarity
+    print(f"\n7. Related Papers Test:")
+    # Find papers with 'machine learning' in title
+    ml_papers = [p for p in cached_papers[:100] 
+                 if 'machine' in p.get('title', '').lower() or 
+                    'learning' in p.get('title', '').lower()]
+    
+    if ml_papers:
+        print(f"   Found {len(ml_papers)} ML-related papers in first 100")
+        ml_paper = ml_papers[0]
+        ml_paper_id = ml_paper['paper_id']
+        
+        if ml_paper_id in env.precomputed_embeddings:
+            ml_emb = env.precomputed_embeddings[ml_paper_id]
+            ml_sim = np.dot(query_emb, ml_emb) / (
+                np.linalg.norm(query_emb) * np.linalg.norm(ml_emb) + 1e-9
+            )
+            print(f"   Paper: {ml_paper['title'][:60]}")
+            print(f"   Similarity: {ml_sim:.3f} (should be >0.5)")
+            
+            if ml_sim < 0.4:
+                print(f"   ⚠ WARNING: Low similarity for obviously related paper!")
+        else:
+            print(f"   ✗ Paper not in precomputed embeddings")
+    
+    print("\n" + "="*80 + "\n")
+    
+    return True
+
 
 async def train_single_process():
     """Simple single-process training with DDQN agent."""
@@ -153,10 +265,11 @@ async def train_single_process():
     store = EnhancedStore(pool_size=20)
     encoder = BatchEncoder()
     precomputed_embeddings = encoder.precompute_paper_embeddings(cached_papers)
-    env = AdvancedGraphTraversalEnv(store, use_communities=True)
+    env = AdvancedGraphTraversalEnv(store, use_communities=True , precomputed_embeddings= precomputed_embeddings)
     
     if not args.skip_diagnostic:
         await diagnose_communities(env, store)
+        await diagnose_embeddings(env , store ,  cached_papers)
         
         print("\nDo you want to continue training? (y/n): ", end='')
         response = input().strip().lower()

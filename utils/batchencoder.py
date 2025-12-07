@@ -43,19 +43,71 @@ class BatchEncoder:
         texts = []
         paper_ids = []
         
+        INVALID_VALUES = {'', 'N/A', '...', 'Unknown', 'null', 'None', 'undefined'}
+        
         for paper in papers:
-            title = paper.get('title', '')
-            abstract = paper.get('abstract', '')
-            text = f"{title} {abstract}".strip()
+            paper_id = paper.get('paper_id')
+            if not paper_id:
+                continue
             
-            if text:
+            title = str(paper.get('title', '')) if paper.get('title') else ''
+            keywords = str(paper.get('keywords', '')) if paper.get('keywords') else ''
+            abstract = str(paper.get('abstract', '')) if paper.get('abstract') else ''
+            pub_name = str(paper.get('publication_name', '')) if paper.get('publication_name') else ''
+            
+            if not title or title in INVALID_VALUES or len(title) <= 3:
+                continue  
+            
+            parts = [title]
+            
+            if keywords:
+                parts.append(keywords)
+            
+            if abstract and len(abstract) > 20:
+                parts.append(abstract[:500])
+            elif pub_name and pub_name not in INVALID_VALUES:
+                parts.append(pub_name)
+            
+            text = " ".join(parts).strip()
+            
+            if text and len(text) >= 10:
                 texts.append(text)
-                paper_ids.append(paper['paper_id'])
+                paper_ids.append(paper_id)
         
         print(f"Precomputing embeddings for {len(texts)} papers...")
+        
+        if not texts:
+            print("⚠ Warning: No valid texts to encode!")
+            return {}
+
+        print(f"\nSample texts being encoded:")
+        for i, (text, pid) in enumerate(zip(texts[:3], paper_ids[:3]), 1):
+            print(f"  {i}. {text[:80]}...")
+            print(f"     ID: {pid}")
+        
         embeddings = self.encode_batch(texts)
         
-        embedding_map = {pid: emb for pid, emb in zip(paper_ids, embeddings)}
-        print(f"✓ Precomputed {len(embedding_map)} embeddings")
+        valid_count = 0
+        zero_count = 0
+        
+        embedding_map = {}
+        for pid, emb in zip(paper_ids, embeddings):
+            if isinstance(emb, np.ndarray) and emb.shape[0] > 0:
+                if np.abs(emb).sum() > 0.01:  # Not all zeros
+                    embedding_map[pid] = emb
+                    valid_count += 1
+                else:
+                    zero_count += 1
+            else:
+                zero_count += 1
+        
+        print(f"✓ Precomputed {len(embedding_map)} valid embeddings")
+        if zero_count > 0:
+            print(f"⚠ Warning: {zero_count} embeddings were zero/invalid")
+        
+        if embedding_map:
+            sample_emb = next(iter(embedding_map.values()))
+            print(f"Embedding dimension: {sample_emb.shape}")
+            print(f"Sample embedding norm: {np.linalg.norm(sample_emb):.3f}")
         
         return embedding_map
