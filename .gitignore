@@ -11,3 +11,4 @@ wheels/
 communities_unified.pkl
 *.pkl
 arxiv.zip
+s2_datasets/
