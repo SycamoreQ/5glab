@@ -1,16 +1,6 @@
-"""
-Add CITES relationships to existing papers using Semantic Scholar API.
-
-This script:
-1. Fetches citation data from S2 API using arXiv IDs
-2. Creates CITES relationships between papers in your database
-3. Works with your existing 2M arXiv papers
-
-Timeline: ~4-6 hours to add citations for 2M papers
-"""
-
 import asyncio
 import aiohttp
+import time
 from typing import Dict, List, Set, Optional
 from tqdm.asyncio import tqdm
 from neo4j import AsyncGraphDatabase
@@ -36,9 +26,11 @@ class CitationLinker:
         self.session = None
         
         # Rate limiting (with API key: 5000 requests per 5 minutes)
-        self.semaphore = asyncio.Semaphore(100)  # Increased from 80
+        self.semaphore = asyncio.Semaphore(15)  # Limits concurrency to 15 at a time
         self.request_count = 0
         self.window_start = None
+        self.max_requests_per_window = 4800  # Conservative limit for 5000/5min
+        self.window_duration = 300  # 5 minutes
         
         # Batch citation creation for speed
         self.citation_batch = []
@@ -129,12 +121,12 @@ class CitationLinker:
         print(f"  DOIs:       {len(self.doi_to_neo4j):,}")
         print(f"  Titles:     {len(self.title_to_neo4j):,}\n")
     
-    async def add_citations(self, batch_size: int = 5000, max_papers: int = None):
+    async def add_citations(self, batch_size: int = 1000, max_papers: int = None):
         """
         Fetch citations from S2 API and create relationships.
         
         Args:
-            batch_size: Papers to process in each batch (increased to 5000)
+            batch_size: Papers to process in each batch (default: 1000)
             max_papers: Limit papers to process (None = all)
         """
         print("="*80)
@@ -152,22 +144,31 @@ class CitationLinker:
             print("⚠ No papers with arXiv IDs found!")
             return 0
         
-        print(f"Processing {len(papers_to_process):,} papers")
-        print(f"Batch size: {batch_size:,} (larger = faster)")
-        print(f"Concurrent requests: 100\n")
+        total_papers = len(papers_to_process)
+        print(f"Processing {total_papers:,} papers")
+        print(f"Batch size: {batch_size:,}")
+        print(f"Concurrent requests: 15 (rate-limited)")
+        print(f"Estimated time: ~{total_papers//900} hours (Targeting ~15 req/s)\n")
         
         citation_count = 0
         papers_processed = 0
         papers_with_citations = 0
+
+        # Use tqdm.asyncio for a clean, non-interrupting progress bar
+        papers_iter = tqdm(
+            desc="Processing papers",
+            unit="paper",
+            total=total_papers
+        )
         
-        for i in range(0, len(papers_to_process), batch_size):
+        for i in range(0, total_papers, batch_size):
             batch = papers_to_process[i:i+batch_size]
             
-            # Process batch concurrently
-            tasks = []
-            for arxiv_id, citing_neo4j_id in batch:
-                task = self._process_paper_citations(arxiv_id, citing_neo4j_id)
-                tasks.append(task)
+            # Process batch concurrently (but rate-limited)
+            tasks = [
+                self._process_paper_citations(arxiv_id, citing_neo4j_id)
+                for arxiv_id, citing_neo4j_id in batch
+            ]
             
             # Wait for batch to complete
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -185,10 +186,11 @@ class CitationLinker:
             if self.citation_batch:
                 await self._flush_citation_batch()
             
-            print(f"\r  Papers: {papers_processed:,} | "
-                  f"Citations: {citation_count:,} | "
-                  f"Papers w/ cites: {papers_with_citations:,}", 
-                  end='', flush=True)
+            # Update TQDM progress
+            papers_iter.update(len(batch))
+            papers_iter.set_postfix(citations=f"{citation_count:,}", refresh=True)
+
+        papers_iter.close()
         
         # Final flush
         if self.citation_batch:
@@ -237,20 +239,92 @@ class CitationLinker:
         
         return None
     
+    async def _process_paper_citations(self, arxiv_id: str, citing_neo4j_id: str) -> tuple:
+        """Process citations for a single paper (async)."""
+        try:
+            # Get S2 data
+            s2_data = await self._get_paper_by_arxiv(arxiv_id)
+            
+            if not s2_data:
+                return (0, False)
+            
+            # Store S2 ID
+            s2_id = s2_data.get('paperId', '')
+            if s2_id:
+                # Update local index (crucial for finding *cited* papers later)
+                self.s2_to_neo4j[s2_id] = citing_neo4j_id
+                # Update DB (can be done concurrently without awaiting)
+                asyncio.create_task(self._update_s2_id(citing_neo4j_id, s2_id))
+            
+            # Process references
+            references = s2_data.get('references', [])
+            added = 0
+            
+            # Only process the first 100 references to save on processing time
+            for ref in references[:100]:
+                cited_neo4j_id = self._find_paper_in_db(ref)
+                
+                if cited_neo4j_id:
+                    # Add to batch instead of creating immediately
+                    self.citation_batch.append((citing_neo4j_id, cited_neo4j_id))
+                    added += 1
+            
+            return (added, added > 0)
+        
+        except Exception as e:
+            # print(f"Error processing paper {arxiv_id}: {e}") # Debugging
+            return (0, False)
+    
+    async def _flush_citation_batch(self):
+        """Create citations in batch for speed."""
+        if not self.citation_batch:
+            return
+        
+        async with self.driver.session(database=self.database_name) as session:
+            query = """
+            UNWIND $citations as citation
+            MATCH (citing:Paper), (cited:Paper)
+            WHERE elementId(citing) = citation.citing_id 
+              AND elementId(cited) = citation.cited_id
+            MERGE (citing)-[:CITES]->(cited)
+            """
+            
+            citations_data = [
+                {"citing_id": citing, "cited_id": cited}
+                for citing, cited in self.citation_batch
+            ]
+            
+            await session.run(query, {"citations": citations_data})
+        
+        self.citation_batch = []
+    
     async def _get_paper_by_arxiv(self, arxiv_id: str) -> Optional[Dict]:
         """Get paper data from S2 using arXiv ID."""
         await self._rate_limit()
         
         url = f"{self.base_url}/paper/arXiv:{arxiv_id}"
+        # Request references with identifiers to maximize local matches
         params = {
-            "fields": "paperId,title,references,references.paperId,references.title,references.externalIds"
+            "fields": "paperId,references,references.paperId,references.title,references.externalIds"
         }
         
         try:
             async with self.session.get(url, params=params) as response:
                 if response.status == 200:
                     return await response.json()
-        except:
+                elif response.status == 429:
+                    # Explicit 429 handler (should be caught by _rate_limit, but for safety)
+                    print("\n⚠️ Received 429 from S2. Retrying in 5 seconds...")
+                    await asyncio.sleep(5)
+                    # Simple retry (consider a more robust backoff strategy for production)
+                    async with self.session.get(url, params=params) as retry_response:
+                        if retry_response.status == 200:
+                            return await retry_response.json()
+        except aiohttp.ClientConnectorError:
+             # Handle DNS/Connection issues gracefully
+             pass 
+        except Exception:
+            # Catch other exceptions like JSONDecodeError, TimeoutError
             pass
         
         return None
@@ -265,33 +339,50 @@ class CitationLinker:
             """
             await session.run(query, {"neo4j_id": neo4j_id, "s2_id": s2_id})
     
-    async def _create_citation(self, citing_id: str, cited_id: str):
-        """Create CITES relationship."""
-        async with self.driver.session(database=self.database_name) as session:
-            query = """
-            MATCH (citing:Paper), (cited:Paper)
-            WHERE elementId(citing) = $citing_id AND elementId(cited) = $cited_id
-            MERGE (citing)-[:CITES]->(cited)
-            """
-            await session.run(query, {"citing_id": citing_id, "cited_id": cited_id})
-    
     async def _rate_limit(self):
-        """Rate limiting for S2 API."""
+        """
+        Proper rate limiting for S2 API using the 5000 requests/5 min rule.
+        Uses a minimum inter-request delay for a smooth rate.
+        """
         import time
         
         async with self.semaphore:
-            if self.window_start is None:
-                self.window_start = time.time()
+            current_time = time.time()
             
-            self.request_count += 1
+            # --- Window Reset Logic ---
+            # If the current window has expired (5 minutes = 300 seconds)
+            if self.window_start is None or (current_time - self.window_start) >= self.window_duration:
+                # If we were in a cooldown, print a message
+                if self.request_count >= self.max_requests_per_window:
+                    # Print without leading \n to keep progress bar clean
+                    print(f"✅ Rate limit window reset. Continuing...") 
+                
+                # Reset the window
+                self.request_count = 0
+                self.window_start = current_time
+                current_time = self.window_start # Reset current_time for accurate calculations
             
-            elapsed = time.time() - self.window_start
-            if self.request_count >= 4500 and elapsed < 300:
-                wait = 300 - elapsed + 1
-                print(f"\n⏳ Rate limit: waiting {wait:.0f}s...")
-                await asyncio.sleep(wait)
+            # --- Hard Limit Check and Wait ---
+            if self.request_count >= self.max_requests_per_window:
+                # Calculate remaining wait time until the window resets
+                time_elapsed = current_time - self.window_start
+                wait_time = self.window_duration - time_elapsed + 1 # +1 second buffer
+                
+                print(f"⏳ Rate limit reached ({self.request_count} requests in {time_elapsed:.0f}s). Waiting {wait_time:.0f}s for window reset...")
+                await asyncio.sleep(wait_time)
+                
+                # After waiting, reset the window
                 self.request_count = 0
                 self.window_start = time.time()
+            
+            # --- Smooth Rate Delay (Throttle) ---
+            # 4800 requests / 300 seconds = 1 request per 0.0625 seconds.
+            # We enforce a *minimum* delay between requests to keep the rate smooth.
+            min_delay = 0.07  # ~14.2 requests/sec (safe)
+            await asyncio.sleep(min_delay)
+            
+            # Increment after the delay and checks
+            self.request_count += 1
     
     async def verify_citations(self):
         """Check citation network statistics."""
@@ -338,19 +429,25 @@ class CitationLinker:
             
             print(f"\nCitation Network Statistics:")
             print(f"  Total papers:           {total_papers:,}")
-            print(f"  Papers citing others:   {with_refs:,} ({with_refs/total_papers*100:.1f}%)")
-            print(f"  Papers being cited:     {cited:,} ({cited/total_papers*100:.1f}%)")
-            print(f"  Total citations:        {total_cites:,}")
-            print(f"  Avg citations/paper:    {total_cites/total_papers:.1f}")
             
-            if total_cites == 0:
+            if total_papers > 0:
+                print(f"  Papers citing others:   {with_refs:,} ({with_refs/total_papers*100:.1f}%)")
+                print(f"  Papers being cited:     {cited:,} ({cited/total_papers*100:.1f}%)")
+                print(f"  Total citations:        {total_cites:,}")
+                print(f"  Avg citations/paper:    {total_cites/total_papers:.1f}")
+            else:
+                print("  No papers found in the database.")
+
+            
+            if total_cites == 0 and total_papers > 0:
                 print("\n⚠ WARNING: No citations found!")
                 print("  Run the citation linker to add citations")
-            elif with_refs / total_papers < 0.3:
+            elif total_papers > 0 and with_refs / total_papers < 0.3:
                 print("\n⚠ Low citation coverage (<30%)")
                 print("  Consider running citation linker on more papers")
-            else:
+            elif total_papers > 0:
                 print("\n✓ Citation network looks good!")
+            
 
 
 async def main():
@@ -380,10 +477,11 @@ async def main():
     
     if args.max_papers:
         print(f"Max papers: {args.max_papers:,}")
-        print(f"Estimated time: ~{args.max_papers//1000} hours")
+        # Note: This ETA is an estimate based on a high-throughput scenario
+        print(f"Estimated time: ~{args.max_papers//900} hours (Targeting ~15 req/s)") 
     else:
         print(f"Processing: ALL papers")
-        print(f"Estimated time: ~4-6 hours for 2M papers")
+        print(f"Estimated time: ~4-6 hours for 2M papers (based on average citation lookup speed)")
     
     print("="*80 + "\n")
     
@@ -392,7 +490,11 @@ async def main():
             await linker.build_paper_index()
             await linker.verify_citations()
         else:
-            input("Press Enter to start adding citations...")
+            try:
+                input("Press Enter to start adding citations...")
+            except KeyboardInterrupt:
+                print("\nOperation cancelled by user.")
+                return
             
             await linker.build_paper_index()
             citation_count = await linker.add_citations(
@@ -409,4 +511,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user. Exiting.")

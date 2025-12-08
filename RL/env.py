@@ -753,7 +753,7 @@ class AdvancedGraphTraversalEnv:
                 manager_reward += 2.0
                 logging.info(f"✓ Manager chose query-aligned relation: {focus}")
             
-            # Paper operation bonus
+
             if self.current_query_facets.get('paper_operation') == 'citations':
                 if relation_type == RelationType.CITED_BY:
                     manager_reward += 1.5
@@ -761,19 +761,16 @@ class AdvancedGraphTraversalEnv:
                 if relation_type == RelationType.CITES:
                     manager_reward += 1.5
         
-        # Intent match reward
         if relation_type == self.current_intent:
             manager_reward += self.config.INTENT_MATCH_REWARD
         else:
             manager_reward += self.config.INTENT_MISMATCH_PENALTY
         
-        # Diversity bonus
         if relation_type not in self.relation_types_used:
             manager_reward += self.config.DIVERSITY_BONUS
             self.relation_types_used.add(relation_type)
             self.episode_stats['unique_relation_types'] += 1
         
-        # Fetch nodes based on relation type
         paper_id = self.current_node.get('paper_id')
         author_id = self.current_node.get('author_id')
         raw_nodes = []
@@ -806,11 +803,8 @@ class AdvancedGraphTraversalEnv:
         elif relation_type == RelationType.INFLUENCE_PATH and author_id:
             raw_nodes = await self.store.get_influence_path_papers(author_id)
         
-        # Normalize all nodes
         normalized_nodes = [self._normalize_node_keys(node) for node in raw_nodes]
         
-        # ===== CRITICAL FILTER SECTION =====
-        # Filter out nodes with invalid titles/names
         INVALID_VALUES = {'', 'N/A', '...', 'Unknown', 'null', 'None', 'undefined'}
         valid_nodes = []
         
@@ -952,19 +946,19 @@ class AdvancedGraphTraversalEnv:
             worker_paper_reward += semantic_sim * self.config.SEMANTIC_WEIGHT
 
             if semantic_sim > 0.7:
-                worker_paper_reward += 15.0  # Huge bonus for excellent matches
+                worker_paper_reward += 15.0 
             elif semantic_sim > 0.6:
-                worker_paper_reward += 10.0  # Great matches
+                worker_paper_reward += 10.0 
             elif semantic_sim > 0.5:
-                worker_paper_reward += 7.0   # Good matches
+                worker_paper_reward += 7.0
             elif semantic_sim > 0.4:
-                worker_paper_reward += 4.0   # Decent matches
+                worker_paper_reward += 4.0 
             elif semantic_sim > 0.3:
-                worker_paper_reward += 2.0   # OK matches
+                worker_paper_reward += 2.0 
             elif semantic_sim > 0.2:
-                worker_paper_reward += 0.5   # Weak matches (small bonus)
+                worker_paper_reward += 0.5 
             else:
-                worker_paper_reward -= 1.0   # Only penalize very low similarity
+                worker_paper_reward -= 1.0  
             
             if self.previous_node_embedding is not None:
                 prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
@@ -973,20 +967,20 @@ class AdvancedGraphTraversalEnv:
 
                 similarity_delta = semantic_sim - prev_sim
 
-                if semantic_sim > 0.5:  # Was 0.7 - excellent for title-only
+                if semantic_sim > 0.5: 
                     worker_paper_reward += 20.0
-                elif semantic_sim > 0.4:  # Was 0.6 - great
+                elif semantic_sim > 0.4:  
                     worker_paper_reward += 15.0
-                elif semantic_sim > 0.35:  # Was 0.5 - good
+                elif semantic_sim > 0.35:  
                     worker_paper_reward += 10.0
-                elif semantic_sim > 0.3:  # Was 0.4 - decent
+                elif semantic_sim > 0.3:  
                     worker_paper_reward += 6.0
-                elif semantic_sim > 0.25:  # Was 0.3 - OK
+                elif semantic_sim > 0.25: 
                     worker_paper_reward += 3.0
-                elif semantic_sim > 0.2:  # Was 0.2 - weak but positive
+                elif semantic_sim > 0.2:  
                     worker_paper_reward += 1.0
                 else:
-                    worker_paper_reward -= 0.5  # Only small penalty for low sim
+                    worker_paper_reward -= 0.5 
             
             # Novelty/revisit
             if not is_revisit and semantic_sim > 0.3:

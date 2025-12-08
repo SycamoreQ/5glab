@@ -49,7 +49,6 @@ def test_abstract_impact():
         print(f"\n📝 Query: '{query}'")
         query_emb = encoder.encode(query)
         
-        # Find papers that match keywords
         keywords = query.lower().split()
         matching_papers = []
         

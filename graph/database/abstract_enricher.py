@@ -1,8 +1,3 @@
-"""
-OPTIMIZED Abstract Enricher - 10x faster with batching and async requests.
-Expected time: 1-2 hours instead of 14 hours!
-"""
-
 import asyncio
 import aiohttp
 import time

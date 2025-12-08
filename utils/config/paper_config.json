@@ -1,0 +1,361 @@
+{
+  "s2_api_key": null,
+  "neo4j_uri": "bolt://localhost:7687",
+  "neo4j_username": "neo4j",
+  "neo4j_password": "diam0ndman@3",
+  "batch_size": 500,
+  "rate_limit": 0.9,
+  "max_papers_per_field": 200,
+  "field_configs": [
+    {
+      "query": "Graph Neural Networks",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Quantum Cryptography",
+      "fields": ["Physics", "Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "CRISPR Gene Editing",
+      "fields": ["Biology", "Medicine"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Climate Change Modeling",
+      "fields": ["Environmental Science", "Engineering"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Immunotherapy for Cancer",
+      "fields": ["Medicine", "Biology"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Autonomous Vehicles Safety",
+      "fields": ["Computer Science", "Engineering"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Reinforcement Learning Applications",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "High-Energy Physics",
+      "fields": ["Physics"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Exoplanet Detection",
+      "fields": ["Physics", "Astronomy"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Bioremediation of Pollutants",
+      "fields": ["Biology", "Environmental Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Behavioral Economics",
+      "fields": ["Economics", "Psychology"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Supply Chain Optimization",
+      "fields": ["Business", "Engineering"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Human-Computer Interaction",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Nanomaterials Synthesis",
+      "fields": ["Materials Science", "Chemistry"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Satellite Imagery Analysis",
+      "fields": ["Computer Science", "Geography"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Drug Discovery Techniques",
+      "fields": ["Medicine", "Chemistry", "Biology"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Cybersecurity Threats",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Natural Language Processing",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Computational Fluid Dynamics",
+      "fields": ["Engineering", "Physics"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Solar Cell Efficiency",
+      "fields": ["Engineering", "Materials Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Deep Learning Architectures",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Blockchain Technology",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Renewable Energy Storage",
+      "fields": ["Engineering", "Materials Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Neuroscience of Memory",
+      "fields": ["Neuroscience", "Psychology"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Epigenetics and Disease",
+      "fields": ["Biology", "Medicine"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Polymer Chemistry",
+      "fields": ["Chemistry", "Materials Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Robotics and Control Systems",
+      "fields": ["Computer Science", "Engineering"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Internet of Things (IoT) Security",
+      "fields": ["Computer Science", "Engineering"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Financial Modeling",
+      "fields": ["Economics", "Mathematics"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Biodiversity Conservation",
+      "fields": ["Biology", "Environmental Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Social Network Analysis",
+      "fields": ["Computer Science", "Sociology"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Virtual Reality Applications",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Geothermal Energy",
+      "fields": ["Engineering", "Geology"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Quantum Field Theory",
+      "fields": ["Physics"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Digital Humanities",
+      "fields": ["Sociology", "Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Precision Agriculture",
+      "fields": ["Agricultural And Food Sciences", "Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Materials Science",
+      "fields": ["Materials Science", "Engineering"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Computer Vision",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Distributed Systems",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Cloud Computing Security",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Urban Planning",
+      "fields": ["Geography", "Sociology"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Machine Translation",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Cognitive Psychology",
+      "fields": ["Psychology"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Medical Imaging",
+      "fields": ["Medicine", "Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Epidemiology",
+      "fields": ["Medicine", "Biology"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Wireless Communication",
+      "fields": ["Engineering", "Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Organic Synthesis",
+      "fields": ["Chemistry"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Data Mining Techniques",
+      "fields": ["Computer Science"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Stellar Evolution",
+      "fields": ["Physics", "Astronomy"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    },
+    {
+      "query": "Game Theory",
+      "fields": ["Mathematics", "Economics"],
+      "year_range": "2018-2025",
+      "crawl_citations": true,
+      "crawl_references": true
+    }
+  ]
+}

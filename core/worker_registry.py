@@ -47,7 +47,7 @@ class WorkerRegistry:
         print("Worker Registry initialized")
 
 
-    def registry_worker(self , worker_id:str , capabilities: Dict) -> bool: 
+    def register_worker(self , worker_id:str , capabilities: Dict) -> bool: 
         worker = WorkerCapability(
             worker_id=worker_id,
             node_type=capabilities.get('node_type', 'unknown'),
@@ -127,4 +127,60 @@ class WorkerRegistry:
         
         return health_status
     
-    def get_available_workers()
+
+    def get_available_workers(
+        self,
+        min_cpus: float = 1.0,
+        min_gpu_memory: float = 0.0,
+        custom_resource: Optional[str] = None
+    ) -> List[str]:
+            """Get list of available workers matching requirements."""
+            available = []
+            
+            for worker_id, worker in self.workers.items():
+                if worker.status != WorkerStatus.HEALTHY:
+                    continue
+                
+                if worker.cpu_usage_percent > 80:
+                    continue
+                
+                if min_gpu_memory > 0:
+                    if not worker.has_gpu:
+                        continue
+                    if worker.gpu_memory_gb and worker.gpu_memory_gb < min_gpu_memory:
+                        continue
+            
+                if custom_resource:
+                    if worker.node_type != custom_resource:
+                        continue
+                
+                available.append(worker_id)
+            
+            return available
+    
+
+    def get_worker_stats(self) -> Dict:
+        total_workers = len(self.workers)
+        healthy_workers = sum(1 for w in self.workers.values() if w.status == WorkerStatus.HEALTHY)
+        total_jobs = sum(w.jobs_completed for w in self.workers.values())
+        total_failures = sum(w.jobs_failed for w in self.workers.values())
+        
+        return {
+            'total_workers': total_workers,
+            'healthy_workers': healthy_workers,
+            'offline_workers': total_workers - healthy_workers,
+            'total_jobs_completed': total_jobs,
+            'total_jobs_failed': total_failures,
+            'success_rate': total_jobs / (total_jobs + total_failures) if (total_jobs + total_failures) > 0 else 0.0
+        }
+    
+
+    def get_worker_details(self, worker_id: str) -> Optional[Dict]:
+        if worker_id in self.workers:
+            return asdict(self.workers[worker_id])
+        return None
+    
+    def list_all_workers(self) -> List[Dict]:
+        return [asdict(w) for w in self.workers.values()]
+
+

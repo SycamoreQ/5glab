@@ -40,7 +40,7 @@ class QNetwork(nn.Module):
 class DDQLAgent:
     """Double DQN Agent with Prioritized Experience Replay."""
     
-    def __init__(self, state_dim=773, text_dim=384, use_prioritized=True):
+    def __init__(self, state_dim=773, text_dim=384, use_prioritized=True , ):
         self.state_dim = state_dim
         self.text_dim = text_dim
         self.relation_dim = 13
