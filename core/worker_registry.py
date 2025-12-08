@@ -126,3 +126,5 @@ class WorkerRegistry:
             health_status[worker_id] = worker.status
         
         return health_status
+    
+    def get_available_workers()
