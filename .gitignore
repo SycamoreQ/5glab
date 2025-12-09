@@ -12,4 +12,6 @@ communities_unified.pkl
 *.pkl
 arxiv.zip
 s2_datasets/
-s2_citations/
+s2_citations/*.pt
+*.gz
+arxiv.zip
