@@ -1,6 +1,6 @@
 """
 Semantic Scholar Bulk Dataset Loader for Neo4j
-Downloads and loads papers from S2 Academic Graph with duplicate checking.
+Downloads and loads papers and citations from S2 Academic Graph with duplicate checking.
 """
 
 import requests
@@ -202,7 +202,7 @@ class SemanticScholarBulkLoader:
         
         Args:
             release_id: Release ID to download
-            dataset_name: Name of dataset ('papers', 'authors', etc.)
+            dataset_name: Name of dataset ('papers', 'citations', etc.)
             max_files: Maximum number of files to download (None = all)
         """
         download_info = self.get_download_urls(release_id, dataset_name)
@@ -526,12 +526,6 @@ class SemanticScholarBulkLoader:
                                     elif isinstance(field, str):
                                         field_names.append(field)
                             
-                            # Debug: show field comparison for first few papers
-                            #if sample_papers_shown <= 5 and field_names:
-                            #    logger.info(f"Extracted fields: {field_names}")
-                            #    logger.info(f"Filter fields: {filter_fields}")
-                            #    logger.info(f"Match: {any(field in field_names for field in filter_fields)}")
-                            
                             if not any(field in field_names for field in filter_fields):
                                 filtered_by_field += 1
                                 continue
@@ -576,6 +570,78 @@ class SemanticScholarBulkLoader:
         except Exception as e:
             logger.error(f"Failed to process file {filepath}: {e}")
     
+    def process_citations_file(self, filepath: str):
+        """
+        Process a citations JSONL.gz file and load CITES relationships into Neo4j.
+        
+        Args:
+            filepath: Path to the .gz citations file
+        """
+        logger.info(f"Processing citations file: {filepath}")
+        
+        total_lines = 0
+        citations_added = 0
+        missing_ids = 0
+        
+        try:
+            with gzip.open(filepath, 'rt', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    try:
+                        citation = json.loads(line)
+                        total_lines += 1
+                        
+                        # Show first 3 citations for debugging
+                        if citations_added < 3:
+                            logger.info(f"\n=== SAMPLE CITATION {citations_added + 1} ===")
+                            logger.info(f"Citing: {citation.get('citingcorpusid')}")
+                            logger.info(f"Cited: {citation.get('citedcorpusid')}")
+                        
+                        # Get citation pair (lowercase keys)
+                        citing_id = citation.get('citingcorpusid')
+                        cited_id = citation.get('citedcorpusid')
+                        
+                        if not citing_id or not cited_id:
+                            missing_ids += 1
+                            continue
+                        
+                        # Add to batch
+                        self.cites_batch.append({
+                            'citingPaperId': str(citing_id),
+                            'citedPaperId': str(cited_id)
+                        })
+                        
+                        citations_added += 1
+                        
+                        # Flush if batch size reached
+                        if len(self.cites_batch) >= self.batch_size:
+                            self.flush_cites_batch()
+                        
+                        # Periodic logging
+                        if citations_added % 100000 == 0:
+                            self.flush_cites_batch()
+                            logger.info(f"Progress: {citations_added:,} citations processed")
+                    
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON decode error at line {line_num}: {e}")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error processing line {line_num}: {e}")
+                        continue
+            
+            # Final flush
+            self.flush_cites_batch()
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"CITATIONS FILE SUMMARY: {os.path.basename(filepath)}")
+            logger.info(f"{'='*60}")
+            logger.info(f"Total lines read: {total_lines:,}")
+            logger.info(f"Missing IDs: {missing_ids:,}")
+            logger.info(f"Citations added: {citations_added:,}")
+            logger.info(f"{'='*60}\n")
+            
+        except Exception as e:
+            logger.error(f"Failed to process citations file {filepath}: {e}")
+    
     def process_all_papers(
         self,
         filter_fields: Optional[List[str]] = None,
@@ -617,6 +683,34 @@ class SemanticScholarBulkLoader:
                 filter_year_min=filter_year_min,
                 filter_year_max=filter_year_max
             )
+        
+        self.print_statistics()
+    
+    def process_all_citations(self, max_files: Optional[int] = None):
+        """
+        Process all downloaded citation files.
+        
+        Args:
+            max_files: Maximum number of files to process
+        """
+        files = sorted([f for f in os.listdir(self.download_dir) if f.endswith('.gz')])
+        
+        if not files:
+            logger.error(f"No .gz files found in {self.download_dir}")
+            return
+        
+        if max_files:
+            files = files[:max_files]
+        
+        logger.info(f"Found {len(files)} citation files to process")
+        
+        for i, filename in enumerate(files, 1):
+            filepath = os.path.join(self.download_dir, filename)
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing citation file {i}/{len(files)}: {filename}")
+            logger.info(f"{'='*60}")
+            
+            self.process_citations_file(filepath)
         
         self.print_statistics()
     
@@ -664,9 +758,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Download and process with filters
+  # Download and process papers with filters
   python bulk_loader.py --api-key YOUR_KEY --neo4j-password PASS \\
-    --filter-fields "Computer Science" "Medicine" --year-min 2020
+    --dataset-type papers --filter-fields "Computer Science" "Medicine" --year-min 2020
+
+  # Download and process citations
+  python bulk_loader.py --api-key YOUR_KEY --neo4j-password PASS \\
+    --dataset-type citations --download-dir ./s2_citations --batch-size 5000
 
   # Download only (first run)
   python bulk_loader.py --api-key YOUR_KEY --neo4j-password PASS \\
@@ -691,11 +789,15 @@ Examples:
     parser.add_argument('--batch-size', type=int, default=1000, help='Neo4j batch size (default: 1000)')
     parser.add_argument('--max-files', type=int, help='Max files to download/process')
     
+    # Dataset type
+    parser.add_argument('--dataset-type', default='papers', choices=['papers', 'citations'], 
+                       help='Dataset type to download/process (default: papers)')
+    
     # Operation mode
     parser.add_argument('--download-only', action='store_true', help='Only download, don\'t process')
     parser.add_argument('--process-only', action='store_true', help='Only process existing files')
     
-    # Filters
+    # Filters (only for papers)
     parser.add_argument('--filter-fields', nargs='+', help='Filter by fields of study (e.g., "Computer Science" "Medicine")')
     parser.add_argument('--year-min', type=int, default=2018, help='Minimum year (default: 2018)')
     parser.add_argument('--year-max', type=int, default=2025, help='Maximum year (default: 2025)')
@@ -727,18 +829,22 @@ Examples:
             logger.info("-"*60)
             release_id = loader.get_latest_release()
             loader.get_available_datasets(release_id)
-            loader.download_dataset(release_id, 'papers', max_files=args.max_files)
+            loader.download_dataset(release_id, args.dataset_type, max_files=args.max_files)
         
         if not args.download_only:
             # Process and load into Neo4j
             logger.info("\nPROCESSING PHASE")
             logger.info("-"*60)
-            loader.process_all_papers(
-                filter_fields=args.filter_fields,
-                filter_year_min=args.year_min,
-                filter_year_max=args.year_max,
-                max_files=args.max_files
-            )
+            
+            if args.dataset_type == 'papers':
+                loader.process_all_papers(
+                    filter_fields=args.filter_fields,
+                    filter_year_min=args.year_min,
+                    filter_year_max=args.year_max,
+                    max_files=args.max_files
+                )
+            elif args.dataset_type == 'citations':
+                loader.process_all_citations(max_files=args.max_files)
     
     except KeyboardInterrupt:
         logger.warning("\n\nInterrupted by user. Flushing remaining batches...")
