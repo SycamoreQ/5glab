@@ -21,7 +21,7 @@ class BaseWorker:
         # Detect capabilities
         self.capabilities = self._detect_capabilities()
         
-        print(f"✓ Worker {self.worker_id} initialized on {socket.gethostname()}")
+        print(f"Worker {self.worker_id} initialized on {socket.gethostname()}")
     
     def _detect_capabilities(self) -> Dict:
         """Detect hardware capabilities."""

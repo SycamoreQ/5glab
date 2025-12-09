@@ -51,9 +51,9 @@ class BatchEncoder:
                 continue
             
             title = str(paper.get('title', '')) if paper.get('title') else ''
-            keywords = str(paper.get('keywords', '')) if paper.get('keywords') else ''
+            keywords = str(paper.get('fields' , '')) if paper.get('fieldOfStudy') else ''
             abstract = str(paper.get('abstract', '')) if paper.get('abstract') else ''
-            pub_name = str(paper.get('publication_name', '')) if paper.get('publication_name') else ''
+            pub_name = str(paper.get('venue', '')) if paper.get('venue') else ''
             
             if not title or title in INVALID_VALUES or len(title) <= 3:
                 continue  
@@ -77,7 +77,7 @@ class BatchEncoder:
         print(f"Precomputing embeddings for {len(texts)} papers...")
         
         if not texts:
-            print("⚠ Warning: No valid texts to encode!")
+            print("Warning: No valid texts to encode!")
             return {}
 
         print(f"\nSample texts being encoded:")
@@ -101,9 +101,9 @@ class BatchEncoder:
             else:
                 zero_count += 1
         
-        print(f"✓ Precomputed {len(embedding_map)} valid embeddings")
+        print(f"Precomputed {len(embedding_map)} valid embeddings")
         if zero_count > 0:
-            print(f"⚠ Warning: {zero_count} embeddings were zero/invalid")
+            print(f"Warning: {zero_count} embeddings were zero/invalid")
         
         if embedding_map:
             sample_emb = next(iter(embedding_map.values()))

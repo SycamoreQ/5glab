@@ -1,8 +1,3 @@
-"""
-Cold Start Handler
-Handles new papers/authors with no citation history
-"""
-
 import numpy as np
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -27,8 +22,8 @@ class ColdStartHandler:
         """
         reward = 0.0
         
-        # 1. Venue reputation (max +1.5)
-        venue = paper_node.get('publication_name', '')
+        # 1. Venue reputation 
+        venue = paper_node.get('venue', '')
         if venue:
             venue_lower = venue.lower()
             if any(top.lower() in venue_lower for top in self.config.TOP_VENUES):
@@ -36,7 +31,6 @@ class ColdStartHandler:
             elif 'conference' in venue_lower or 'journal' in venue_lower:
                 reward += 0.5
         
-        # 2. Author reputation (max +2.0)
         try:
             authors = await self.store.get_authors_by_paper_id(paper_id)
             if authors:
@@ -46,25 +40,24 @@ class ColdStartHandler:
                     score = await self._get_author_reputation(author_id)
                     author_scores.append(score)
                 
-                # Use max author reputation
                 max_author_score = max(author_scores) if author_scores else 0
                 reward += min(max_author_score, 2.0)
         except:
             pass
         
-        # 3. Recency boost (max +1.5)
+        # 3. Recency boost
         year = paper_node.get('year')
         if year:
             current_year = datetime.now().year
             if year >= current_year:
-                reward += 1.5  # Current year papers
+                reward += 1.5
             elif year >= current_year - 1:
-                reward += 1.0  # Last year
+                reward += 1.0 
             elif year >= current_year - 2:
-                reward += 0.5  # 2 years ago
+                reward += 0.5 
         
-        # 4. Keyword match (max +0.5)
-        keywords = paper_node.get('keywords', '')
+        # 4. Keyword match
+        keywords = paper_node.get('fieldsOfStudy', '')
         if keywords:
             # Trending keywords
             trending = ['transformer', 'llm', 'diffusion', 'gnn', 'rl', 
@@ -87,14 +80,14 @@ class ColdStartHandler:
             papers = await self.store.get_papers_by_author_id(author_id)
             paper_count = len(papers)
             
-            # Paper count contribution (max 1.0)
+            # Paper count contribution
             score += min(paper_count / 50.0, 1.0)
             
-            # H-index contribution (max 1.0)
+            # H-index contribution
             h_index = await self.store.get_author_h_index(author_id)
             score += min(h_index / 30.0, 1.0)
             
-            # Affiliation contribution (max 0.5)
+            # Affiliation contribution
             author_node = await self.store.get_author_by_id(author_id)
             if author_node:
                 affiliation = author_node.get('affiliation', '')
@@ -119,7 +112,4 @@ class ColdStartHandler:
         current_year = datetime.now().year
         
         is_recent = (current_year - year) <= 2
-        
-        # Note: citation count check would require async, 
-        # so we primarily rely on recency
         return is_recent

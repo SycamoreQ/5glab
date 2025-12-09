@@ -215,14 +215,23 @@ class AdvancedGraphTraversalEnv:
 
 
     def _normalize_node_keys(self, node: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalizes Neo4j query results."""
+        """Normalizes Neo4j query results to consistent format."""
         if not node:
             return {}
+        
         normalized = {}
         for key, value in node.items():
             clean_key = key.split('.')[-1] if '.' in key else key
             normalized[clean_key] = value
+        
+        # Map old field names to new ones for compatibility
+        if 'fields' in normalized and 'fieldsOfStudy' not in normalized:
+            normalized['fieldsOfStudy'] = normalized['fields']
+        if 'venue' not in normalized and 'publication_name' in normalized:
+            normalized['venue'] = normalized['publication_name']
+        
         return normalized
+
 
     def _get_intent_vector(self, intent_enum: int):
         vec = np.zeros(self.intent_dim)
@@ -579,16 +588,16 @@ class AdvancedGraphTraversalEnv:
         
         title = str(node.get('title', '')) if node.get('title') else ''
         name = str(node.get('name', '')) if node.get('name') else ''
-        affiliation = str(node.get('affiliation', '')) if node.get('affiliation') else ''
         
         INVALID_TITLES = {'', 'N/A', '...', 'Unknown', 'null', 'None', 'undefined'}
         
         node_text = None
         
         if title and title not in INVALID_TITLES and len(title) > 3:
-            keywords = str(node.get('keywords', '')) if node.get('keywords') else ''
+            fields = str(node.get('fields' , [])) if node.get('fieldsOfStudy') else ''
+            keywords = ', '.join(fields) if isinstance(fields, list) else str(fields)
             abstract = str(node.get('abstract', '')) if node.get('abstract') else ''
-            pub_name = str(node.get('publication_name', '')) if node.get('publication_name') else ''
+            pub_name = str(node.get('venue', '')) if node.get('venue') else ''
             
             parts = [title]
             if keywords:
@@ -602,8 +611,6 @@ class AdvancedGraphTraversalEnv:
     
         elif name and name not in INVALID_TITLES and len(name) > 2:
             parts = [name]
-            if affiliation:
-                parts.append(affiliation)
             node_text = " ".join(parts).strip()
         
         if not node_text or len(node_text) < 5:
@@ -673,7 +680,7 @@ class AdvancedGraphTraversalEnv:
             if authors:
                 valid_relations.append(RelationType.WROTE)
             
-            keywords = self.current_node.get('keywords' , '')
+            keywords = self.current_node.get('fieldOfStudy' , '') or self.current_node.get('fields' , '')
             if keywords:
                 valid_relations.append(RelationType.KEYWORD_JUMP)
             
@@ -1049,11 +1056,7 @@ class AdvancedGraphTraversalEnv:
             except:
                 pass
             
-            # Institution bonus
-            affiliation = self.current_node.get('affiliation') or ''
-            if affiliation and any(inst.lower() in affiliation.lower() for inst in self.config.TOP_INSTITUTIONS):
-                worker_author_reward += self.config.INSTITUTION_QUALITY_BONUS
-            
+
             # H-index bonus
             if author_id not in self.h_index_cache:
                 self.h_index_cache[author_id] = await self.store.get_author_h_index(author_id)
@@ -1087,12 +1090,6 @@ class AdvancedGraphTraversalEnv:
             worker_reward += facet_rewards['venue']*0.3
             worker_reward += facet_rewards['intent']*0.3
             
-            if self.current_query_facets['institutional'] and paper_id:
-                authors = await self.store.get_authors_by_paper_id(paper_id)
-                if any(self.current_query_facets['institutional'] in a.get('affiliation', '')
-                        for a in authors):
-                    worker_reward += 0.8
-        
         self.previous_node_embedding = node_emb
         self.trajectory_history.append({
             'node': self.current_node,

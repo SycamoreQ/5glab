@@ -159,21 +159,14 @@ class UserFeedbackTracker:
         
 
     def simulate_feedback(self, paper_id: str, relevance_score: float):
-        """
-        Simulate user feedback for offline training.
-        Based on relevance score (semantic similarity).
-        """
-        # Probabilistic simulation
         click_prob = min(relevance_score, 0.9)
         if np.random.random() < click_prob:
             self.record_clicks(paper_id)
             
-            # If clicked, might also save
             save_prob = max(0, relevance_score - 0.5) * 2
             if np.random.random() < save_prob:
                 self.record_save(paper_id)
                 
-                # If saved, might cite
                 cite_prob = max(0, relevance_score - 0.7) * 3
                 if np.random.random() < cite_prob:
                     self.record_cite(paper_id)

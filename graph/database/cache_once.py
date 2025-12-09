@@ -3,7 +3,6 @@ import pickle
 import random
 from graph.database.store import EnhancedStore
 
-
 async def build_training_cache():
     """Cache high-quality papers using memory-efficient streaming."""
     print("Building training paper cache...")
@@ -22,27 +21,25 @@ async def build_training_cache():
         query = """
         MATCH (p:Paper)
         WHERE p.title IS NOT NULL 
-          AND p.title <> ''
-          AND size(p.title) > 10
+              AND p.title <> ''
+              AND size(p.title) > 10
         WITH p
         SKIP $1
         LIMIT $2
-        
         OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
         OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
-        
         WITH p, 
-             count(DISTINCT ref) as ref_count, 
+             count(DISTINCT ref) as ref_count,
              count(DISTINCT citing) as cite_count
         WHERE ref_count > 0 OR cite_count > 0
-        
-        RETURN elementId(p) as paper_id,
+        RETURN p.paperId as paper_id,
                p.title as title,
                p.year as year,
-               COALESCE(p.doi, p.id, '') as doi,
-               p.publication_name,
-               p.keywords,
-               p.id as original_id,
+               p.abstract as abstract,
+               p.venue as venue,
+               p.fieldsOfStudy as fields,
+               p.citationCount as citation_count,
+               p.referenceCount as reference_count,
                ref_count,
                cite_count
         """
@@ -58,7 +55,7 @@ async def build_training_cache():
             print(f"  Batch {batch_num + 1}: Found {len(batch)} papers (total: {len(all_papers)})")
             
             if len(all_papers) >= 200000:
-                print(f"  Reached 50k papers, stopping...")
+                print(f"  Reached 200k papers, stopping...")
                 break
                 
         except Exception as e:
@@ -70,13 +67,14 @@ async def build_training_cache():
     valid_papers = []
     for p in all_papers:
         title = p.get('title', '')
-        ref_count = p.get('ref_count', 0)
-        cite_count = p.get('cite_count', 0)
+        ref_count = p.get('ref_count', 0) or 0
+        cite_count = p.get('cite_count', 0) or 0
         
+        # Quality filters
         if (title and 
             len(title) > 10 and
-            title not in ['...', 'research paper', ''] and
-            (ref_count + cite_count) >= 3):
+            title.lower() not in ['...', 'research paper', 'unknown', 'n/a'] and
+            (ref_count + cite_count) >= 3): 
             valid_papers.append(p)
     
     print(f"  Valid papers: {len(valid_papers)}")
@@ -87,36 +85,65 @@ async def build_training_cache():
         return
     
     print("\nPhase 3: Sorting by connectivity...")
-    valid_papers.sort(key=lambda x: x['ref_count'] + x['cite_count'], reverse=True)
     
+    # Sort by total connectivity (refs + citations)
+    valid_papers.sort(key=lambda x: (x.get('ref_count', 0) or 0) + (x.get('cite_count', 0) or 0), reverse=True)
+    
+    # Take top 20k most connected papers
     cached_papers = valid_papers[:20000]
     
+    # Save cache
     with open('training_papers.pkl', 'wb') as f:
         pickle.dump(cached_papers, f)
     
     print(f"\n✓ Cache saved to training_papers.pkl")
     
+    # Statistics
     print("\nTop 10 most connected papers:")
     for i, p in enumerate(cached_papers[:10], 1):
-        total_conn = p['ref_count'] + p['cite_count']
-        print(f"  {i}. {p['title'][:60]}")
-        print(f"     Refs: {p['ref_count']}, Cites: {p['cite_count']}, Total: {total_conn}")
+        total_conn = (p.get('ref_count', 0) or 0) + (p.get('cite_count', 0) or 0)
+        venue = p.get('venue', 'Unknown')
+        year = p.get('year', 'N/A')
+        
+        print(f"  {i}. [{year}] {p['title'][:60]}")
+        print(f"     Venue: {venue}")
+        print(f"     Refs: {p.get('ref_count', 0)}, Cites: {p.get('cite_count', 0)}, Total: {total_conn}")
     
-    total_refs = sum(p['ref_count'] for p in cached_papers)
-    total_cites = sum(p['cite_count'] for p in cached_papers)
+    # Overall statistics
+    total_refs = sum(p.get('ref_count', 0) or 0 for p in cached_papers)
+    total_cites = sum(p.get('cite_count', 0) or 0 for p in cached_papers)
     avg_refs = total_refs / len(cached_papers)
     avg_cites = total_cites / len(cached_papers)
     
     print(f"\nCache statistics:")
-    print(f"  Total papers: {len(cached_papers)}")
+    print(f"  Total papers: {len(cached_papers):,}")
     print(f"  Avg references: {avg_refs:.1f}")
     print(f"  Avg citations: {avg_cites:.1f}")
-    print(f"  Min connectivity: {min(p['ref_count'] + p['cite_count'] for p in cached_papers)}")
-    print(f"  Max connectivity: {max(p['ref_count'] + p['cite_count'] for p in cached_papers)}")
+    print(f"  Min connectivity: {min((p.get('ref_count', 0) or 0) + (p.get('cite_count', 0) or 0) for p in cached_papers)}")
+    print(f"  Max connectivity: {max((p.get('ref_count', 0) or 0) + (p.get('cite_count', 0) or 0) for p in cached_papers)}")
+    
+    # Year distribution
+    years = [p.get('year') for p in cached_papers if p.get('year')]
+    if years:
+        print(f"  Year range: {min(years)} - {max(years)}")
+        print(f"  Avg year: {sum(years) / len(years):.0f}")
+    
+    # Field distribution
+    all_fields = []
+    for p in cached_papers:
+        fields = p.get('fields', []) or []
+        if isinstance(fields, list):
+            all_fields.extend(fields)
+    
+    if all_fields:
+        from collections import Counter
+        field_counts = Counter(all_fields)
+        print(f"\n  Top 5 research fields:")
+        for field, count in field_counts.most_common(5):
+            print(f"    - {field}: {count}")
     
     await store.pool.close()
     print("\n✓ Done!")
-
 
 if __name__ == "__main__":
     asyncio.run(build_training_cache())

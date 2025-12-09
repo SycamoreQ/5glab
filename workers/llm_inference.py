@@ -14,11 +14,9 @@ class ResearchChatbot:
     """
     
     def __init__(self, config_path: str = "config/cluster_config.yaml"):
-        # Load config
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
         
-        # Connect to Ray cluster
         master_host = self.config['master_node']['host']
         master_port = self.config['master_node']['ray_port']
         redis_password = self.config['master_node']['redis_password']
@@ -28,7 +26,7 @@ class ResearchChatbot:
             _redis_password=redis_password
         )
         
-        print(f"✓ Connected to Ray cluster at {master_host}:{master_port}")
+        print(f"Connected to Ray cluster at {master_host}:{master_port}")
         
         # LLM config
         llm_config = self.config['llm_frontend']['llm']
@@ -40,9 +38,9 @@ class ResearchChatbot:
         # Initialize Ollama
         try:
             ollama.list()  # Test connection
-            print(f"✓ Ollama connected, using model: {self.llm_model}")
+            print(f"Ollama connected, using model: {self.llm_model}")
         except Exception as e:
-            print(f"⚠ Ollama not available: {e}")
+            print(f"Ollama not available: {e}")
         
         # Get master node actors
         try:
@@ -65,35 +63,33 @@ class ResearchChatbot:
         """
         prompt = f"""Analyze this research query and extract structured information:
 
-User Query: "{message}"
+                User Query: "{message}"
 
-Determine:
-1. query_type: "paper_search" | "author_search" | "topic_exploration" | "citation_analysis"
-2. keywords: List of main research topics/keywords
-3. operation: "find_papers" | "find_citations" | "find_references" | "find_related" | "train_model"
-4. entities: Any specific paper titles or author names mentioned
-5. filters: Year ranges, venues, etc.
+                Determine:
+                1. query_type: "paper_search" | "author_search" | "topic_exploration" | "citation_analysis"
+                2. keywords: List of main research topics/keywords
+                3. operation: "find_papers" | "find_citations" | "find_references" | "find_related" | "train_model"
+                4. entities: Any specific paper titles or author names mentioned
+                5. filters: Year ranges, venues, etc.
 
-Respond in valid JSON format only, no explanation."""
+                Respond in valid JSON format only, no explanation."""
         
         try:
             response = ollama.generate(
                 model=self.llm_model,
                 prompt=prompt,
                 options={
-                    'temperature': 0.3,  # Low temp for structured output
+                    'temperature': 0.3, 
                     'num_predict': 200
                 }
             )
-            
-            # Parse JSON response
+        
             import json
             intent = json.loads(response['response'])
             return intent
         
         except Exception as e:
             print(f"Intent parsing failed: {e}")
-            # Fallback to simple keyword extraction
             return {
                 'query_type': 'topic_exploration',
                 'keywords': [message],
@@ -122,32 +118,32 @@ Respond in valid JSON format only, no explanation."""
         if job_type == "rl_training":
             prompt = f"""The user asked: "{user_query}"
 
-We trained an RL agent and found relevant research papers. Here are the results:
+            We trained an RL agent and found relevant research papers. Here are the results:
 
-Training Results:
-- Episodes trained: {results.get('episodes', 0)}
-- Average reward: {results.get('avg_reward', 0):.2f}
-- Max similarity achieved: {results.get('max_similarity', 0):.3f}
-- Training time: {results.get('duration_sec', 0):.1f} seconds
+            Training Results:
+            - Episodes trained: {results.get('episodes', 0)}
+            - Average reward: {results.get('avg_reward', 0):.2f}
+            - Max similarity achieved: {results.get('max_similarity', 0):.3f}
+            - Training time: {results.get('duration_sec', 0):.1f} seconds
 
-Generate a friendly, conversational response (2-3 sentences) explaining:
-1. What we found
-2. How relevant the results are (based on similarity score)
-3. Suggest next steps
+            Generate a friendly, conversational response (2-3 sentences) explaining:
+            1. What we found
+            2. How relevant the results are (based on similarity score)
+            3. Suggest next steps
 
-Be natural and helpful, like talking to a colleague."""
-        
-        else:  # RAG inference
+            Be natural and helpful, like talking to a colleague."""
+                
+        else: 
             prompt = f"""The user asked: "{user_query}"
 
-We found {results.get('num_papers', 0)} relevant papers through graph traversal:
+        We found {results.get('num_papers', 0)} relevant papers through graph traversal:
 
-Results:
-- Papers explored: {results.get('num_papers', 0)}
-- Average relevance: {results.get('avg_similarity', 0):.3f}
-- Inference time: {results.get('duration_sec', 0):.2f} seconds
+        Results:
+        - Papers explored: {results.get('num_papers', 0)}
+        - Average relevance: {results.get('avg_similarity', 0):.3f}
+        - Inference time: {results.get('duration_sec', 0):.2f} seconds
 
-Generate a friendly response explaining what we found and how relevant it is."""
+        Generate a friendly response explaining what we found and how relevant it is."""
         
         try:
             response = ollama.generate(
@@ -169,24 +165,24 @@ Generate a friendly response explaining what we found and how relevant it is."""
     def _fallback_format(self, results: Dict, job_type: str) -> str:
         """Fallback formatting without LLM."""
         if job_type == "rl_training":
-            return f"""✅ Training Complete!
+            return f"""Training Complete!
 
-I trained an RL agent and explored the citation graph. Here's what I found:
+            I trained an RL agent and explored the citation graph. Here's what I found:
 
-📊 **Training Stats:**
-- Trained for {results.get('episodes', 0)} episodes
-- Achieved {results.get('max_similarity', 0):.1%} similarity to your query
-- Average reward: {results.get('avg_reward', 0):.2f}
+            **Training Stats:**
+            - Trained for {results.get('episodes', 0)} episodes
+            - Achieved {results.get('max_similarity', 0):.1%} similarity to your query
+            - Average reward: {results.get('avg_reward', 0):.2f}
 
-The agent explored {results.get('episodes', 0)} different research paths and found papers with {results.get('avg_similarity', 0):.1%} average relevance.
+            The agent explored {results.get('episodes', 0)} different research paths and found papers with {results.get('avg_similarity', 0):.1%} average relevance.
 
-Would you like me to show you the top recommended papers?"""
+            Would you like me to show you the top recommended papers?"""
         
         else:
-            return f"""✅ Found {results.get('num_papers', 0)} papers!
+            return f"""Found {results.get('num_papers', 0)} papers!
 
-Average relevance: {results.get('avg_similarity', 0):.1%}
-Search time: {results.get('duration_sec', 0):.1f}s"""
+            Average relevance: {results.get('avg_similarity', 0):.1%}
+            Search time: {results.get('duration_sec', 0):.1f}s"""
     
     def chat(
         self,
@@ -194,7 +190,7 @@ Search time: {results.get('duration_sec', 0):.1f}s"""
         history: List[Tuple[str, str]]
     ) -> Tuple[str, List[Tuple[str, str]]]:
         if not self.scheduler:
-            history.append((message, "❌ Ray scheduler not available. Please check cluster connection."))
+            history.append((message, "Ray scheduler not available. Please check cluster connection."))
             return "", history
         
         # Parse user intent
@@ -260,7 +256,7 @@ Search time: {results.get('duration_sec', 0):.1f}s"""
                         break
                     
                     elif status_value == 'failed':
-                        error_msg = "❌ Job failed. Please try again or rephrase your query."
+                        error_msg = " Job failed. Please try again or rephrase your query."
                         history[-1] = (message, error_msg)
                         yield "", history
                         break
@@ -270,7 +266,7 @@ Search time: {results.get('duration_sec', 0):.1f}s"""
             
             else:
                 # Timeout
-                timeout_msg = "⏰ Request timed out. The job is still running in the background."
+                timeout_msg = "Request timed out. The job is still running in the background."
                 history[-1] = (message, timeout_msg)
                 yield "", history
         
