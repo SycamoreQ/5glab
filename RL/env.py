@@ -9,6 +9,7 @@ from utils.coldstart import ColdStartHandler
 from utils.diversity import DiversitySelector
 from utils.userfeedback import UserFeedbackTracker
 from model.llm.parser.unified import ParserType , UnifiedQueryParser , QueryRewardCalculator
+from utils.attention_selector import HybridAttentionSelector
 
 try:
     from graph.database.comm_det import CommunityDetector
@@ -39,7 +40,7 @@ class CommunityAwareRewardConfig:
     INTENT_MISMATCH_PENALTY = -0.5
     DIVERSITY_BONUS = 0.5
     
-    SEMANTIC_WEIGHT = 20.0
+    SEMANTIC_WEIGHT = 5.0
     NOVELTY_BONUS = 5.0
     DEAD_END_PENALTY = -0.5
     REVISIT_PENALTY = -0.3
@@ -50,10 +51,10 @@ class CommunityAwareRewardConfig:
     STAGNATION_PENALTY = -3.0
     GOAL_REACHED_BONUS = 5.0
     
-    COMMUNITY_SWITCH_BONUS = 3.0       # Bonus for jumping to different community
-    COMMUNITY_STUCK_PENALTY = -1.0    # Penalty per step stuck in same community
+    COMMUNITY_SWITCH_BONUS = 5.0       # Bonus for jumping to different community
+    COMMUNITY_STUCK_PENALTY = -2.5    # Penalty per step stuck in same community
     COMMUNITY_LOOP_PENALTY = -1.0      # Severe penalty for returning to previous community
-    DIVERSE_COMMUNITY_BONUS = 2.0    # Bonus for visiting many unique communities
+    DIVERSE_COMMUNITY_BONUS = 3.0    # Bonus for visiting many unique communities
     TEMPORAL_JUMP_BONUS = 0.7        # Bonus for moving to a community which is recent 
     TEMPORAL_JUMP_PENALTY = -0.1        # Bonus for doing the opposite 
     COMMUNITY_SIZE_BONUS = 0.3         # Bonus for not being in small communities
@@ -102,7 +103,7 @@ class AdvancedGraphTraversalEnv:
         self.current_intent = None
         self.current_node = None
         self.visited = set()
-        self.max_steps = 30
+        self.max_steps = 50
         self.current_step = 0
         self.text_dim = 384
         self.intent_dim = 5
@@ -213,6 +214,12 @@ class AdvancedGraphTraversalEnv:
             self.encoder = BatchEncoder()
             print("Using GPU-accelerated encoder")
 
+        self.attention_selector = HybridAttentionSelector(
+        embed_dim=self.text_dim,
+        use_community_attention=self.use_communities
+        )
+        self.use_attention = True
+
 
     def _normalize_node_keys(self, node: Dict[str, Any]) -> Dict[str, Any]:
         """Normalizes Neo4j query results to consistent format."""
@@ -310,7 +317,7 @@ class AdvancedGraphTraversalEnv:
 
         if self.steps_in_current_community == 1 and self.previous_community: 
             if self.previous_community != self.current_community: 
-                if self.current_comm_node is paper_id : 
+                if paper_id : 
                     paper_reward += self.config.COMMUNITY_SWITCH_BONUS
                 
                 else: 
@@ -903,16 +910,16 @@ class AdvancedGraphTraversalEnv:
         return self.available_worker_nodes
     
     async def worker_step(self, chosen_node: Dict) -> Tuple[np.ndarray, float, bool]:
-        """Worker step with COMMUNITY-AWARE rewards."""
+
         self.current_step += 1
         self.episode_stats['total_nodes_explored'] += 1
-        community_reason = "none"
         
+        # Normalize node
         self.current_node = self._normalize_node_keys(chosen_node)
-        
         paper_id = self.current_node.get('paper_id')
         author_id = self.current_node.get('author_id')
         
+        # Track visits
         is_revisit = False
         if paper_id and paper_id in self.visited:
             is_revisit = True
@@ -928,11 +935,7 @@ class AdvancedGraphTraversalEnv:
             self.visited.add(author_id)
             self._update_community_tracking(author_id)
         
-        worker_paper_reward = 0.0
-        worker_author_reward = 0.0
-        
         node_emb = await self._get_node_embedding(self.current_node)
-        
         if node_emb is None or not isinstance(node_emb, np.ndarray):
             logging.error(f"Invalid embedding for node {paper_id or author_id}")
             node_emb = np.zeros(self.text_dim, dtype=np.float32)
@@ -940,177 +943,59 @@ class AdvancedGraphTraversalEnv:
         semantic_sim = np.dot(self.query_embedding, node_emb) / (
             np.linalg.norm(self.query_embedding) * np.linalg.norm(node_emb) + 1e-9
         )
-
-        if self.current_step <= 3 and len(self.trajectory_history) < 30:
-            print(f"  [DEBUG] Step {self.current_step}: sim={semantic_sim:.3f}, "
-            f"node={self.current_node.get('title', 'N/A')[:50]}")
         
+        if self.current_step <= 3 and len(self.trajectory_history) <= 30:
+            title = self.current_node.get('title', 'NA')[:50]
+            print(f"  [DEBUG] Step {self.current_step}: sim={semantic_sim:.3f}, node={title}")
+
         if semantic_sim > self.best_similarity_so_far:
             self.best_similarity_so_far = semantic_sim
             self.episode_stats['max_similarity_achieved'] = semantic_sim
         
-        if paper_id:
-            worker_paper_reward += semantic_sim * self.config.SEMANTIC_WEIGHT
-
-            if semantic_sim > 0.7:
-                worker_paper_reward += 15.0 
-            elif semantic_sim > 0.6:
-                worker_paper_reward += 10.0 
-            elif semantic_sim > 0.5:
-                worker_paper_reward += 7.0
-            elif semantic_sim > 0.4:
-                worker_paper_reward += 4.0 
-            elif semantic_sim > 0.3:
-                worker_paper_reward += 2.0 
-            elif semantic_sim > 0.2:
-                worker_paper_reward += 0.5 
-            else:
-                worker_paper_reward -= 1.0  
-            
-            if self.previous_node_embedding is not None:
-                prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
-                    np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
-                )
-
-                similarity_delta = semantic_sim - prev_sim
-
-                if semantic_sim > 0.5: 
-                    worker_paper_reward += 20.0
-                elif semantic_sim > 0.4:  
-                    worker_paper_reward += 15.0
-                elif semantic_sim > 0.35:  
-                    worker_paper_reward += 10.0
-                elif semantic_sim > 0.3:  
-                    worker_paper_reward += 6.0
-                elif semantic_sim > 0.25: 
-                    worker_paper_reward += 3.0
-                elif semantic_sim > 0.2:  
-                    worker_paper_reward += 1.0
-                else:
-                    worker_paper_reward -= 0.5 
-            
-            # Novelty/revisit
-            if not is_revisit and semantic_sim > 0.3:
-                worker_paper_reward += self.config.NOVELTY_BONUS
-            if is_revisit:
-                worker_paper_reward += self.config.REVISIT_PENALTY
-            
-            # Citation bonus
-            citation_count = await self.store.get_citation_count(paper_id)
-            if citation_count > 100:
-                worker_paper_reward += self.config.CITATION_COUNT_BONUS * min(2.0 , np.log10(citation_count / 100))
-            if citation_count > 500: 
-                worker_paper_reward += 0.5
-            year = self.current_node.get('year')
-            if year and year >= 2020:
-                worker_paper_reward += self.config.RECENCY_BONUS
-            
-            # Top venue bonus
-            pub_name = self.current_node.get('publication_name') or ''
-            if pub_name and any(top_venue.lower() in pub_name.lower() for top_venue in self.config.TOP_VENUES):
-                worker_paper_reward += 0.5
-
-
-            if self.use_feedback:
-                feedback_reward = self.feedback_tracker.get_feedback_reward(paper_id)
-                worker_paper_reward += feedback_reward * 0.5
-
-                self.feedback_tracker.simulate_feedback(paper_id , semantic_sim)
-                
-
-            if self.use_feedback and self.cold_start_handler.is_cold_start(self.current_node):
-                cold_reward = await self.cold_start_handler.get_cold_start_reward(paper_id , self.current_node)
-                worker_paper_reward += cold_reward * 0.8
-                
-        # === AUTHOR-SPECIFIC REWARDS ===
-        elif author_id:
-            worker_author_reward += semantic_sim * self.config.SEMANTIC_WEIGHT * 0.8
-            
-            # Progress reward
-            if self.previous_node_embedding is not None:
-                prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
-                    np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
-                )
-                if semantic_sim > prev_sim + 0.03:
-                    worker_author_reward += self.config.PROGRESS_REWARD
-                elif semantic_sim < prev_sim - 0.05:
-                    worker_author_reward += self.config.STAGNATION_PENALTY
-            
-            # Revisit penalty
-            if is_revisit:
-                worker_author_reward += self.config.REVISIT_PENALTY
-            
-            # Prolific author bonus
-            try:
-                papers = await self.store.get_papers_by_author_id(author_id)
-                if len(papers) >= self.config.PROLIFIC_THRESHOLD:
-                    worker_author_reward += self.config.PROLIFIC_AUTHOR_BONUS
-            except:
-                pass
-            
-            # Collaboration bonus
-            try:
-                collab_count = await self.store.get_collab_count(author_id)
-                if collab_count >= self.config.COLLABORATION_THRESHOLD:
-                    worker_author_reward += self.config.COLLABORATION_BONUS
-            except:
-                pass
-            
-
-            # H-index bonus
-            if author_id not in self.h_index_cache:
-                self.h_index_cache[author_id] = await self.store.get_author_h_index(author_id)
-            
-            h_index = self.h_index_cache[author_id]
-            if h_index > 0:
-                h_index_reward = self.config.AUTHOR_H_INDEX_BONUS * min(1.0, np.log10(h_index + 1) / 2.0)
-                worker_author_reward += h_index_reward
-                
-                if h_index > self.author_stats['max_h_index']:
-                    self.author_stats['max_h_index'] = h_index
+        worker_reward = semantic_sim * 100
         
-        if paper_id:
-            (paper_reward, node_type), community_reason = self._calculate_community_reward()
-            worker_paper_reward += paper_reward *0.2
-        elif author_id:
-            (author_reward, node_type), community_reason = self._calculate_community_reward()
-            worker_author_reward += author_reward * 0.2
-
-
-        worker_reward = worker_paper_reward + worker_author_reward
-
-        if self.current_query_facets: 
-            facet_rewards = self.query_reward_calc.calculate_facet_rewards(
-                self.current_node , 
-                self.current_query_facets, 
-                semantic_sim
+        if self.previous_node_embedding is not None:
+            prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
+                np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
             )
-
-            worker_reward += facet_rewards['temporal']*0.3
-            worker_reward += facet_rewards['venue']*0.3
-            worker_reward += facet_rewards['intent']*0.3
             
-        self.previous_node_embedding = node_emb
+            similarity_delta = semantic_sim - prev_sim
+            
+            if similarity_delta < 0:
+                worker_reward -= abs(similarity_delta) * 150
+            else:
+                worker_reward += similarity_delta * 50
+    
+        if is_revisit:
+            worker_reward -= 5
+
+        done = False
+        if paper_id:
+            refs = await self.store.get_references_by_paper(paper_id)
+            cites = await self.store.get_citations_by_paper(paper_id)
+            
+            if len(refs) == 0 and len(cites) == 0:
+                worker_reward -= 50
+                done = True
+                if self.current_step <= 10:
+                    print(f"  [Ep {self.current_step} Step {self.current_step}] No worker actions, ending")
+        
+        if self.current_step >= self.max_steps:
+            done = True
+            if semantic_sim > 0.7:
+                worker_reward += 30
+            elif semantic_sim > 0.6:
+                worker_reward += 15
+        
         self.trajectory_history.append({
             'node': self.current_node,
             'node_type': 'paper' if paper_id else 'author',
             'similarity': semantic_sim,
             'reward': worker_reward,
-            'community': self.current_community,
-            'community_reward': worker_paper_reward if paper_id else worker_author_reward,
-            'community_reason': community_reason
+            'community': self.current_community
         })
         
-        done = self.current_step >= self.max_steps
-        
-        if done:
-            if paper_id and semantic_sim > 0.4:
-                worker_reward += self.config.GOAL_REACHED_BONUS * semantic_sim
-            elif paper_id and semantic_sim > 0.3:  # Was no second tier
-                worker_reward += self.config.GOAL_REACHED_BONUS * semantic_sim
-            elif author_id and semantic_sim > 0.35:  
-                worker_reward += self.config.GOAL_REACHED_BONUS * semantic_sim * 1.5
-        
+        self.previous_node_embedding = node_emb
         next_state = await self._get_state()
         
         self.pending_manager_action = None

@@ -145,7 +145,9 @@ class DDQLAgent:
         if len(self.memory) < self.batch_size:
             return 0.0
         
-        batch, indices, weights = self.memory.sample(self.batch_size)
+        batch, weights , indices = self.memory.sample(self.batch_size)
+        indices = [int(idx) for idx in indices]
+
         
         if not batch:
             return 0.0

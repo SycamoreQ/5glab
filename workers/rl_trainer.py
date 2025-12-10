@@ -6,6 +6,49 @@ import asyncio
 from workers.base_worker import BaseWorker
 from workers.remote_store import RemoteStore
 from typing import Dict , List , Optional
+from RL.ddqn import DDQLAgent
+
+@ray.remote
+class CommunityAwareParameterServer:
+    def __init__(self, model_config):
+        self.global_model = DDQLAgent(**model_config)
+        self.worker_stats = {}
+        self.community_coverage_weights = {}
+        
+    def get_global_weights(self):
+        return self.global_model.policy_net.state_dict()
+    
+    def aggregate_gradients(self, worker_id, gradients, metrics):
+        community_diversity = metrics.get('unique_communities_visited', 1)
+        avg_similarity = metrics.get('avg_similarity', 0.3)
+        
+        quality_weight = (community_diversity / 1059) * (1 + avg_similarity)
+        
+        self.worker_stats[worker_id] = {
+            'weight': quality_weight,
+            'communities': community_diversity,
+            'similarity': avg_similarity
+        }
+        
+        weighted_grads = {k: v * quality_weight for k, v in gradients.items()}
+        
+        for name, param in self.global_model.policy_net.named_parameters():
+            if name in weighted_grads:
+                if param.grad is None:
+                    param.grad = weighted_grads[name].clone()
+                else:
+                    param.grad += weighted_grads[name]
+        
+        self.global_model.optimizer.step()
+        self.global_model.optimizer.zero_grad()
+        
+    def get_best_worker_stats(self, top_k=3):
+        sorted_workers = sorted(
+            self.worker_stats.items(),
+            key=lambda x: x[1]['weight'],
+            reverse=True
+        )
+        return sorted_workers[:top_k]
 
 
 @ray.remote(num_gpus=3, num_cpus=0)

@@ -99,7 +99,7 @@ class AgentWorker:
             episode_reward = 0.0 
             trajectory = []
             
-            for step in range(self.episode_count) : 
+            for step in range(self.env.max_steps) : 
                 manager_actions = await self.env.get_manager_actions()
 
                 if not manager_actions: 
@@ -251,10 +251,9 @@ class MultiAgentTrainer:
 
 
     def sync(self):
-        best = max(
-            self.agents , 
-            key = lambda x : x.episode_count
-        )
+        best = max(self.agents, 
+               key=lambda x: sum(exp.reward for exp in self.shared_buffer.buffer 
+                                 if exp.agent_id == x.agent_id))
 
         best_state = best.agent.policy_net.state_dict()
 

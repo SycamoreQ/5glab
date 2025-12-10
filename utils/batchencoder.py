@@ -10,16 +10,13 @@ class BatchEncoder:
     def __init__(
         self,
         model_name: str = "all-MiniLM-L6-v2",
-        batch_size: int = 256,  # Larger batches for GPU
+        batch_size: int = 256, 
         cache_file: str = "embeddings_cache.pkl"
     ):
-        # Detect device
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        # Load model
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model = SentenceTransformer(model_name)
         self.model.to(self.device)
-        
         self.batch_size = batch_size
         self.cache_file = cache_file
         self.cache = {}
@@ -27,10 +24,10 @@ class BatchEncoder:
         # Load cache
         self._load_cache()
         
-        print(f"✓ BatchEncoder initialized")
-        print(f"  Device: {self.device}")
-        print(f"  Batch size: {batch_size}")
-        print(f"  Cached embeddings: {len(self.cache):,}")
+        print(f"BatchEncoder initialized")
+        print(f"Device: {self.device}")
+        print(f"Batch size: {batch_size}")
+        print(f"Cached embeddings: {len(self.cache):,}")
     
     def _load_cache(self):
         """Load embedding cache."""
@@ -38,12 +35,11 @@ class BatchEncoder:
             try:
                 with open(self.cache_file, 'rb') as f:
                     self.cache = pickle.load(f)
-                print(f"✓ Loaded {len(self.cache):,} cached embeddings")
+                print(f"Loaded {len(self.cache):,} cached embeddings")
             except:
                 self.cache = {}
     
     def _save_cache(self):
-        """Save embedding cache."""
         with open(self.cache_file, 'wb') as f:
             pickle.dump(self.cache, f)
     
@@ -52,32 +48,33 @@ class BatchEncoder:
         papers: List[Dict],
         force: bool = False
     ) -> Dict[str, np.ndarray]:
-        """
-        Precompute embeddings for all papers with GPU batching.
         
-        Args:
-            papers: List of paper dicts
-            force: Force recomputation even if cached
-        
-        Returns:
-            Dict mapping paper_id to embedding
-        """
-        print(f"Precomputing embeddings for {len(papers):,} papers...")
-        
-        # Find papers needing embedding
         to_encode = []
         paper_ids = []
+        texts = []
         
         for paper in papers:
             paper_id = paper['paper_id']
             
             if force or paper_id not in self.cache:
-                text = f"{paper['title']} {paper['abstract']}"
+                title = paper.get('title', '')
+                abstract = paper.get('abstract', '')
+                fields = paper.get('fields', [])
+                
+                if abstract and len(abstract) > 50:
+                    text = f"{title}. {abstract[:400]}" 
+                elif fields and isinstance(fields, list) and len(fields) > 0:
+                    field_str = ' '.join(str(f) for f in fields[:3])
+                    text = f"{title}. {field_str}"
+                else:
+                    text = title
+                
+                texts.append(text)
                 to_encode.append(text)
                 paper_ids.append(paper_id)
         
         if not to_encode:
-            print("✓ All embeddings cached!")
+            print(" All embeddings cached!")
             return {p['paper_id']: self.cache[p['paper_id']] for p in papers}
         
         print(f"  Need to encode: {len(to_encode):,} papers")

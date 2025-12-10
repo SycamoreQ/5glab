@@ -16,3 +16,5 @@ s2_citations/*.pt
 *.gz
 arxiv.zip
 s2_arxiv/*.jsonl
+*.pt
+*.json

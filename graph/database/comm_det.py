@@ -37,62 +37,81 @@ class CommunityDetector:
         print(f"Total papers covered: {len(self.paper_communities)}")
         print(f"Total authors covered: {len(self.author_communities)}")
 
+
     async def _build_paper_communities_leiden(self, max_papers: Optional[int]):
-        print("PAPER communities using Leiden)")
-        print("-" * 80)
-        
-        print("Step 1/6: Dropping existing graph projection...")
-        drop_query = "CALL gds.graph.drop('paperCitationGraph', false)"
-        try:
-            await self.store._run_query_method(drop_query, [])
-            print("Dropped existing projection")
-        except:
-            print("No existing projection")
-        
-        print("\Step 2/6: Creating graph projection (Undirected)...")
-        
-        # Native projection - captures ALL CITES relationships
-        project_query = """
-        CALL gds.graph.project(
-            'paperCitationGraph',
-            'Paper',
-            {
-                CITES: {
-                    orientation: 'UNDIRECTED'
-                }
-            },
-            {
-                nodeProperties: ['year', 'citationCount']
-            }
-        )
-        YIELD graphName, nodeCount, relationshipCount
-        RETURN graphName, nodeCount, relationshipCount
-        """
-        
-        try:
-            result = await self.store._run_query_method(project_query, [])
-            if result:
-                node_count = result[0]['nodeCount']
-                rel_count = result[0]['relationshipCount']
-                print(f"Graph projected: {node_count:,} nodes, {rel_count:,} edges (undirected)")
-                
-                if rel_count < 100000:
-                    print(f"WARNING: Expected ~508k edges, got {rel_count}. Proceeding anyway...")
-        except Exception as e:
-            print(f"    ✗ ERROR: Graph projection failed: {e}")
-            print("    Falling back to tier-based method...")
+        print("\nPAPER communities using Leiden")
+
+        training_file = "training_papers.pkl"
+        if not os.path.exists(training_file):
+            print(f"{training_file} not found! Run cache_once.py first.")
             await self._build_paper_communities_tier_based(max_papers)
             return
         
-        print("\n  Step 3/6: Running Leiden algorithm (may take 3-10 minutes for 1.8M nodes)...")
+        print(f" Loading cached paper IDs from {training_file}...")
+        with open(training_file, 'rb') as f:
+            cached_papers = pickle.load(f)
         
+        paper_ids = [p['paper_id'] for p in cached_papers]
+        print(f" Loaded {len(paper_ids):,} paper IDs from cache")
+        
+        print("\n  Dropping existing graph projection...")
+        drop_query = "CALL gds.graph.drop('paperCitationGraph', false)"
+        try:
+            await self.store._run_query_method(drop_query, [])
+            print(" Dropped existing projection")
+        except:
+            print("  No existing projection")
+
+        print(f"\n  Creating graph projection (CACHED PAPERS ONLY)...")
+        print(f"  Projecting {len(paper_ids):,} papers and their citations...")
+
+
+        project_query = f"""
+            CALL gds.graph.project.cypher(
+            'paperCitationGraph',
+            'MATCH (p:Paper) WHERE p.paperId IN $paper_ids RETURN id(p) AS id',
+            'MATCH (p1:Paper)-[:CITES]->(p2:Paper) 
+            WHERE p1.paperId IN $paper_ids AND p2.paperId IN $paper_ids 
+            RETURN id(p1) AS source, id(p2) AS target
+            UNION ALL
+            MATCH (p1:Paper)-[:CITES]->(p2:Paper) 
+            WHERE p1.paperId IN $paper_ids AND p2.paperId IN $paper_ids 
+            RETURN id(p2) AS source, id(p1) AS target',
+            {{parameters: {{paper_ids: $1}}}}
+            )
+            YIELD graphName, nodeCount, relationshipCount
+            RETURN graphName, nodeCount, relationshipCount
+            """
+        
+        node_count = 0
+        rel_count = 0
+        
+        try:
+            result = await self.store._run_query_method(project_query, [paper_ids])
+            if result:
+                node_count = result[0]['nodeCount']
+                rel_count = result[0]['relationshipCount']
+                print(f" Graph projected: {node_count:,} nodes, {rel_count:,} edges (undirected)")
+                
+                if node_count != len(paper_ids):
+                    print(f" WARNING: Expected {len(paper_ids):,} nodes, got {node_count:,}")
+                
+                if rel_count < 10000:
+                    print(f" WARNING: Very sparse graph ({rel_count} edges). Falling back to tier-based.")
+                    await self.store._run_query_method(drop_query, [])
+                    await self._build_paper_communities_tier_based(max_papers)
+                    return
+        except Exception as e:
+            print(f" ERROR: Graph projection failed: {e}")
+            print(" Falling back to tier-based method...")
+            await self._build_paper_communities_tier_based(max_papers)
+            return
+        
+        print(f"\n  Running Leiden algorithm (may take 3-5 minutes for {node_count:,} nodes)...")
         leiden_query = """
-        CALL gds.leiden.stream('paperCitationGraph', {
-            maxLevels: 10,
-            gamma: 1.0,
-            theta: 0.01,
-            includeIntermediateCommunities: false,
-            concurrency: 4
+        CALL gds.louvain.stream('paperCitationGraph', {
+        maxLevels: 10,
+        concurrency: 4
         })
         YIELD nodeId, communityId
         RETURN gds.util.asNode(nodeId).paperId AS paperId, communityId
@@ -100,50 +119,35 @@ class CommunityDetector:
         
         try:
             leiden_results = await self.store._run_query_method(leiden_query, [])
-            print(f"Leiden completed: {len(leiden_results):,} node assignments")
+            print(f" Leiden completed: {len(leiden_results):,} node assignments")
             
             if not leiden_results:
-                print("WARNING: Leiden returned no results. Falling back to tier-based.")
+                print(" WARNING: Leiden returned no results. Falling back to tier-based.")
                 await self.store._run_query_method(drop_query, [])
                 await self._build_paper_communities_tier_based(max_papers)
                 return
-                
         except Exception as e:
-            print(f"ERROR: Leiden failed: {e}")
+            print(f" ERROR: Leiden failed: {e}")
             await self.store._run_query_method(drop_query, [])
             await self._build_paper_communities_tier_based(max_papers)
             return
-        
-        print("Step 4/6: Assigning base communities...")
-        
+
+        print("\n  Assigning base communities...")
         for result in leiden_results:
             paper_id = result.get('paperId')
             comm_id = result.get('communityId')
-            
             if paper_id and comm_id is not None:
                 self.paper_communities[paper_id] = f"L_{comm_id}"
         
         base_communities = len(set(self.paper_communities.values()))
-        print(f"Assigned {len(self.paper_communities):,} papers to {base_communities} base communities")
-        community_sizes = Counter(self.paper_communities.values())
-        large_communities = {c for c, size in community_sizes.items() if size >= 10}
-
-        for paper_id, comm_id in list(self.paper_communities.items()):
-            if comm_id not in large_communities:
-                self.paper_communities[paper_id] = "L_SMALL"
-
-        final_communities = len(set(self.paper_communities.values()))
-        print(f"Reduced from {base_communities:,} to {final_communities:,} communities (min size: 10)")
+        print(f" Assigned {len(self.paper_communities):,} papers to {base_communities} base communities")
         
-        print("Step 5/6: Enriching with metadata...")
-        
-        paper_ids = list(self.paper_communities.keys())
+        print("\n  Enriching with metadata")
         batch_size = 5000
-        
         metadata_map = {}
+        
         for i in range(0, len(paper_ids), batch_size):
             batch = paper_ids[i:i+batch_size]
-            
             query = """
             MATCH (p:Paper)
             WHERE p.paperId IN $1
@@ -152,17 +156,15 @@ class CommunityDetector:
                 COALESCE(p.citationCount, 0) as cites,
                 p.fieldsOfStudy as fields
             """
-            
             results = await self.store._run_query_method(query, [batch])
-            
             for r in results:
                 pid = r['paper_id']
                 metadata_map[pid] = r
             
             if (i + batch_size) % 20000 == 0:
-                print(f"Fetched metadata for {len(metadata_map):,}/{len(paper_ids):,} papers...")
+                print(f"  Fetched metadata for {len(metadata_map):,}/{len(paper_ids):,} papers...")
         
-        print(f"Metadata fetched for {len(metadata_map):,} papers")
+        print(f" Metadata fetched for {len(metadata_map):,} papers")
         
         for paper_id, comm_id in list(self.paper_communities.items()):
             meta = metadata_map.get(paper_id, {})
@@ -176,11 +178,10 @@ class CommunityDetector:
             enriched_id = f"{comm_id}_{year}_{cite_tier}_{field}"
             self.paper_communities[paper_id] = enriched_id
         
-        print("Step 6/6: Cleaning up graph projection...")
-        
+        print("\n  Cleaning up graph projection...")
         try:
             await self.store._run_query_method(drop_query, [])
-            print(" Cleanup complete")
+            print("  Cleanup complete")
         except:
             pass
         
@@ -188,14 +189,14 @@ class CommunityDetector:
         self.paper_community_sizes = dict(paper_counter)
         
         enriched_communities = len(set(self.paper_communities.values()))
-        
-        print(f"Created {enriched_communities:,} enriched paper communities (from {base_communities} base communities)")
-        print(f"Covered {len(self.paper_communities):,} papers")
+        print(f"\n✓ Created {enriched_communities:,} enriched paper communities (from {base_communities} base communities)")
+        print(f" Covered {len(self.paper_communities):,} papers")
         
         top_paper_comms = sorted(self.paper_community_sizes.items(), key=lambda x: x[1], reverse=True)[:10]
-        print(f"\n  Top 10 paper communities:")
+        print(f"\n Top 10 paper communities:")
         for i, (comm_id, size) in enumerate(top_paper_comms, 1):
-            print(f"    {i}. {comm_id}: {size:,} papers")
+            print(f"  {i}. {comm_id}: {size:,} papers")
+
 
 
 

@@ -12,6 +12,7 @@ import argparse
 import logging
 from utils.batchencoder import BatchEncoder
 import os 
+import random
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 import warnings
@@ -112,6 +113,16 @@ async def diagnose_communities(env, store):
         else:
             print(f"SUCCESS: All {found_count}/{len(sample_papers)} test papers have communities!")
             print(" Community detection should work correctly")
+
+        print("\n=== DATABASE CONNECTIVITY CHECK ===")
+        sample_ids = [p['paper_id'] for p in sample_papers[:20]]
+
+        for pid in sample_ids[:5]:
+            refs = await store.get_references_by_paper(pid)
+            cites = await store.get_citations_by_paper(pid)
+            print(f"Paper {pid}: {len(refs)} refs, {len(cites)} cites")
+            if len(refs) == 0 and len(cites) == 0:
+                print(f"  ⚠️ ISOLATED NODE")  
         
     except Exception as e:
         print(f"Error during diagnostic: {e}")
@@ -223,13 +234,56 @@ async def diagnose_embeddings(env, store, cached_papers):
             print(f"   Similarity: {ml_sim:.3f} (should be >0.5)")
             
             if ml_sim < 0.4:
-                print(f"   ⚠ WARNING: Low similarity for obviously related paper!")
+                print(f"WARNING: Low similarity for obviously related paper!")
         else:
-            print(f"   ✗ Paper not in precomputed embeddings")
+            print(f"Paper not in precomputed embeddings")
     
     print("\n" + "="*80 + "\n")
     
     return True
+
+
+async def find_relevant_starting_papers(cached_papers, queries, encoder, n_per_query=20):
+    """Find papers most relevant to each query."""
+    query_papers = {}
+    
+    print(f"Finding relevant starting papers for {len(queries)} queries...\n")
+    
+    for query in queries:
+        query_emb = encoder.encode_with_cache(query, cache_key=f"query_{query}")
+        
+        scored_papers = []
+        for paper in cached_papers:
+            paper_id = paper['paper_id']
+            
+            if paper_id in encoder.cache:
+                paper_emb = encoder.cache[paper_id]
+            else:
+                title = paper.get('title', '')
+                abstract = paper.get('abstract', '')
+                
+                if abstract and len(abstract) > 50:
+                    text = f"{title}. {abstract[:200]}"
+                else:
+                    text = title
+                
+                paper_emb = encoder.encode_with_cache(text, cache_key=paper_id)
+            
+            sim = np.dot(query_emb, paper_emb) / (
+                np.linalg.norm(query_emb) * np.linalg.norm(paper_emb) + 1e-9
+            )
+            
+            scored_papers.append((paper, sim))
+    
+        scored_papers.sort(key=lambda x: x[1], reverse=True)
+        query_papers[query] = [p for p, s in scored_papers[:n_per_query]]
+        
+        print(f" Query: '{query[:50]}...'")
+        print(f" Top paper: {scored_papers[0][0]['title'][:60]} (sim: {scored_papers[0][1]:.3f})")
+    
+    print()
+    return query_papers
+
 
 
 async def train_single_process():
@@ -257,9 +311,17 @@ async def train_single_process():
     print(f"✓ Loaded {len(cached_papers)} papers")
 
     print("\nStarting papers sample:")
-    for i, p in enumerate(cached_papers[:3], 1):
-        print(f"  {i}. {p['title'][:60]}")
-        print(f"     Connectivity: {p['ref_count']} refs, {p['cite_count']} cites")
+    for i, p in enumerate(cached_papers[:5], 1):
+        title = p.get('title', 'N/A')[:80]
+        year = p.get('year', 'N/A')
+        refs = p.get('referenceCount', 0) or 0
+        cites = p.get('citationCount', 0) or 0
+        fields = p.get('fields', [])
+        field_str = ', '.join(fields[:3]) if isinstance(fields, list) and fields else 'N/A'
+    
+        print(f"  {i}. {title}")
+        print(f"Year: {year} | Fields: {field_str}")
+        print(f"Connectivity: {refs} refs, {cites} cites")
     
     print("\nInitializing environment...")
     store = EnhancedStore(pool_size=20)
@@ -294,38 +356,55 @@ async def train_single_process():
     episode_steps = []
     episode_similarities = []
     losses = []
+
+    queries = [
+    "machine learning neural networks",
+    "deep learning computer vision",
+    "reinforcement learning algorithms",
+    "natural language processing transformers",
+    "graph neural networks",
+    "time series forecasting",
+    "federated learning privacy",
+    "explainable artificial intelligence",
+    "transfer learning few shot",
+    "generative adversarial networks"
+    ]
+
     
     print(f"Starting Training for: {num_episodes} episodes")
-    
+    query_to_papers = await find_relevant_starting_papers(
+    cached_papers, queries, encoder, n_per_query=20
+    )
+
     for episode in range(num_episodes):
-        paper = np.random.choice(cached_papers)
+        query_idx = episode % len(queries)
+        query = queries[query_idx]
+        
+        candidate_papers = query_to_papers[query]
+        start_paper = random.choice(candidate_papers)
         
         try:
             state = await env.reset(
-                query= paper['title'],
+                query=query,
                 intent=1,  
-                start_node_id=paper['paper_id']
+                start_node_id=start_paper['paper_id']
             )
             
             episode_reward = 0
             step = 0
             done = False
-            episode_experiences = []
+            
+            if episode >= 5:
+                agent.epsilon = 0.1 
             
             while not done and step < env.max_steps:
                 step += 1
                 
                 manager_actions = await env.get_manager_actions()
                 if not manager_actions:
-                    if episode < 10: 
-                        print(f"  [Ep {episode} Step {step}] No manager actions, ending")
                     break
                 
-                if 1 in manager_actions:  
-                    manager_action = 1
-                else:
-                    manager_action = np.random.choice(manager_actions)
-                
+                manager_action = 1 if 1 in manager_actions else manager_actions[0]
                 is_terminal, manager_reward = await env.manager_step(manager_action)
                 episode_reward += manager_reward
                 
@@ -335,22 +414,39 @@ async def train_single_process():
                 
                 worker_actions = await env.get_worker_actions()
                 if not worker_actions:
-                    if episode < 10: 
-                        print(f"  [Ep {episode} Step {step}] No worker actions, ending")
                     break
                 
-                best_action = agent.act(state, worker_actions)
-                
-                if best_action is None:
-                    if episode < 10:
-                        print(f"  [Ep {episode} Step {step}] Agent returned no action")
-                    break
+                if episode < 30:
+                    best_action = None
+                    best_sim = -1.0
+                    
+                    for node, r_type in worker_actions:
+                        node_emb = encoder.cache.get(node['paper_id'])
+                        if node_emb is None:
+                            title = node.get('title', '')
+                            abstract = node.get('abstract', '')
+                            text = f"{title}. {abstract[:200]}" if abstract else title
+                            node_emb = encoder.encode_with_cache(text, cache_key=node['paper_id'])
+                        
+                        sim = np.dot(env.query_embedding, node_emb) / (
+                            np.linalg.norm(env.query_embedding) * np.linalg.norm(node_emb) + 1e-9
+                        )
+                        
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_action = (node, r_type)
+                    
+                    if best_action is None:
+                        break
+                else:
+                    best_action = agent.act(state, worker_actions)
+                    if best_action is None:
+                        break
                 
                 chosen_node, _ = best_action
-                
                 next_state, worker_reward, done = await env.worker_step(chosen_node)
                 episode_reward += worker_reward
-                
+
                 if not done:
                     next_manager_actions = await env.get_manager_actions()
                     if next_manager_actions:
@@ -364,11 +460,10 @@ async def train_single_process():
                 else:
                     next_worker_actions = []
                 
-                # Store experience
                 agent.remember(
                     state=state,
                     action_tuple=best_action,
-                    reward=episode_reward,
+                    reward=worker_reward, 
                     next_state=next_state,
                     done=done,
                     next_actions=next_worker_actions
@@ -382,46 +477,47 @@ async def train_single_process():
             summary = env.get_episode_summary()
             episode_similarities.append(summary.get('max_similarity_achieved', 0.0))
             
-            if len(agent.memory) >= agent.batch_size:
-                if agent.use_prioritized: 
-                    loss = agent.replay_prioritized()
-                else: 
-                    loss = agent.replay()
-                
+            if len(agent.memory) >= 16: 
+                loss = agent.replay_prioritized() if agent.use_prioritized else agent.replay()
                 losses.append(loss)
             else:
                 loss = 0.0
             
-            if episode % target_update_freq == 0 and episode > 0:
+            # Decay epsilon
+            if episode >= 20:
+                agent.epsilon = max(0.05, agent.epsilon * 0.998)
+            
+            # Update target network
+            if episode % 5 == 0 and episode > 0:
                 agent.update_target()
                 print(f"  [Ep {episode}] Target network updated")
             
-            # Print progress every 10 episodes
+            # Print progress
             if episode % 10 == 0:
                 env.feedback_tracker.save_feedback()
                 total_clicks = sum(env.feedback_tracker.clicks.values())
                 total_saves = sum(env.feedback_tracker.saves.values())
                 avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
-                avg_steps = np.mean(episode_steps[-100:]) if len(episode_steps) >= 100 else np.mean(episode_steps)
-                avg_sim = np.mean(episode_similarities[-100:]) if len(episode_similarities) >= 100 else np.mean(episode_similarities)
+                avg_sim = np.mean(episode_similarities[-10:]) if len(episode_similarities) >= 10 else np.mean(episode_similarities)
                 
                 print(f"  Feedback: {total_clicks} clicks, {total_saves} saves")
                 print(f"Episode {episode:4d} | "
-                      f"Reward: {episode_reward:+7.2f} | "
-                      f"Avg(100): {avg_reward:+7.2f} | "
-                      f"Steps: {step} | "
-                      f"Loss: {loss:.4f} | "
-                      f"ε: {agent.epsilon:.3f}")
+                    f"Reward: {episode_reward:+7.2f} | "
+                    f"Avg(100): {avg_reward:+7.2f} | "
+                    f"Steps: {step} | "
+                    f"Loss: {loss:.4f} | "
+                    f"ε: {agent.epsilon:.3f}")
                 print(f"  Stats: Communities: {summary['unique_communities_visited']}, "
-                      f"Sim: {summary['max_similarity_achieved']:.3f}, "
-                      f"Loops: {summary['community_loops']}")
+                    f"Sim: {avg_sim:.3f}, "
+                    f"Loops: {summary['community_loops']}")
         
         except Exception as e:
             logging.error(f"Episode {episode} failed: {e}")
-            if episode < 5:  
+            if episode < 5:
                 import traceback
                 traceback.print_exc()
             continue
+
 
         # Save checkpoints
         if episode % save_freq == 0 and episode > 0:

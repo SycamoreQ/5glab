@@ -1,68 +1,52 @@
 import numpy as np
-from collections import namedtuple
-from typing import List, Tuple
-
-Experience = namedtuple('Experience', ['state', 'action', 'r_type', 'reward', 'next_state', 'done', 'next_actions'])
-
+from collections import deque
+from typing import List, Tuple, Any
 
 class PrioritizedReplay:
-    """Prioritized Experience Replay Buffer."""
-    
-    def __init__(self, capacity: int = 50000, alpha: float = 0.6, beta: float = 0.4):
-        self.capacity = capacity
+    def __init__(self, max_size=100000, alpha=0.6, beta=0.4 , capacity = None):
+        if capacity is not None:
+            max_size = capacity 
+        self.max_size = max_size   
+        self.buffer = deque(maxlen=max_size)
+        self.priorities = deque(maxlen=max_size)
         self.alpha = alpha
         self.beta = beta
         self.beta_increment = 0.001
-        
-        self.buffer = []
-        self.priorities = np.zeros(capacity, dtype=np.float32)
-        self.position = 0
+        self.epsilon = 1e-6
         self.size = 0
     
-    def add(self, state, action, r_type, reward, next_state, done, next_actions):
-        """Add experience to buffer with relation type."""
-        max_priority = self.priorities[:self.size].max() if self.size > 0 else 1.0
+    def add(self, state, action, relation_type, reward, next_state, done, next_actions):
+        max_priority = max(self.priorities) if len(self.priorities) > 0 else 1.0
         
-        experience = Experience(state, action, r_type, reward, next_state, done, next_actions)
-        
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(experience)
-        else:
-            self.buffer[self.position] = experience
-        
-        self.priorities[self.position] = max_priority
-        self.position = (self.position + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
+        self.buffer.append((state, action, relation_type, reward, next_state, done, next_actions))
+        self.priorities.append(max_priority ** self.alpha)
+        self.size = len(self.buffer)
     
-    def sample(self, batch_size: int) -> Tuple[List, np.ndarray, np.ndarray]:
-        """Sample batch with priorities."""
-        if self.size < batch_size:
-            return [], np.array([]), np.array([])
+    def sample(self, batch_size):
+        if len(self.buffer) < batch_size:
+            return None
         
-        priorities = self.priorities[:self.size]
-        probabilities = priorities ** self.alpha
-        probabilities /= probabilities.sum()
+        priorities_array = np.array(self.priorities)
+        probs = priorities_array / priorities_array.sum()
         
-        indices = np.random.choice(self.size, batch_size, p=probabilities, replace=False)
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs, replace=False)
         
-        # Importance sampling weights
-        weights = (self.size * probabilities[indices]) ** (-self.beta)
+        samples = [self.buffer[idx] for idx in indices]
+        
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-self.beta)
         weights /= weights.max()
-        
-        batch = [self.buffer[idx] for idx in indices]
         
         self.beta = min(1.0, self.beta + self.beta_increment)
         
-        return batch, indices, weights
+        return samples, weights, indices
     
-    def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray):
-        """Update priorities based on TD errors."""
-        for idx, error in zip(indices, td_errors):
-            self.priorities[idx] = abs(error) + 1e-6
+    def update_priorities(self, indices, priorities):
+        for idx, priority in zip(indices, priorities):
+            self.priorities[idx] = (priority + self.epsilon) ** self.alpha
     
     def __len__(self):
-        """Return current buffer size."""
-        return self.size
+        return len(self.buffer)
     
     def __iter__(self):
         """Make buffer iterable for compatibility."""
