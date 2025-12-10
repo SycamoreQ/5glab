@@ -171,10 +171,10 @@ async def diagnose_embeddings(env, store, cached_papers):
     
     # Check if in precomputed
     if paper_id in env.precomputed_embeddings:
-        print(f"   ✓ Found in precomputed embeddings")
+        print(f"Found in precomputed embeddings")
         emb = env.precomputed_embeddings[paper_id]
     else:
-        print(f"   ✗ NOT in precomputed embeddings!")
+        print(f"NOT in precomputed embeddings!")
         # Try encoding manually
         title = test_paper.get('title', '')
         keywords = test_paper.get('keywords', '')
@@ -302,7 +302,7 @@ async def train_single_process():
         
         try:
             state = await env.reset(
-                query=paper['title'],
+                query= paper['title'],
                 intent=1,  
                 start_node_id=paper['paper_id']
             )

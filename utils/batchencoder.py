@@ -1,113 +1,126 @@
-import torch 
+import torch
+import numpy as np
 from sentence_transformers import SentenceTransformer
-from typing import Dict , List , Any 
-import numpy as np 
-
+from typing import List, Dict, Optional
+import pickle
+import os
 
 
 class BatchEncoder:
-    
-    def __init__(self , model_name: str = "all-MiniLM-L6-v2" , device:str = "cuda"): 
-        self.device = device if torch.cuda.is_available() else "cpu"
-        self.model = SentenceTransformer(model_name, device=self.device)
-        self.cache = {}
-        self.cache_limit = 10000
-
-    
-    def encode_batch(self , texts: List[str]) -> np.ndarray:
-        embeddings = self.model.encode(
-            texts , 
-            batch_size = 32, 
-            show_progress_bar= False ,
-            convert_to_numpy= True , 
-            device = self.device
-        )
-
-        return embeddings
-    
-    def encode_with_cache(self , text : str , cache_keys: str) -> np.ndarray: 
-        key = cache_keys or text[:100]
-
-        if key in self.cache: 
-            return self.cache[key]
+    def __init__(
+        self,
+        model_name: str = "all-MiniLM-L6-v2",
+        batch_size: int = 256,  # Larger batches for GPU
+        cache_file: str = "embeddings_cache.pkl"
+    ):
+        # Detect device
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        embedding = self.model.encode(text , convert_to_numpy=True)
-
-        if len(self.cache) < self.cache_limit: 
-            self.cache[key] = embedding
-
-        return embedding
+        # Load model
+        self.model = SentenceTransformer(model_name)
+        self.model.to(self.device)
+        
+        self.batch_size = batch_size
+        self.cache_file = cache_file
+        self.cache = {}
+        
+        # Load cache
+        self._load_cache()
+        
+        print(f"✓ BatchEncoder initialized")
+        print(f"  Device: {self.device}")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Cached embeddings: {len(self.cache):,}")
     
-
-    def precompute_paper_embeddings(self, papers: List[Dict]) -> Dict[str, np.ndarray]:
-        texts = []
+    def _load_cache(self):
+        """Load embedding cache."""
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, 'rb') as f:
+                    self.cache = pickle.load(f)
+                print(f"✓ Loaded {len(self.cache):,} cached embeddings")
+            except:
+                self.cache = {}
+    
+    def _save_cache(self):
+        """Save embedding cache."""
+        with open(self.cache_file, 'wb') as f:
+            pickle.dump(self.cache, f)
+    
+    def precompute_paper_embeddings(
+        self,
+        papers: List[Dict],
+        force: bool = False
+    ) -> Dict[str, np.ndarray]:
+        """
+        Precompute embeddings for all papers with GPU batching.
+        
+        Args:
+            papers: List of paper dicts
+            force: Force recomputation even if cached
+        
+        Returns:
+            Dict mapping paper_id to embedding
+        """
+        print(f"Precomputing embeddings for {len(papers):,} papers...")
+        
+        # Find papers needing embedding
+        to_encode = []
         paper_ids = []
         
-        INVALID_VALUES = {'', 'N/A', '...', 'Unknown', 'null', 'None', 'undefined'}
-        
         for paper in papers:
-            paper_id = paper.get('paper_id')
-            if not paper_id:
-                continue
+            paper_id = paper['paper_id']
             
-            title = str(paper.get('title', '')) if paper.get('title') else ''
-            keywords = str(paper.get('fields' , '')) if paper.get('fieldOfStudy') else ''
-            abstract = str(paper.get('abstract', '')) if paper.get('abstract') else ''
-            pub_name = str(paper.get('venue', '')) if paper.get('venue') else ''
-            
-            if not title or title in INVALID_VALUES or len(title) <= 3:
-                continue  
-            
-            parts = [title]
-            
-            if keywords:
-                parts.append(keywords)
-            
-            if abstract and len(abstract) > 20:
-                parts.append(abstract[:500])
-            elif pub_name and pub_name not in INVALID_VALUES:
-                parts.append(pub_name)
-            
-            text = " ".join(parts).strip()
-            
-            if text and len(text) >= 10:
-                texts.append(text)
+            if force or paper_id not in self.cache:
+                text = f"{paper['title']} {paper['abstract']}"
+                to_encode.append(text)
                 paper_ids.append(paper_id)
         
-        print(f"Precomputing embeddings for {len(texts)} papers...")
+        if not to_encode:
+            print("✓ All embeddings cached!")
+            return {p['paper_id']: self.cache[p['paper_id']] for p in papers}
         
-        if not texts:
-            print("Warning: No valid texts to encode!")
-            return {}
-
-        print(f"\nSample texts being encoded:")
-        for i, (text, pid) in enumerate(zip(texts[:3], paper_ids[:3]), 1):
-            print(f"  {i}. {text[:80]}...")
-            print(f"     ID: {pid}")
+        print(f"  Need to encode: {len(to_encode):,} papers")
+        print(f"  Using device: {self.device}")
         
-        embeddings = self.encode_batch(texts)
+        # Batch encode on GPU
+        print("  Encoding in batches...")
+        embeddings = self.model.encode(
+            to_encode,
+            batch_size=self.batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            device=self.device
+        )
         
-        valid_count = 0
-        zero_count = 0
+        # Update cache
+        for paper_id, embedding in zip(paper_ids, embeddings):
+            self.cache[paper_id] = embedding
         
-        embedding_map = {}
-        for pid, emb in zip(paper_ids, embeddings):
-            if isinstance(emb, np.ndarray) and emb.shape[0] > 0:
-                if np.abs(emb).sum() > 0.01:  # Not all zeros
-                    embedding_map[pid] = emb
-                    valid_count += 1
-                else:
-                    zero_count += 1
-            else:
-                zero_count += 1
+        # Save cache
+        print("  Saving cache...")
+        self._save_cache()
         
-        print(f"Precomputed {len(embedding_map)} valid embeddings")
-        if zero_count > 0:
-            print(f"Warning: {zero_count} embeddings were zero/invalid")
+        print(f"✓ Precomputed {len(embeddings):,} new embeddings")
         
-        if embedding_map:
-            sample_emb = next(iter(embedding_map.values()))
-            print(f"Embedding dimension: {sample_emb.shape}")
-            print(f"Sample embedding norm: {np.linalg.norm(sample_emb):.3f}")
+        return {p['paper_id']: self.cache[p['paper_id']] for p in papers}
+    
+    def encode_with_cache(
+        self,
+        text: str,
+        cache_key: Optional[str] = None
+    ) -> np.ndarray:
+        """Encode text with caching."""
+        if cache_key and cache_key in self.cache:
+            return self.cache[cache_key]
         
-        return embedding_map
+        embedding = self.model.encode(
+            text,
+            convert_to_numpy=True,
+            device=self.device
+        )
+        
+        if cache_key:
+            self.cache[cache_key] = embedding
+        
+        return embedding

@@ -1,149 +1,184 @@
 import asyncio
 import pickle
-import random
+import os
+from collections import Counter
 from graph.database.store import EnhancedStore
 
-async def build_training_cache():
-    """Cache high-quality papers using memory-efficient streaming."""
-    print("Building training paper cache...")
+
+async def build_full_abstract_cache(database: str = "neo4j"):
+    """
+    Get ALL papers with abstracts.
+    This is your effective database for RL training.
+    """
+    print("="*80)
+    print("BUILDING CACHE: ALL PAPERS WITH ABSTRACTS")
+    print("="*80)
+    print(f"Database: {database}\n")
     
     store = EnhancedStore(pool_size=20)
     
-    print("Phase 1: Sampling papers with connectivity...")
+    # Get ALL papers with abstracts
+    query = """
+    MATCH (p:Paper)
+    WHERE p.abstract IS NOT NULL 
+      AND size(p.abstract) > 50
     
-    batch_size = 50000
-    max_batches = 100
-    all_papers = []
+    OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
+    WHERE citing.abstract IS NOT NULL
     
-    for batch_num in range(max_batches):
-        offset = batch_num * batch_size
-        
-        query = """
-        MATCH (p:Paper)
-        WHERE p.title IS NOT NULL 
-              AND p.title <> ''
-              AND size(p.title) > 10
-        WITH p
-        SKIP $1
-        LIMIT $2
-        OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
-        OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
-        WITH p, 
-             count(DISTINCT ref) as ref_count,
-             count(DISTINCT citing) as cite_count
-        WHERE ref_count > 0 OR cite_count > 0
-        RETURN p.paperId as paper_id,
-               p.title as title,
-               p.year as year,
-               p.abstract as abstract,
-               p.venue as venue,
-               p.fieldsOfStudy as fields,
-               p.citationCount as citation_count,
-               p.referenceCount as reference_count,
-               ref_count,
-               cite_count
-        """
-        
-        try:
-            batch = await store._run_query_method(query, [offset, batch_size])
-            
-            if not batch:
-                print(f"  Batch {batch_num + 1}: No more papers")
-                break
-            
-            all_papers.extend(batch)
-            print(f"  Batch {batch_num + 1}: Found {len(batch)} papers (total: {len(all_papers)})")
-            
-            if len(all_papers) >= 200000:
-                print(f"  Reached 200k papers, stopping...")
-                break
-                
-        except Exception as e:
-            print(f"  Batch {batch_num + 1}: Error - {e}")
-            break
+    OPTIONAL MATCH (p)-[:CITES]->(cited:Paper)
+    WHERE cited.abstract IS NOT NULL
     
-    print(f"\nPhase 2: Filtering quality papers...")
+    RETURN 
+        p.paperId as paper_id,
+        p.title as title,
+        p.abstract as abstract,
+        p.year as year,
+        p.doi as doi,
+        p.fieldsOfStudy as fields,
+        p.citationCount as total_citations,
+        count(DISTINCT citing) as cite_count,
+        count(DISTINCT cited) as ref_count
+    ORDER BY p.citationCount DESC
+    """
     
-    valid_papers = []
-    for p in all_papers:
-        title = p.get('title', '')
-        ref_count = p.get('ref_count', 0) or 0
-        cite_count = p.get('cite_count', 0) or 0
-        
-        # Quality filters
-        if (title and 
-            len(title) > 10 and
-            title.lower() not in ['...', 'research paper', 'unknown', 'n/a'] and
-            (ref_count + cite_count) >= 3): 
-            valid_papers.append(p)
+    print("Querying ALL papers with abstracts...")
     
-    print(f"  Valid papers: {len(valid_papers)}")
+    results = await store._run_query_method(query, [])
     
-    if not valid_papers:
-        print("\nERROR: No valid papers found!")
+    if not results:
+        print(" No papers found!")
         await store.pool.close()
         return
     
-    print("\nPhase 3: Sorting by connectivity...")
+    papers = []
+    for r in results:
+        papers.append({
+            'paper_id': r['paper_id'],
+            'title': r['title'],
+            'abstract': r['abstract'],
+            'year': r['year'],
+            'doi': r.get('doi'),
+            'arxiv_id': None,
+            'venue': None,
+            'fields': r.get('fields', []),
+            'cite_count': r['cite_count'],
+            'ref_count': r['ref_count'],
+            'total_citations': r.get('total_citations', 0),
+            'total_connectivity': r['cite_count'] + r['ref_count']
+        })
     
-    # Sort by total connectivity (refs + citations)
-    valid_papers.sort(key=lambda x: (x.get('ref_count', 0) or 0) + (x.get('cite_count', 0) or 0), reverse=True)
+    print(f"✓ Found {len(papers):,} papers with abstracts")
     
-    # Take top 20k most connected papers
-    cached_papers = valid_papers[:20000]
+    # Check internal connectivity (only among papers WITH abstracts)
+    print(f"\n🔍 Checking citation connectivity...")
     
-    # Save cache
-    with open('training_papers.pkl', 'wb') as f:
-        pickle.dump(cached_papers, f)
+    paper_ids = [p['paper_id'] for p in papers]
     
-    print(f"\n✓ Cache saved to training_papers.pkl")
+    edge_query = """
+    MATCH (p1:Paper)-[:CITES]->(p2:Paper)
+    WHERE p1.paperId IN $1 
+      AND p2.paperId IN $1
+      AND p1.abstract IS NOT NULL
+      AND p2.abstract IS NOT NULL
+    RETURN count(*) as edge_count
+    """
     
-    # Statistics
-    print("\nTop 10 most connected papers:")
-    for i, p in enumerate(cached_papers[:10], 1):
-        total_conn = (p.get('ref_count', 0) or 0) + (p.get('cite_count', 0) or 0)
-        venue = p.get('venue', 'Unknown')
-        year = p.get('year', 'N/A')
-        
-        print(f"  {i}. [{year}] {p['title'][:60]}")
-        print(f"     Venue: {venue}")
-        print(f"     Refs: {p.get('ref_count', 0)}, Cites: {p.get('cite_count', 0)}, Total: {total_conn}")
-    
-    # Overall statistics
-    total_refs = sum(p.get('ref_count', 0) or 0 for p in cached_papers)
-    total_cites = sum(p.get('cite_count', 0) or 0 for p in cached_papers)
-    avg_refs = total_refs / len(cached_papers)
-    avg_cites = total_cites / len(cached_papers)
-    
-    print(f"\nCache statistics:")
-    print(f"  Total papers: {len(cached_papers):,}")
-    print(f"  Avg references: {avg_refs:.1f}")
-    print(f"  Avg citations: {avg_cites:.1f}")
-    print(f"  Min connectivity: {min((p.get('ref_count', 0) or 0) + (p.get('cite_count', 0) or 0) for p in cached_papers)}")
-    print(f"  Max connectivity: {max((p.get('ref_count', 0) or 0) + (p.get('cite_count', 0) or 0) for p in cached_papers)}")
-    
-    # Year distribution
-    years = [p.get('year') for p in cached_papers if p.get('year')]
-    if years:
-        print(f"  Year range: {min(years)} - {max(years)}")
-        print(f"  Avg year: {sum(years) / len(years):.0f}")
-    
-    # Field distribution
-    all_fields = []
-    for p in cached_papers:
-        fields = p.get('fields', []) or []
-        if isinstance(fields, list):
-            all_fields.extend(fields)
-    
-    if all_fields:
-        from collections import Counter
-        field_counts = Counter(all_fields)
-        print(f"\n  Top 5 research fields:")
-        for field, count in field_counts.most_common(5):
-            print(f"    - {field}: {count}")
+    edge_result = await store._run_query_method(edge_query, [paper_ids])
     
     await store.pool.close()
-    print("\n✓ Done!")
+    
+    edge_count = 0
+    if edge_result:
+        edge_count = edge_result[0]['edge_count']
+        nodes = len(papers)
+        avg_degree = (2 * edge_count / nodes) if nodes > 0 else 0
+        
+        print(f"  Papers: {nodes:,}")
+        print(f"  Internal citation edges: {edge_count:,}")
+        print(f"  Avg degree: {avg_degree:.1f}")
+        
+        if avg_degree >= 10:
+            print(f"  ✅ EXCELLENT! Use Leiden communities")
+            strategy = "leiden"
+        elif avg_degree >= 5:
+            print(f"  ✅ Good! Use Leiden communities")
+            strategy = "leiden"
+        elif avg_degree >= 2:
+            print(f"  ⚠️  Moderate. Use tier-based communities")
+            strategy = "tier"
+        else:
+            print(f"  ⚠️  Sparse. Use tier-based communities")
+            strategy = "tier"
+    
+    # Statistics
+    avg_cites = sum(p['cite_count'] for p in papers) / len(papers)
+    avg_refs = sum(p['ref_count'] for p in papers) / len(papers)
+    avg_total = sum(p['total_citations'] for p in papers) / len(papers)
+    
+    print(f"\nCitation Statistics:")
+    print(f"  Avg internal citations: {avg_cites:.1f}")
+    print(f"  Avg internal references: {avg_refs:.1f}")
+    print(f"  Avg total citations (S2ORC): {avg_total:.1f}")
+    print(f"  Internal coverage: {(avg_cites + avg_refs) / avg_total * 100:.1f}%")
+    
+    # Year distribution
+    year_dist = Counter(p['year'] for p in papers if p['year'])
+    print(f"\nYear Distribution:")
+    for year in sorted(year_dist.keys(), reverse=True)[:10]:
+        print(f"  {year}: {year_dist[year]:,} papers")
+    
+    # Field distribution
+    field_counts = Counter()
+    for p in papers:
+        fields = p.get('fields', [])
+        if isinstance(fields, list):
+            for field in fields[:2]:
+                if isinstance(field, str):
+                    field_counts[field] += 1
+    
+    print(f"\nField Distribution (Top 10):")
+    for field, count in field_counts.most_common(10):
+        print(f"  {field}: {count:,} papers")
+    
+    # Top papers
+    print(f"\nTop 5 Most Connected Papers:")
+    sorted_papers = sorted(papers, key=lambda p: p['total_connectivity'], reverse=True)
+    for i, p in enumerate(sorted_papers[:5], 1):
+        print(f"  {i}. {p['title'][:60]}...")
+        print(f"     Internal: {p['cite_count']} cites, {p['ref_count']} refs")
+        print(f"     Year: {p['year']}")
+    
+    # Save
+    cache_file = 'training_papers_filtered.pkl'
+    with open(cache_file, 'wb') as f:
+        pickle.dump(papers, f)
+    
+    file_size_mb = os.path.getsize(cache_file) / 1024 / 1024
+    
+    print(f"\n✓ Saved to: {cache_file}")
+    print(f"  Papers: {len(papers):,}")
+    print(f"  Internal edges: {edge_count:,}")
+    print(f"  File size: {file_size_mb:.1f} MB")
+    
+    # Next steps
+    print(f"\n📋 NEXT STEPS:")
+    if strategy == "leiden":
+        print(f"  1. Run: python -m graph.database.comm_det --leiden")
+    else:
+        print(f"  1. Run: python -m graph.database.comm_det  # Tier-based")
+    
+    print(f"  2. Train: python -m RL.train_rl --parser llm --episodes 100")
+    print(f"\n  Your {len(papers):,} papers with {edge_count:,} edges is a GREAT dataset!")
+    print(f"  Training will be fast and results should be excellent! 🚀")
+
 
 if __name__ == "__main__":
-    asyncio.run(build_training_cache())
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--database', type=str, default='neo4j')
+    
+    args = parser.parse_args()
+    
+    asyncio.run(build_full_abstract_cache(database=args.database))

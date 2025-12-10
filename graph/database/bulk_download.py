@@ -1,8 +1,3 @@
-"""
-Semantic Scholar Bulk Dataset Loader for Neo4j
-Downloads and loads papers and citations from S2 Academic Graph with duplicate checking.
-"""
-
 import requests
 import json
 import gzip
@@ -786,7 +781,7 @@ Examples:
     
     # Processing configuration
     parser.add_argument('--download-dir', default='./s2_datasets', help='Download directory (default: ./s2_datasets)')
-    parser.add_argument('--batch-size', type=int, default=1000, help='Neo4j batch size (default: 1000)')
+    parser.add_argument('--batch-size', type=int, default=10000, help='Neo4j batch size (default: 1000)')
     parser.add_argument('--max-files', type=int, help='Max files to download/process')
     
     # Dataset type
@@ -844,7 +839,7 @@ Examples:
                     max_files=args.max_files
                 )
             elif args.dataset_type == 'citations':
-                loader.process_all_citations(max_files=args.max_files)
+                loader.process_all_citations(max_files=None)
     
     except KeyboardInterrupt:
         logger.warning("\n\nInterrupted by user. Flushing remaining batches...")

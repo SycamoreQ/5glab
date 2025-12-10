@@ -111,5 +111,5 @@ class ColdStartHandler:
         year = paper_node.get('year', 2000)
         current_year = datetime.now().year
         
-        is_recent = (current_year - year) <= 2
+        is_recent = (current_year - year) <= 2 if year is not None else False 
         return is_recent

@@ -42,7 +42,7 @@ class Neo4jConnectionPool:
     @asynccontextmanager
     async def get_connection(self):
         """Yields an async session."""
-        async with self._driver.session(database="researchdbv2") as session:
+        async with self._driver.session(database="neo4j") as session:
             yield session
 
 class EnhancedStore:

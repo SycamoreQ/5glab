@@ -102,7 +102,7 @@ class AdvancedGraphTraversalEnv:
         self.current_intent = None
         self.current_node = None
         self.visited = set()
-        self.max_steps = 15
+        self.max_steps = 30
         self.current_step = 0
         self.text_dim = 384
         self.intent_dim = 5
