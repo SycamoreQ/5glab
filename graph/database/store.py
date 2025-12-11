@@ -353,25 +353,24 @@ class EnhancedStore:
         LIMIT 20
         """
         return await self._run_query_method(query, [paper_id])
-
-    async def get_influence_path_papers(self, author_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """
-        Meta-Path Action: Finds papers cited by collaborators of the given author.
-        """
+    
+    async def get_influence_path_papers(self, author_id: str, limit: int = 10):
         query = """
-        MATCH (a1:Author {authorId: $1})-[:WROTE]->(:Paper)<-[:WROTE]-(collab:Author)
-        WHERE a1 <> collab
-        WITH collab
-        MATCH (collab)-[:WROTE]->(p_collab:Paper)-[:CITES]->(p_influence:Paper)
-        RETURN DISTINCT p_influence.paperId as paper_id,
-               p_influence.title as title,
-               p_influence.year as year,
-               p_influence.abstract as abstract,
-               p_influence.venue as venue
-        ORDER BY p_influence.citationCount DESC
-        LIMIT $2
+        MATCH (a:Author {authorId: $author_id})-[:WROTE]->(p1:Paper)
+        MATCH (p1)-[:CITES]->(p2:Paper)
+        MATCH (p2)<-[:WROTE]-(a2:Author)
+        WITH DISTINCT p2
+        ORDER BY p2.citationCount DESC
+        LIMIT $limit
+        RETURN 
+            p2.paperId as paper_id,
+            p2.title as title,
+            p2.abstract as abstract,
+            p2.year as year,
+            p2.citationCount as citation_count
         """
         return await self._run_query_method(query, [author_id, limit])
+
 
     async def get_any_paper(self) -> Optional[Dict[str, Any]]:
         """Get any random paper from the database (useful for initialization)"""

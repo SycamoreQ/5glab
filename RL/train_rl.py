@@ -1,575 +1,263 @@
 import asyncio
-import pickle
-import torch
 import numpy as np
-from graph.database.store import EnhancedStore
-from RL.env import AdvancedGraphTraversalEnv
-from RL.ddqn import DDQLAgent
-import matplotlib.pyplot as plt
-from collections import deque
-from utils.userfeedback import UserFeedbackTracker 
-import argparse
-import logging
-from utils.batchencoder import BatchEncoder
-import os 
-import random
-
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-import warnings
-warnings.filterwarnings('ignore')
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s'
-)
-logging.getLogger('neo4j').setLevel(logging.WARNING)
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING)
-logging.getLogger('sentence_transformers').setLevel(logging.WARNING) 
-
+import pickle
+import os
+import signal
 import sys
-from tqdm import tqdm
-from functools import partialmethod
-tqdm.__init__ = partialmethod(tqdm.__init__, disable=True)
+from sentence_transformers import SentenceTransformer
+from RL.ddqn import DDQLAgent
+from RL.env import AdvancedGraphTraversalEnv
+from graph.database.store import EnhancedStore
 
 
-async def diagnose_communities(env, store):
-    """Check if community detection is working."""
-    print("Community Detection Diagnostic" )
+async def build_query_paper_pools(store, queries):
+    """Build relevant paper pools for each query"""
+    query_paper_pools = {}
     
-    if not env.use_communities:
-        print(" Community detection is DISABLED")
-        print("="*70 + "\n")
-        return
-    
-    print("Community detection is ENABLED")
-    
-    query = """
-    MATCH (p:Paper)
-    RETURN elementId(p) as paper_id, p.title as title
-    LIMIT 5
-    """
-    
-    try:
-        sample_papers = await store._run_query_method(query)
-        
-        if not sample_papers:
-            print("No papers found in database!")
-            print("="*70 + "\n")
-            return
-        
-        print(f"\nTesting {len(sample_papers)} sample papers:\n")
-        
-        found_count = 0
-        for i, paper in enumerate(sample_papers, 1):
-            paper_id = paper['paper_id']
-            title = paper.get('title', 'No title')[:50]
-            
-            comm = env.community_detector.get_community(paper_id)
-            
-            print(f"{i}. Paper: {title}...")
-            print(f"   ID: {paper_id}")
-            print(f"   Community: {comm if comm else ' NOT FOUND'}")
-            
-            if comm:
-                found_count += 1
-                size = env.community_detector.get_community_size(comm)
-                print(f"   Community size: {size} papers")
-            else:
-                print(f" No community mapping found for this ID!")
-            print()
-        
-        print("Cache Statistics:")
-        print(f"Papers in cache: {len(env.community_detector.paper_communities):,}")
-        print(f"Authors in cache: {len(env.community_detector.author_communities):,}")
-        print(f"Unique paper communities: {len(set(env.community_detector.paper_communities.values()))}")
-        print(f"Unique author communities: {len(set(env.community_detector.author_communities.values()))}")
-        
-        print("\nSample cache ID formats:")
-        sample_cache_ids = list(env.community_detector.paper_communities.keys())[:3]
-        for cache_id in sample_cache_ids:
-            comm = env.community_detector.paper_communities[cache_id]
-            print(f"  {cache_id} → {comm}")
-        
-        print("\nSample Neo4j ID formats:")
-        for paper in sample_papers[:3]:
-            print(f"  {paper['paper_id']}")
-        
-        print("Analysis:")
-        
-        if found_count == 0:
-            print("CRITICAL: No communities found for any papers!")
-            print("\nPossible issues:")
-            print("  1. ID format mismatch between cache and Neo4j")
-            print("     - Cache uses one format, Neo4j returns another")
-            print("  2. Community cache is outdated")
-            print("     - Papers in DB don't match papers in cache")
-            print("\nRecommended fix:")
-            print("  Run: python -m RL.community_detection")
-            print("  This will rebuild the cache with current paper IDs")
-        elif found_count < len(sample_papers):
-            print(f" WARNING: Only {found_count}/{len(sample_papers)} papers have communities")
-            print("  Some papers might be missing from cache")
-        else:
-            print(f"SUCCESS: All {found_count}/{len(sample_papers)} test papers have communities!")
-            print(" Community detection should work correctly")
-
-        print("\n=== DATABASE CONNECTIVITY CHECK ===")
-        sample_ids = [p['paper_id'] for p in sample_papers[:20]]
-
-        for pid in sample_ids[:5]:
-            refs = await store.get_references_by_paper(pid)
-            cites = await store.get_citations_by_paper(pid)
-            print(f"Paper {pid}: {len(refs)} refs, {len(cites)} cites")
-            if len(refs) == 0 and len(cites) == 0:
-                print(f"  ⚠️ ISOLATED NODE")  
-        
-    except Exception as e:
-        print(f"Error during diagnostic: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-async def diagnose_embeddings(env, store, cached_papers):
-    """
-    Diagnose why similarity scores are low.
-    """
-    print("\n" + "="*80)
-    print("EMBEDDING DIAGNOSTIC")
-    print("="*80)
-    
-    # Test 1: Check query embedding
-    test_query = "machine learning neural networks"
-    query_emb = env.encoder.encode(test_query)
-    print(f"\n1. Query Embedding Test:")
-    print(f"   Query: '{test_query}'")
-    print(f"   Shape: {query_emb.shape}")
-    print(f"   Norm: {np.linalg.norm(query_emb):.3f}")
-    print(f"   Non-zero elements: {np.count_nonzero(query_emb)}/{query_emb.shape[0]}")
-    
-    # Test 2: Check precomputed embeddings
-    print(f"\n2. Precomputed Embeddings:")
-    print(f"   Total: {len(env.precomputed_embeddings)}")
-    
-    if env.precomputed_embeddings:
-        sample_id = list(env.precomputed_embeddings.keys())[0]
-        sample_emb = env.precomputed_embeddings[sample_id]
-        print(f"   Sample ID: {sample_id}")
-        print(f"   Sample shape: {sample_emb.shape}")
-        print(f"   Sample norm: {np.linalg.norm(sample_emb):.3f}")
-    
-    # Test 3: Check cached papers
-    print(f"\n3. Cached Papers Analysis:")
-    papers_with_keywords = sum(1 for p in cached_papers if p.get('keywords'))
-    papers_with_abstract = sum(1 for p in cached_papers if p.get('abstract'))
-    papers_with_valid_title = sum(1 for p in cached_papers 
-                                  if p.get('title') and len(p.get('title', '')) > 10)
-    
-    print(f"   Total papers: {len(cached_papers)}")
-    print(f"   With valid titles: {papers_with_valid_title}")
-    print(f"   With keywords: {papers_with_keywords} ({papers_with_keywords/len(cached_papers)*100:.1f}%)")
-    print(f"   With abstracts: {papers_with_abstract} ({papers_with_abstract/len(cached_papers)*100:.1f}%)")
-    
-    # Test 4: Simulate embedding retrieval
-    print(f"\n4. Embedding Retrieval Test:")
-    test_paper = cached_papers[0]
-    print(f"   Paper: {test_paper['title'][:60]}")
-    print(f"   Has keywords: {bool(test_paper.get('keywords'))}")
-    print(f"   Has abstract: {bool(test_paper.get('abstract'))}")
-    
-    # Simulate _get_node_embedding
-    paper_id = test_paper['paper_id']
-    
-    # Check if in precomputed
-    if paper_id in env.precomputed_embeddings:
-        print(f"Found in precomputed embeddings")
-        emb = env.precomputed_embeddings[paper_id]
-    else:
-        print(f"NOT in precomputed embeddings!")
-        # Try encoding manually
-        title = test_paper.get('title', '')
-        keywords = test_paper.get('keywords', '')
-        text = f"{title} {keywords}".strip() if keywords else title
-        print(f"   Encoding text: {text[:80]}")
-        emb = env.encoder.encode(text)
-    
-    print(f"   Embedding norm: {np.linalg.norm(emb):.3f}")
-    
-    # Test 5: Similarity between query and paper
-    print(f"\n5. Similarity Test:")
-    sim = np.dot(query_emb, emb) / (
-        np.linalg.norm(query_emb) * np.linalg.norm(emb) + 1e-9
-    )
-    print(f"   Query: '{test_query}'")
-    print(f"   Paper: '{test_paper['title'][:60]}'")
-    print(f"   Similarity: {sim:.3f}")
-    
-    # Test 6: Check for zero embeddings in trajectory
-    print(f"\n6. Zero Embedding Check:")
-    zero_count = 0
-    for pid, emb in list(env.precomputed_embeddings.items())[:100]:
-        if np.abs(emb).sum() < 0.01:
-            zero_count += 1
-    
-    print(f"   Zero embeddings in first 100: {zero_count}/100")
-    
-    # Test 7: Related paper similarity
-    print(f"\n7. Related Papers Test:")
-    # Find papers with 'machine learning' in title
-    ml_papers = [p for p in cached_papers[:100] 
-                 if 'machine' in p.get('title', '').lower() or 
-                    'learning' in p.get('title', '').lower()]
-    
-    if ml_papers:
-        print(f"   Found {len(ml_papers)} ML-related papers in first 100")
-        ml_paper = ml_papers[0]
-        ml_paper_id = ml_paper['paper_id']
-        
-        if ml_paper_id in env.precomputed_embeddings:
-            ml_emb = env.precomputed_embeddings[ml_paper_id]
-            ml_sim = np.dot(query_emb, ml_emb) / (
-                np.linalg.norm(query_emb) * np.linalg.norm(ml_emb) + 1e-9
-            )
-            print(f"   Paper: {ml_paper['title'][:60]}")
-            print(f"   Similarity: {ml_sim:.3f} (should be >0.5)")
-            
-            if ml_sim < 0.4:
-                print(f"WARNING: Low similarity for obviously related paper!")
-        else:
-            print(f"Paper not in precomputed embeddings")
-    
-    print("\n" + "="*80 + "\n")
-    
-    return True
-
-
-async def find_relevant_starting_papers(cached_papers, queries, encoder, n_per_query=20):
-    """Find papers most relevant to each query."""
-    query_papers = {}
-    
-    print(f"Finding relevant starting papers for {len(queries)} queries...\n")
-    
+    print("Building relevant paper pools...")
     for query in queries:
-        query_emb = encoder.encode_with_cache(query, cache_key=f"query_{query}")
+        pool = []
+        keywords = query.split()
         
-        scored_papers = []
-        for paper in cached_papers:
-            paper_id = paper['paper_id']
+        for kw in keywords:
+            if len(kw) < 4:
+                continue
+            papers = await store.get_paper_by_title(kw)
+            pool.extend(papers[:10])
+        
+        # Deduplicate
+        seen = set()
+        unique_pool = []
+        for p in pool:
+            pid = p.get('paper_id')
+            if pid and pid not in seen:
+                seen.add(pid)
+                unique_pool.append(p)
+        
+        query_paper_pools[query] = unique_pool[:30]
+        print(f"  {query}: {len(unique_pool)} papers")
+    
+    return query_paper_pools
+
+
+async def precompute_embeddings(papers, encoder):
+    """Precompute embeddings for all papers"""
+    embeddings = {}
+    
+    print(f"\nPrecomputing {len(papers)} embeddings...")
+    for i, paper in enumerate(papers):
+        pid = paper.get('paper_id')
+        if pid and pid not in embeddings:
+            title = paper.get('title', '')
+            abstract = paper.get('abstract', '') or ''
+            text = f"{title} {abstract[:200]}"
             
-            if paper_id in encoder.cache:
-                paper_emb = encoder.cache[paper_id]
+            if text.strip():
+                embeddings[pid] = encoder.encode(text)
             else:
-                title = paper.get('title', '')
-                abstract = paper.get('abstract', '')
-                
-                if abstract and len(abstract) > 50:
-                    text = f"{title}. {abstract[:200]}"
-                else:
-                    text = title
-                
-                paper_emb = encoder.encode_with_cache(text, cache_key=paper_id)
-            
-            sim = np.dot(query_emb, paper_emb) / (
-                np.linalg.norm(query_emb) * np.linalg.norm(paper_emb) + 1e-9
-            )
-            
-            scored_papers.append((paper, sim))
-    
-        scored_papers.sort(key=lambda x: x[1], reverse=True)
-        query_papers[query] = [p for p, s in scored_papers[:n_per_query]]
+                embeddings[pid] = encoder.encode(f"Paper {pid}")
         
-        print(f" Query: '{query[:50]}...'")
-        print(f" Top paper: {scored_papers[0][0]['title'][:60]} (sim: {scored_papers[0][1]:.3f})")
+        if (i + 1) % 100 == 0:
+            print(f"  Progress: {i + 1}/{len(papers)}")
     
-    print()
-    return query_papers
+    return embeddings
 
 
-
-async def train_single_process():
-    """Simple single-process training with DDQN agent."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--parser', type=str, default='dspy',
-                       choices=['dspy', 'llm', 'rule'],
-                       help='Query parser type')
-    parser.add_argument('--episodes', type=int, default=1000)
-    parser.add_argument('--skip-diagnostic', action='store_true',
-                       help='Skip community diagnostic check')
-    args = parser.parse_args()
+async def train():
+    store = EnhancedStore()
     
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(message)s'
-    )
-    logging.getLogger('neo4j').setLevel(logging.WARNING)
-    logging.getLogger('httpx').setLevel(logging.WARNING)
+    queries = [
+        "attention mechanism transformers",
+        "graph neural networks",
+        "reinforcement learning optimization",
+        "computer vision deep learning",
+        "natural language processing"
+    ]
     
-    print("Loading cached papers...")
-    with open('training_papers.pkl', 'rb') as f:
-        cached_papers = pickle.load(f)
-    print(f"✓ Loaded {len(cached_papers)} papers")
-
-    print("\nStarting papers sample:")
-    for i, p in enumerate(cached_papers[:5], 1):
-        title = p.get('title', 'N/A')[:80]
-        year = p.get('year', 'N/A')
-        refs = p.get('referenceCount', 0) or 0
-        cites = p.get('citationCount', 0) or 0
-        fields = p.get('fields', [])
-        field_str = ', '.join(fields[:3]) if isinstance(fields, list) and fields else 'N/A'
+    # Build query-specific paper pools
+    query_paper_pools = await build_query_paper_pools(store, queries)
     
-        print(f"  {i}. {title}")
-        print(f"Year: {year} | Fields: {field_str}")
-        print(f"Connectivity: {refs} refs, {cites} cites")
+    # Precompute embeddings
+    encoder = SentenceTransformer('all-MiniLM-L6-v2')
     
-    print("\nInitializing environment...")
-    store = EnhancedStore(pool_size=20)
-    encoder = BatchEncoder()
-    precomputed_embeddings = encoder.precompute_paper_embeddings(cached_papers)
-    env = AdvancedGraphTraversalEnv(store, use_communities=True , precomputed_embeddings= precomputed_embeddings)
+    all_papers = []
+    for papers in query_paper_pools.values():
+        all_papers.extend(papers)
     
-    if not args.skip_diagnostic:
-        await diagnose_communities(env, store)
-        await diagnose_embeddings(env , store ,  cached_papers)
-        
-        print("\nDo you want to continue training? (y/n): ", end='')
-        response = input().strip().lower()
-        if response != 'y':
-            print("Training cancelled. Fix issues and re-run.")
-            await store.pool.close()
-            return
-        print()
+    # Deduplicate all papers
+    seen_pids = set()
+    unique_papers = []
+    for p in all_papers:
+        pid = p.get('paper_id')
+        if pid and pid not in seen_pids:
+            seen_pids.add(pid)
+            unique_papers.append(p)
     
-    state_dim = 773  
-    text_dim = 384   
+    embeddings = await precompute_embeddings(unique_papers, encoder)
     
-    agent = DDQLAgent(state_dim=state_dim, text_dim=text_dim)
-    agent.use_prioritized = True 
-    print(f"Agent initialized (state_dim={state_dim}, text_dim={text_dim})")
+    print(f"\nTotal unique papers: {len(unique_papers)}")
+    print(f"Total embeddings: {len(embeddings)}")
     
-    num_episodes = args.episodes
-    target_update_freq = 5
-    save_freq = 100
+    # Initialize environment and agent
+    env = AdvancedGraphTraversalEnv(store, precomputedembeddings=embeddings)
+    agent = DDQLAgent(state_dim=773, text_dim=384, precomputed_embeddings=embeddings)
+    
+    print(f"\nStarting training...")
+    print(f"Warmup: {agent.warmup_steps}, Batch: {agent.batch_size}")
+    print(f"=" * 70)
     
     episode_rewards = []
-    episode_steps = []
     episode_similarities = []
-    losses = []
-
-    queries = [
-    "machine learning neural networks",
-    "deep learning computer vision",
-    "reinforcement learning algorithms",
-    "natural language processing transformers",
-    "graph neural networks",
-    "time series forecasting",
-    "federated learning privacy",
-    "explainable artificial intelligence",
-    "transfer learning few shot",
-    "generative adversarial networks"
-    ]
-
     
-    print(f"Starting Training for: {num_episodes} episodes")
-    query_to_papers = await find_relevant_starting_papers(
-    cached_papers, queries, encoder, n_per_query=20
-    )
-
-    for episode in range(num_episodes):
-        query_idx = episode % len(queries)
-        query = queries[query_idx]
+    for episode in range(500):
+        query = np.random.choice(queries)
+        paper_pool = query_paper_pools[query]
         
-        candidate_papers = query_to_papers[query]
-        start_paper = random.choice(candidate_papers)
+        if not paper_pool:
+            print(f"[ERROR] No papers for query: {query}")
+            continue
+        
+        start_paper = np.random.choice(paper_pool)
         
         try:
-            state = await env.reset(
-                query=query,
-                intent=1,  
-                start_node_id=start_paper['paper_id']
+            state = await env.reset(query, intent=1, start_node_id=start_paper['paper_id'])
+        except Exception as e:
+            print(f"[ERROR] Reset failed: {e}")
+            continue
+        
+        episode_reward = 0
+        steps = 0
+        dead_end_count = 0
+        max_retries = 3
+        
+        # FIXED: Limit steps per episode to prevent hanging
+        max_steps_per_episode = min(env.max_steps, 10)  # Cap at 10 steps
+        
+        for step in range(max_steps_per_episode):
+            print(f"  [STEP] Episode {episode}, Step {step}")  # Progress tracking
+            
+            # Manager step
+            manager_actions = await env.get_manager_actions()
+            if not manager_actions:
+                dead_end_count += 1
+                if dead_end_count > max_retries:
+                    print(f"  [BREAK] Dead end at step {step}")
+                    break
+                continue
+            
+            # Prefer CITEDBY to reduce dead ends
+            if 1 in manager_actions and len(env.visited) > 2:
+                manager_action = 1
+            elif 1 in manager_actions:
+                manager_action = 1
+            else:
+                manager_action = np.random.choice(manager_actions)
+            
+            is_terminal, manager_reward = await env.manager_step(manager_action)
+            episode_reward += manager_reward
+            
+            if is_terminal:
+                print(f"  [BREAK] Terminal at step {step}")
+                break
+            
+            # Worker step
+            worker_actions = await env.get_worker_actions()
+            if not worker_actions:
+                dead_end_count += 1
+                if dead_end_count > max_retries:
+                    print(f"  [SKIP] No worker actions at episode {episode}, step {step}")
+                    break
+                continue
+            
+            # FIXED: Limit worker actions to prevent slow Q-value computation
+            if len(worker_actions) > 20:
+                print(f"  [LIMIT] Sampling 20 from {len(worker_actions)} worker actions")
+                worker_actions = worker_actions[:20]  # Just take first 20
+            
+            dead_end_count = 0
+            
+            print(f"  [ACT] Computing action for {len(worker_actions)} options...")
+            best_action = agent.act(state, worker_actions)
+            if not best_action:
+                print(f"  [BREAK] No action selected at step {step}")
+                break
+            
+            chosen_node, _ = best_action
+            print(f"  [WORKER] Executing worker step...")
+            next_state, worker_reward, done = await env.worker_step(chosen_node)
+            episode_reward += worker_reward
+            steps += 1
+            
+            if not done:
+                next_actions = await env.get_worker_actions()
+                # Limit next actions too
+                if len(next_actions) > 20:
+                    next_actions = next_actions[:20]
+            else:
+                next_actions = []
+            
+            print(f"  [REMEMBER] Storing transition...")
+            agent.remember(
+                state=state,
+                action_tuple=best_action,
+                reward=worker_reward,
+                next_state=next_state,
+                done=done,
+                next_actions=next_actions
             )
             
-            episode_reward = 0
-            step = 0
-            done = False
+            state = next_state
             
-            if episode >= 5:
-                agent.epsilon = 0.1 
-            
-            while not done and step < env.max_steps:
-                step += 1
-                
-                manager_actions = await env.get_manager_actions()
-                if not manager_actions:
-                    break
-                
-                manager_action = 1 if 1 in manager_actions else manager_actions[0]
-                is_terminal, manager_reward = await env.manager_step(manager_action)
-                episode_reward += manager_reward
-                
-                if is_terminal:
-                    done = True
-                    break
-                
-                worker_actions = await env.get_worker_actions()
-                if not worker_actions:
-                    break
-                
-                if episode < 30:
-                    best_action = None
-                    best_sim = -1.0
-                    
-                    for node, r_type in worker_actions:
-                        node_emb = encoder.cache.get(node['paper_id'])
-                        if node_emb is None:
-                            title = node.get('title', '')
-                            abstract = node.get('abstract', '')
-                            text = f"{title}. {abstract[:200]}" if abstract else title
-                            node_emb = encoder.encode_with_cache(text, cache_key=node['paper_id'])
-                        
-                        sim = np.dot(env.query_embedding, node_emb) / (
-                            np.linalg.norm(env.query_embedding) * np.linalg.norm(node_emb) + 1e-9
-                        )
-                        
-                        if sim > best_sim:
-                            best_sim = sim
-                            best_action = (node, r_type)
-                    
-                    if best_action is None:
-                        break
-                else:
-                    best_action = agent.act(state, worker_actions)
-                    if best_action is None:
-                        break
-                
-                chosen_node, _ = best_action
-                next_state, worker_reward, done = await env.worker_step(chosen_node)
-                episode_reward += worker_reward
-
-                if not done:
-                    next_manager_actions = await env.get_manager_actions()
-                    if next_manager_actions:
-                        temp_manager = 1 if 1 in next_manager_actions else next_manager_actions[0]
-                        await env.manager_step(temp_manager)
-                        next_worker_actions = await env.get_worker_actions()
-                        env.pending_manager_action = None
-                        env.available_worker_nodes = []
-                    else:
-                        next_worker_actions = []
-                else:
-                    next_worker_actions = []
-                
-                agent.remember(
-                    state=state,
-                    action_tuple=best_action,
-                    reward=worker_reward, 
-                    next_state=next_state,
-                    done=done,
-                    next_actions=next_worker_actions
-                )
-                
-                state = next_state
-            
-            episode_rewards.append(episode_reward)
-            episode_steps.append(step)
-            
-            summary = env.get_episode_summary()
-            episode_similarities.append(summary.get('max_similarity_achieved', 0.0))
-            
-            if len(agent.memory) >= 16: 
-                loss = agent.replay_prioritized() if agent.use_prioritized else agent.replay()
-                losses.append(loss)
-            else:
-                loss = 0.0
-            
-            # Decay epsilon
-            if episode >= 20:
-                agent.epsilon = max(0.05, agent.epsilon * 0.998)
-            
-            # Update target network
-            if episode % 5 == 0 and episode > 0:
-                agent.update_target()
-                print(f"  [Ep {episode}] Target network updated")
-            
-            # Print progress
-            if episode % 10 == 0:
-                env.feedback_tracker.save_feedback()
-                total_clicks = sum(env.feedback_tracker.clicks.values())
-                total_saves = sum(env.feedback_tracker.saves.values())
-                avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
-                avg_sim = np.mean(episode_similarities[-10:]) if len(episode_similarities) >= 10 else np.mean(episode_similarities)
-                
-                print(f"  Feedback: {total_clicks} clicks, {total_saves} saves")
-                print(f"Episode {episode:4d} | "
-                    f"Reward: {episode_reward:+7.2f} | "
-                    f"Avg(100): {avg_reward:+7.2f} | "
-                    f"Steps: {step} | "
-                    f"Loss: {loss:.4f} | "
-                    f"ε: {agent.epsilon:.3f}")
-                print(f"  Stats: Communities: {summary['unique_communities_visited']}, "
-                    f"Sim: {avg_sim:.3f}, "
-                    f"Loops: {summary['community_loops']}")
+            if done:
+                print(f"  [DONE] Episode complete at step {step}")
+                break
         
-        except Exception as e:
-            logging.error(f"Episode {episode} failed: {e}")
-            if episode < 5:
-                import traceback
-                traceback.print_exc()
-            continue
-
-
+        # Train every episode
+        print(f"  [TRAIN] Training agent...")
+        if len(agent.memory) >= agent.batch_size:
+            loss = agent.replay()
+            print(f"  [TRAIN] Loss: {loss:.4f}")
+        else:
+            loss = 0.0
+            print(f"  [TRAIN] Skipped (memory: {len(agent.memory)}/{agent.batch_size})")
+        
+        # Update target network periodically
+        if episode % 10 == 0 and episode > 0:
+            print(f"  [TARGET] Updating target network...")
+            agent.update_target()
+        
+        episode_rewards.append(episode_reward)
+        episode_similarities.append(env.best_similarity_so_far)
+        
+        # Logging
+        if episode % 10 == 0:
+            avg_reward = np.mean(episode_rewards[-20:]) if episode_rewards else 0
+            avg_sim = np.mean(episode_similarities[-20:]) if episode_similarities else 0
+            best_sim = max(episode_similarities) if episode_similarities else 0
+            best_ep = episode_similarities.index(best_sim) if episode_similarities else 0
+            
+            print(f"\n{'='*70}")
+            print(f"Episode {episode}/500")
+            print(f"{'='*70}")
+            print(f"  Reward: {episode_reward:+.2f} | Avg(20): {avg_reward:+.2f}")
+            print(f"  Steps: {steps:2d} | RL Loss: {loss:.4f}")
+            print(f"  Similarity: {env.best_similarity_so_far:.3f} | Avg(20): {avg_sim:.3f}")
+            print(f"  Best Sim: {best_sim:.3f} (ep {best_ep})")
+            print(f"  Epsilon: {agent.epsilon:.3f} | Memory: {len(agent.memory)}")
+            print(f"  Total Steps: {agent.training_step}")
+            print(f"{'='*70}\n")
+        
         # Save checkpoints
-        if episode % save_freq == 0 and episode > 0:
-            checkpoint = {
-                'episode': episode,
-                'policy_net_state': agent.policy_net.state_dict(),
-                'target_net_state': agent.target_net.state_dict(),
-                'optimizer_state': agent.optimizer.state_dict(),
-                'epsilon': agent.epsilon,
-                'rewards': episode_rewards,
-                'steps': episode_steps,
-                'similarities': episode_similarities
-            }
-            torch.save(checkpoint, f"checkpoint_ep{episode}.pt")
-            print(f"  Checkpoint saved: checkpoint_ep{episode}.pt")
+        if episode % 50 == 0 and episode > 0:
+            os.makedirs('checkpoints', exist_ok=True)
+            agent.save(f'checkpoints/agent_ep{episode}.pt')
+            print(f"[CHECKPOINT] Saved at episode {episode}")
     
-    await store.pool.close()
-    
-    print("Training Complete")
-    
-    env.query_parser.print_stats()
-
-    # Save final model
-    final_checkpoint = {
-        'episode': num_episodes,
-        'policy_net_state': agent.policy_net.state_dict(),
-        'target_net_state': agent.target_net.state_dict(),
-        'optimizer_state': agent.optimizer.state_dict(),
-        'epsilon': agent.epsilon,
-        'rewards': episode_rewards,
-        'steps': episode_steps,
-        'similarities': episode_similarities
-    }
-    torch.save(final_checkpoint, "final_model.pt")
-    print("\n✓ Final model saved: final_model.pt")
-    
-    # Print statistics
-    print(f"\n{'='*70}")
-    print("TRAINING STATISTICS")
-    print(f"{'='*70}")
-    print(f"Total episodes: {num_episodes}")
-    print(f"Average reward: {np.mean(episode_rewards):.2f}")
-    print(f"Max reward: {np.max(episode_rewards):.2f}")
-    print(f"Min reward: {np.min(episode_rewards):.2f}")
-    print(f"Positive reward episodes: {sum(1 for r in episode_rewards if r > 0)} / {num_episodes} "
-          f"({100 * sum(1 for r in episode_rewards if r > 0) / num_episodes:.1f}%)")
-    print(f"Average steps per episode: {np.mean(episode_steps):.1f}")
-    print(f"Average max similarity: {np.mean(episode_similarities):.3f}")
-    print(f"Final epsilon: {agent.epsilon:.4f}")
-    print(f"{'='*70}\n")
+    print("\n" + "="*70)
+    print("Training complete!")
+    print("="*70)
+    agent.save('final_agent.pt')
 
 
-if __name__ == "__main__":
-    import random
-    asyncio.run(train_single_process())
+if __name__ == '__main__':
+    asyncio.run(train())

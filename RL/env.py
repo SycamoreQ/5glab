@@ -10,6 +10,7 @@ from utils.diversity import DiversitySelector
 from utils.userfeedback import UserFeedbackTracker
 from model.llm.parser.unified import ParserType , UnifiedQueryParser , QueryRewardCalculator
 from utils.attention_selector import HybridAttentionSelector
+from RL.curiousity import CuriosityModule
 
 try:
     from graph.database.comm_det import CommunityDetector
@@ -176,7 +177,7 @@ class AdvancedGraphTraversalEnv:
 
         self.author_stats = {
             'total_authors_explored': 0, 
-            'dead_end_hits': 0,
+            'dead_ends_hit': 0,
             'revisits': 0,
             'max_similarity_acheived': 0,
             'unique_communitites_visited': 0,
@@ -220,6 +221,7 @@ class AdvancedGraphTraversalEnv:
         )
         self.use_attention = True
 
+        self.curiosity_module = CuriosityModule()
 
     def _normalize_node_keys(self, node: Dict[str, Any]) -> Dict[str, Any]:
         """Normalizes Neo4j query results to consistent format."""
@@ -472,27 +474,27 @@ class AdvancedGraphTraversalEnv:
 
         reason_str = ", ".join(reasons) if reasons else "none"
         return ((paper_reward , "Paper") , reason_str) if paper_id else ((author_reward , "Author") , reason_str)
-
     
+
     async def reset(self, query: str, intent: int, start_node_id: str = None):
-        """Reset environment with community tracking."""
         self.query_embedding = self.encoder.encode(query)
         self.current_intent = intent
         self.visited = set()
         self.current_step = 0
         self.pending_manager_action = None
         self.available_worker_nodes = []
-    
         self.trajectory_history = []
         self.relation_types_used = set()
         self.best_similarity_so_far = -1.0
         self.previous_node_embedding = None
         
+        # Reset community tracking
         self.current_community = None
         self.community_history = []
         self.community_visit_count = Counter()
         self.steps_in_current_community = 0
         self.previous_community = None
+        self.visited_communities = set()
         
         self.episode_stats = {
             'total_nodes_explored': 0,
@@ -505,81 +507,61 @@ class AdvancedGraphTraversalEnv:
             'max_steps_in_community': 0,
             'community_loops': 0
         }
-
+        
         self.current_query_facets = self.query_parser.parse(query)
-    
-        if self.current_query_facets['paper_search_mode']:
-            paper_title = self.current_query_facets['paper_title']
-            paper_candidates = await self.store.get_paper_by_title(paper_title)
-            
-            if paper_candidates:
-                self.current_node = self._normalize_node_keys(paper_candidates[0])
-                operation = self.current_query_facets['paper_operation']
-                
-                if operation == 'citations':
-                    semantic_query = f"papers citing {paper_title}"
-                elif operation == 'references':
-                    semantic_query = f"references of {paper_title}"
-                elif operation == 'related':
-                    semantic_query = self.current_node.get('abstract', paper_title)
-                elif operation == 'coauthors':
-                    semantic_query = f"authors of {paper_title}"
-                else:
-                    semantic_query = paper_title
-                
-                self.query_embedding = self.encoder.encode(semantic_query)
-            else:
-                semantic_query = self.current_query_facets['semantic'] or paper_title
-                self.query_embedding = self.encoder.encode(semantic_query)
-                candidates = await self.store.get_paper_by_title(semantic_query)
-                if candidates:
-                    self.current_node = self._normalize_node_keys(candidates[0])
         
-        elif self.current_query_facets['author_search_mode']:
-            author_name = self.current_query_facets['author']
-            # Note: You need get_author_by_name in store.py (we'll add it)
-            # For now, fallback to paper search
-            semantic_query = self.current_query_facets['semantic']
-            self.query_embedding = self.encoder.encode(semantic_query)
-            candidates = await self.store.get_paper_by_title(semantic_query)
-            if candidates:
-                self.current_node = self._normalize_node_keys(candidates[0])
-        
+        # FIXED: Better starting paper selection
+        if start_node_id:
+            node = await self.store.get_paper_by_id(start_node_id)
+            if not node:
+                raise ValueError(f"Paper with ID {start_node_id} not found.")
+            self.current_node = self._normalize_node_keys(node)
         else:
-            semantic_query = self.current_query_facets['semantic']
-            self.query_embedding = self.encoder.encode(semantic_query)
+            # Try keyword matching first
+            keywords = query.lower().split()
+            candidates = []
             
-            if start_node_id:
-                node = await self.store.get_paper_by_id(start_node_id)
-                if not node:
-                    raise ValueError(f"Paper with ID '{start_node_id}' not found.")
-                self.current_node = self._normalize_node_keys(node)
-            else:
-                candidates = await self.store.get_paper_by_title(query)
-                if not candidates:
-                    raise ValueError(f"No starting node found for query: '{query}'")
-                self.current_node = self._normalize_node_keys(candidates[0])
+            for keyword in keywords:
+                if len(keyword) < 3:
+                    continue
+                results = await self.store.get_paper_by_title(keyword)
+                if results:
+                    candidates.extend(results[:5])
+            
+            if not candidates:
+                # Fallback: field-of-study query
+                field_query = """
+                MATCH (p:Paper)
+                WHERE 'Computer Science' IN p.fieldsOfStudy
+                AND p.citationCount > 20
+                AND p.year > 2015
+                AND p.abstract IS NOT NULL
+                RETURN p
+                ORDER BY p.citationCount DESC
+                LIMIT 20
+                """
+                candidates = await self.store._run_query_method(field_query)
+            
+            if not candidates:
+                raise ValueError(f"Could not find ANY starting papers for query: {query}")
+            
+            self.current_node = self._normalize_node_keys(np.random.choice(candidates))
         
         if not self.current_node:
             raise ValueError(f"Failed to initialize current_node")
         
         paper_id = self.current_node.get('paper_id')
-        author_id = self.current_node.get('author_id')
+        if not paper_id:
+            raise ValueError(f"Node has no paper_id")
         
-        if not paper_id and not author_id:
-            raise ValueError(f"Node has neither paper_id nor author_id")
-        
-        if paper_id:
-            self.visited.add(paper_id)
-            self._update_community_tracking(paper_id)
-        if author_id:
-            self.visited.add(author_id)
-            self._update_community_tracking(author_id)
-        
+        self.visited.add(paper_id)
+        self._update_community_tracking(paper_id)
         self.previous_node_embedding = await self._get_node_embedding(self.current_node)
-            
+        
         return await self._get_state()
     
+
+    # In env.py, find get_node_embedding and update the abstract handling:
 
     async def _get_node_embedding(self, node: Dict[str, Any]) -> np.ndarray:
         """Get embedding for a node. ALWAYS returns valid ndarray, never None."""
@@ -588,59 +570,43 @@ class AdvancedGraphTraversalEnv:
             return np.zeros(self.text_dim, dtype=np.float32)
         
         paper_id = node.get('paper_id')
-        author_id = node.get('author_id')
         
         if paper_id and paper_id in self.precomputed_embeddings:
             return self.precomputed_embeddings[paper_id]
         
         title = str(node.get('title', '')) if node.get('title') else ''
-        name = str(node.get('name', '')) if node.get('name') else ''
         
-        INVALID_TITLES = {'', 'N/A', '...', 'Unknown', 'null', 'None', 'undefined'}
-        
+        INVALID_TITLES = {'', 'NA', '...', 'Unknown', 'null', 'None', 'undefined'}
         node_text = None
         
-        if title and title not in INVALID_TITLES and len(title) > 3:
-            fields = str(node.get('fields' , [])) if node.get('fieldsOfStudy') else ''
+        if title and title not in INVALID_TITLES and len(title) >= 3:
+            fields = str(node.get('fields', '')) if node.get('fieldsOfStudy') else ''
             keywords = ', '.join(fields) if isinstance(fields, list) else str(fields)
             abstract = str(node.get('abstract', '')) if node.get('abstract') else ''
+            abstract = abstract or ''  # FIXED: Handle None
             pub_name = str(node.get('venue', '')) if node.get('venue') else ''
             
             parts = [title]
             if keywords:
                 parts.append(keywords)
-            if abstract and len(abstract) > 20:  
-                parts.append(abstract[:500]) 
-            elif pub_name: 
+            if abstract and len(abstract) > 20:
+                parts.append(abstract[:500])
+            elif pub_name:
                 parts.append(pub_name)
             
-            node_text = " ".join(parts).strip()
-    
-        elif name and name not in INVALID_TITLES and len(name) > 2:
-            parts = [name]
-            node_text = " ".join(parts).strip()
+            node_text = ' '.join(parts).strip()
         
         if not node_text or len(node_text) < 5:
-            doi = str(node.get('doi', '')) if node.get('doi') else ''
-            original_id = str(node.get('original_id', '')) if node.get('original_id') else ''
-            
-            if doi and doi not in INVALID_TITLES:
-                node_text = f"Document {doi}"
-            elif original_id and original_id not in INVALID_TITLES:
-                node_text = f"Paper {original_id}"
+            if paper_id:
+                node_text = f"Research paper {paper_id[-10:]}"
             else:
-                if paper_id:
-                    node_text = f"Research paper {paper_id[-10:]}"  
-                elif author_id:
-                    node_text = f"Researcher {author_id[-10:]}"
-                else:
-                    if self.current_step <= 3:
-                        logging.warning(f"Node has no usable text: {paper_id or author_id}")
-                    return np.zeros(self.text_dim, dtype=np.float32)
+                if self.current_step <= 3:
+                    logging.warning(f"Node has no usable text: {paper_id}")
+                return np.zeros(self.text_dim, dtype=np.float32)
         
         try:
             if hasattr(self.encoder, 'encode_with_cache'):
-                embedding = self.encoder.encode_with_cache(node_text, cache_keys=paper_id)
+                embedding = self.encoder.encode_with_cache(node_text, cache_keys=[paper_id])
             else:
                 embedding = self.encoder.encode(node_text)
             
@@ -653,10 +619,10 @@ class AdvancedGraphTraversalEnv:
                 return np.zeros(self.text_dim, dtype=np.float32)
             
             return embedding
-            
         except Exception as e:
-            logging.error(f"Encoding exception: {e}. Node: {paper_id or author_id}")
+            logging.error(f"Encoding exception: {e}. Node: {paper_id}")
             return np.zeros(self.text_dim, dtype=np.float32)
+
 
 
 
@@ -816,6 +782,11 @@ class AdvancedGraphTraversalEnv:
             raw_nodes = await self.store.get_second_degree_collaborators(author_id)
         elif relation_type == RelationType.INFLUENCE_PATH and author_id:
             raw_nodes = await self.store.get_influence_path_papers(author_id)
+        if relation_type == RelationType.STOP:
+            if self.current_step < 3:
+                return False, -2.0 
+
+        print(f"  [MANAGER] Relation {relation_type}: fetched {len(raw_nodes)} raw nodes")
         
         normalized_nodes = [self._normalize_node_keys(node) for node in raw_nodes]
         
@@ -842,12 +813,14 @@ class AdvancedGraphTraversalEnv:
                 valid_nodes.append(node)
         
         self.available_worker_nodes = [(node, relation_type) for node in valid_nodes]
+    
         
         self.available_worker_nodes = [
             (node, r_type) for node, r_type in self.available_worker_nodes 
             if not self._is_visited(node)
         ]
         
+        print(f"  [MANAGER] After filtering: {len(self.available_worker_nodes)} valid unvisited nodes")
         num_available = len(self.available_worker_nodes)
         if num_available == 0:
             manager_reward += self.config.DEAD_END_PENALTY
@@ -909,17 +882,16 @@ class AdvancedGraphTraversalEnv:
         """Get worker actions."""
         return self.available_worker_nodes
     
-    async def worker_step(self, chosen_node: Dict) -> Tuple[np.ndarray, float, bool]:
 
+    async def worker_step(self, chosen_node: Dict) -> Tuple[np.ndarray, float, bool]:
+        """FIXED: Much clearer reward signals with better scaling."""
         self.current_step += 1
         self.episode_stats['total_nodes_explored'] += 1
         
-        # Normalize node
         self.current_node = self._normalize_node_keys(chosen_node)
         paper_id = self.current_node.get('paper_id')
         author_id = self.current_node.get('author_id')
         
-        # Track visits
         is_revisit = False
         if paper_id and paper_id in self.visited:
             is_revisit = True
@@ -937,14 +909,13 @@ class AdvancedGraphTraversalEnv:
         
         node_emb = await self._get_node_embedding(self.current_node)
         if node_emb is None or not isinstance(node_emb, np.ndarray):
-            logging.error(f"Invalid embedding for node {paper_id or author_id}")
             node_emb = np.zeros(self.text_dim, dtype=np.float32)
         
         semantic_sim = np.dot(self.query_embedding, node_emb) / (
             np.linalg.norm(self.query_embedding) * np.linalg.norm(node_emb) + 1e-9
         )
         
-        if self.current_step <= 3 and len(self.trajectory_history) <= 30:
+        if self.current_step <= 3:
             title = self.current_node.get('title', 'NA')[:50]
             print(f"  [DEBUG] Step {self.current_step}: sim={semantic_sim:.3f}, node={title}")
 
@@ -952,58 +923,83 @@ class AdvancedGraphTraversalEnv:
             self.best_similarity_so_far = semantic_sim
             self.episode_stats['max_similarity_achieved'] = semantic_sim
         
-        worker_reward = semantic_sim * 100
+        # ================================================================
+        # FIXED: Exponential rewards for clearer learning signal
+        # ================================================================
         
+        # Base similarity reward (exponential scaling)
+        if semantic_sim > 0.7:
+            worker_reward = 200.0  # Jackpot for highly relevant papers
+        elif semantic_sim > 0.5:
+            # Exponential growth between 0.5-0.7
+            worker_reward = 50.0 + 150.0 * ((semantic_sim - 0.5) / 0.2) ** 2
+        elif semantic_sim > 0.3:
+            # Moderate reward for decent papers
+            worker_reward = 10.0 + 40.0 * ((semantic_sim - 0.3) / 0.2) ** 2
+        elif semantic_sim > 0.15:
+            # Small positive for somewhat relevant
+            worker_reward = (semantic_sim - 0.15) * 20.0
+        else:
+            # Strong penalty for irrelevant papers
+            worker_reward = -20.0 + semantic_sim * 50.0
+        
+        # FIXED: Progress bonus (reward improvement)
         if self.previous_node_embedding is not None:
             prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
                 np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
             )
             
-            similarity_delta = semantic_sim - prev_sim
+            progress = semantic_sim - prev_sim
             
-            if similarity_delta < 0:
-                worker_reward -= abs(similarity_delta) * 150
-            else:
-                worker_reward += similarity_delta * 50
-    
-        if is_revisit:
-            worker_reward -= 5
-
-        done = False
-        if paper_id:
-            refs = await self.store.get_references_by_paper(paper_id)
-            cites = await self.store.get_citations_by_paper(paper_id)
-            
-            if len(refs) == 0 and len(cites) == 0:
-                worker_reward -= 50
-                done = True
-                if self.current_step <= 10:
-                    print(f"  [Ep {self.current_step} Step {self.current_step}] No worker actions, ending")
+            if progress > 0.15:
+                worker_reward += 40.0  # Large improvement
+            elif progress > 0.05:
+                worker_reward += 20.0  # Good improvement
+            elif progress > 0:
+                worker_reward += 10.0  # Small improvement
+            elif progress < -0.1:
+                worker_reward -= 30.0  # Significant regression
+            elif progress < -0.05:
+                worker_reward -= 15.0  # Moderate regression
         
-        if self.current_step >= self.max_steps:
-            done = True
-            if semantic_sim > 0.7:
-                worker_reward += 30
-            elif semantic_sim > 0.6:
-                worker_reward += 15
+        # FIXED: Harsh revisit penalty
+        if is_revisit:
+            worker_reward -= 50.0  # Make revisiting very costly
+        
+        # Community exploration bonus (if using communities)
+        if self.use_communities and semantic_sim > 0.3:
+            if self.previous_community and self.current_community != self.previous_community:
+                worker_reward += self.config.COMMUNITY_SWITCH_BONUS
+        
+        # Novelty bonus (but capped)
+        if not is_revisit and semantic_sim > 0.2:
+            novelty_bonus = self.curiosity_module.get_novelty_bonus(paper_id or author_id)
+            worker_reward += min(novelty_bonus, self.config.NOVELTY_BONUS)
+        
+        # FIXED: Step penalty to encourage efficiency
+        worker_reward -= 0.5  # Small penalty per step
+        
+        # FIXED: Early termination bonus if found good paper
+        if semantic_sim > 0.65 and self.current_step < 10:
+            worker_reward += 30.0  # Bonus for finding good paper quickly
+        
+        self.previous_node_embedding = node_emb
+        worker_reward = np.clip(worker_reward, -5.0, 10.0) 
+        
+        done = self.current_step >= self.max_steps
+        if done:
+            print(f"  [TERM] Episode ended: step={self.current_step}/{self.max_steps}")
+        next_state = await self._get_state()
         
         self.trajectory_history.append({
             'node': self.current_node,
-            'node_type': 'paper' if paper_id else 'author',
             'similarity': semantic_sim,
             'reward': worker_reward,
-            'community': self.current_community
+            'step': self.current_step
         })
-        
-        self.previous_node_embedding = node_emb
-        next_state = await self._get_state()
-        
-        self.pending_manager_action = None
-        self.available_worker_nodes = []
         
         return next_state, worker_reward, done
     
-
     def get_diverse_results(self , trajectory: List[Dict]) -> List[Dict]: 
         if not self.use_feedback: 
             return trajectory
@@ -1066,3 +1062,62 @@ class AdvancedGraphTraversalEnv:
         total_reward = (0.6 * struct_reward) + (0.4 * sem_reward)
         done = self.current_step >= self.max_steps
         return await self._get_state(), total_reward, done
+    
+
+    
+class MetaPathReward: 
+    def _init__(self): 
+        self.meta_paths = {
+            'citation_chain': {
+                'pattern': ['Paper', 'CITES', 'Paper', 'CITES', 'Paper'],
+                'reward': 15.0,
+                'description': 'Following citation chain'
+            },
+            'coauthor_bridge': {
+                'pattern': ['Paper', 'WROTE', 'Author', 'WROTE', 'Paper'],
+                'reward': 20.0,
+                'description': 'Finding related work via shared author'
+            },
+            'venue_exploration': {
+                'pattern': ['Paper', 'VENUE', 'Paper', 'VENUE', 'Paper'],
+                'reward': 12.0,
+                'description': 'Exploring same venue papers'
+            },
+            'influence_path': {
+                'pattern': ['Paper', 'CITES', 'Paper', 'WROTE', 'Author'],
+                'reward': 18.0,
+                'description': 'Finding influential authors'
+            },
+            'temporal_forward': {
+                'pattern': ['Paper(old)', 'CITED_BY', 'Paper(new)'],
+                'reward': 10.0,
+                'description': 'Following citations forward in time'
+            }
+        }
+        
+        self.current_path = []
+
+
+    def add_step(self, node_type: str, relation_type: str):
+        """Add a step to current path."""
+        self.current_path.append((node_type, relation_type))
+        
+        # Keep only last 5 steps
+        if len(self.current_path) > 5:
+            self.current_path.pop(0)
+
+    def check_meta_paths(self) -> Tuple[float , str]: 
+        for path_name , path_info in self.meta_paths: 
+            if self._matches_pattern(path_info['pattern']): 
+                return path_info['reward'] , path_info['description']
+        return 0.0 , ''
+    
+    def _matches_pattern(self , pattern: List[str]) -> bool: 
+        if len(self.current_path) < len(pattern) // 2:
+            return False 
+        
+        #TODO: Make more sophisticated
+        recent_types = [node_type for node_type, _ in self.current_path[-(len(pattern)//2):]]
+        pattern_types = [p for p in pattern if p in ['Paper', 'Author']]
+        
+        return recent_types == pattern_types

@@ -8,39 +8,46 @@ from typing import List, Tuple, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 import torch.nn.functional as F
 from .prioritized_replay import PrioritizedReplay
+from .noisy_layer import NoisyLinear
+from .n_step import NStepBuffer
 
 
 class QNetwork(nn.Module):
-    """Q-Network with dropout for regularization."""
-    
     def __init__(self, state_dim, action_emb_dim, relation_dim=13):
         super(QNetwork, self).__init__()
         
-        # Input: State + ActionNode_Emb + Relation_OneHot
         self.input_dim = state_dim + action_emb_dim + relation_dim
         
         self.network = nn.Sequential(
             nn.Linear(self.input_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(512, 256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 1)
+            NoisyLinear(128, 1)
         )
     
     def forward(self, state, action_emb, relation_onehot):
-        """Forward pass through network."""
         x = torch.cat([state, action_emb, relation_onehot], dim=1)
         return self.network(x)
+    
+    def reset_noise(self):
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
 
 
 class DDQLAgent:
-    """Double DQN Agent with Prioritized Experience Replay."""
-    
-    def __init__(self, state_dim=773, text_dim=384, use_prioritized=True , ):
+    def __init__(self, state_dim=773, text_dim=384, use_prioritized=True, precomputed_embeddings=None):
         self.state_dim = state_dim
         self.text_dim = text_dim
         self.relation_dim = 13
@@ -51,60 +58,92 @@ class DDQLAgent:
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-4)
-        self.scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer,
-            step_size=500,
-            gamma=0.5
+        self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=1e-4, weight_decay=1e-5)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=500, T_mult=2, eta_min=1e-6
         )
         
-        # Memory
         self.use_prioritized = use_prioritized
         if use_prioritized:
-            self.memory = PrioritizedReplay(
-                capacity=50000,
-                alpha=0.6,
-                beta=0.4,
-            )
+            self.memory = PrioritizedReplay(capacity=200000, alpha=0.6, beta=0.4)
         else:
-            self.memory = deque(maxlen=50000)
+            self.memory = deque(maxlen=200000)
         
-        self.batch_size = 32
-        self.gamma = 0.95
+        self.batch_size = 16  # FIXED: Reduced for faster training
+        self.gamma = 0.99 
+        
         self.epsilon = 1.0
-        self.epsilon_min = 0.2  
-        self.epsilon_decay = 0.998 
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.9995
         
         self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.precomputed_embeddings = precomputed_embeddings or {}
+        
+        self.n_step_buffer = NStepBuffer(n=1, gamma=self.gamma)  # FIXED: n=1 instead of n=3
+        
+        self.training_step = 0
+        self.warmup_steps = 32  # FIXED: Reduced from 5000
         
         print(f"DDQN Agent initialized on {self.device}")
         print(f"Prioritized Replay: {use_prioritized}")
+        print(f"Replay Buffer Size: 200,000")
+        print(f"Warmup Steps: {self.warmup_steps:,}")
+        print(f"Batch Size: {self.batch_size}")
+        print(f"Precomputed embeddings: {len(self.precomputed_embeddings):,}")
     
     def _get_relation_onehot(self, r_type: int) -> torch.Tensor:
-        """Convert relation type to one-hot encoding."""
         onehot = torch.zeros(1, self.relation_dim)
         if 0 <= r_type < self.relation_dim:
             onehot[0][r_type] = 1.0
         else:
-            print(f"⚠ Invalid relation type {r_type}, using 0")
             onehot[0][0] = 1.0
         return onehot
     
-    def act(self, state: np.ndarray, valid_actions: List[Tuple[Dict, int]]) -> Optional[Tuple[Dict, int]]:
-        """Select action using epsilon-greedy policy."""
+
+    # In ddqn.py, replace _encode_node method:
+
+    def _encode_node(self, node: Dict) -> np.ndarray:
+        paper_id = node.get('paper_id')
+        
+        if paper_id and paper_id in self.precomputed_embeddings:
+            return self.precomputed_embeddings[paper_id]
+        
+        title = node.get('title', '')
+        abstract = node.get('abstract', '') or ''  # FIXED: Handle None
+        text = f"{title} {abstract[:200]}" if abstract else title
+        
+        if not text.strip():
+            # Fallback to paper_id if no text
+            if paper_id:
+                text = f"Paper {paper_id}"
+            else:
+                return np.zeros(self.text_dim)
+        
+        return self.encoder.encode(text, convert_to_numpy=True)
+
+    
+    def act(self, state: np.ndarray, valid_actions: List[Tuple[Dict, int]], max_actions: int = 10) -> Optional[Tuple[Dict, int]]:
         if not valid_actions:
             return None
         
-        memory_size = len(self.memory) if self.use_prioritized else len(self.memory)
+        # FIXED: Sample if too many actions with prioritization
+        if len(valid_actions) > max_actions:
+            scored = []
+            for node, rtype in valid_actions:
+                title = node.get('title', '') or ''
+                abstract = node.get('abstract', '') or ''
+                score = len(title) + len(abstract[:100])
+                scored.append((score, (node, rtype)))
+            
+            scored.sort(key = lambda x: x[0] , reverse=True) 
+            valid_actions = [action for _, action in scored[:max_actions]]
         
-        if len(self.memory) < 640:  
-            return random.choice(valid_actions)
+        self.policy_net.reset_noise()
         
-        # Epsilon-greedy
+        # FIXED: Always use epsilon-greedy (no warmup override)
         if np.random.rand() < self.epsilon:
             return random.choice(valid_actions)
         
-        # Greedy action selection
         state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         best_q = -float('inf')
         best_action = None
@@ -112,10 +151,8 @@ class DDQLAgent:
         self.policy_net.eval()
         with torch.no_grad():
             for node, r_type in valid_actions:
-                node_text = f"{node.get('title', '')} {node.get('abstract', '')}"
-                node_emb = self.encoder.encode(node_text, convert_to_numpy=True)
+                node_emb = self._encode_node(node)
                 node_emb_t = torch.FloatTensor(node_emb).unsqueeze(0).to(self.device)
-            
                 relation_onehot_t = self._get_relation_onehot(r_type).to(self.device)
                 
                 q_value = self.policy_net(state_t, node_emb_t, relation_onehot_t)
@@ -128,26 +165,37 @@ class DDQLAgent:
         return best_action
     
     def remember(self, state, action_tuple, reward, next_state, done, next_actions):
-        """Store experience in replay buffer."""
         node, r_type = action_tuple
+        act_emb = self._encode_node(node)
         
-        # Encode action node
-        txt = node.get('title', '') or node.get('name', '')
-        act_emb = self.encoder.encode(txt, convert_to_numpy=True)
+        n_step_transition = self.n_step_buffer.add(
+            state, act_emb, r_type, reward, next_state, done, next_actions
+        )
         
-        if self.use_prioritized:
-            self.memory.add(state, act_emb,r_type, reward, next_state, done, next_actions)
-        else:
-            self.memory.append((state, act_emb, r_type  , reward, next_state, done, next_actions))
+        if n_step_transition:
+            print(f"  [MEM] Adding transition to memory (size: {len(self.memory)})")
+            if self.use_prioritized:
+                self.memory.add(*n_step_transition)
+            else:
+                self.memory.append(n_step_transition)
+        
+        if done:
+            for trans in self.n_step_buffer.flush():
+                print(f"  [MEM] Episode done, flushing {len(trans)} transitions")
+                if self.use_prioritized:
+                    self.memory.add(*trans)
+                else:
+                    self.memory.append(trans)
     
     def replay_prioritized(self) -> float:
-        """Train with prioritized experience replay."""
+        if len(self.memory) < self.warmup_steps:
+            return 0.0
+            
         if len(self.memory) < self.batch_size:
             return 0.0
         
-        batch, weights , indices = self.memory.sample(self.batch_size)
+        batch, weights, indices = self.memory.sample(self.batch_size)
         indices = [int(idx) for idx in indices]
-
         
         if not batch:
             return 0.0
@@ -165,7 +213,7 @@ class DDQLAgent:
         self.target_net.eval()
         
         for experience in batch:
-            state, act_emb, r_type , reward , next_state, done, next_actions = experience
+            state, act_emb, r_type, reward, next_state, done, next_actions = experience
             
             states.append(state)
             action_embs.append(act_emb)
@@ -183,8 +231,7 @@ class DDQLAgent:
                 
                 with torch.no_grad():
                     for n_node, n_r_type in next_actions:
-                        n_txt = n_node.get('title', '') or n_node.get('name', '')
-                        n_emb = self.encoder.encode(n_txt, convert_to_numpy=True)
+                        n_emb = self._encode_node(n_node)
                         n_emb_t = torch.FloatTensor(n_emb).unsqueeze(0).to(self.device)
                         n_rel_onehot_t = self._get_relation_onehot(n_r_type).to(self.device)
                         
@@ -201,7 +248,6 @@ class DDQLAgent:
                 next_action_embs.append(np.zeros(self.text_dim))
                 next_relation_onehots.append(np.zeros(self.relation_dim))
         
-        # Convert to tensors
         states_t = torch.FloatTensor(np.array(states)).to(self.device)
         action_embs_t = torch.FloatTensor(np.array(action_embs)).to(self.device)
         relation_onehots_t = torch.FloatTensor(np.array(relation_onehots)).to(self.device)
@@ -218,21 +264,22 @@ class DDQLAgent:
         
         with torch.no_grad():
             next_q_values = self.target_net(next_states_t, next_action_embs_t, next_relation_onehots_t)
-            target_q_values = rewards_t + (self.gamma * next_q_values * (1 - dones_t))
+            target_q_values = rewards_t + self.gamma * next_q_values * (1 - dones_t)
         
         td_errors = (q_values - target_q_values).abs().detach().cpu().numpy().flatten()
         self.memory.update_priorities(indices, td_errors)
         
-        loss = (weights_t * F.smooth_l1_loss(q_values, target_q_values, reduction='none')).mean()
+        loss = (weights_t * F.huber_loss(q_values, target_q_values, reduction='none', delta=1.0)).mean()
     
         self.optimizer.zero_grad()
         loss.backward()
-    
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-        
         self.optimizer.step()
         self.scheduler.step()
         
+        self.training_step += 1
+        
+        # FIXED: Decay epsilon from start
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
         
@@ -242,36 +289,32 @@ class DDQLAgent:
         if not self.use_prioritized:
             if len(self.memory) < self.batch_size:
                 return 0.0
-            
             batch = random.sample(list(self.memory), self.batch_size)
-            return self.replay_prioritized()
-        else:
-            return self.replay_prioritized()
+        return self.replay_prioritized()
     
     def update_target(self):
-        """Update target network."""
         self.target_net.load_state_dict(self.policy_net.state_dict())
-        print("  [Target network updated]")
     
     def save(self, filepath: str):
-        """Save model checkpoint."""
         torch.save({
             'policy_net': self.policy_net.state_dict(),
             'target_net': self.target_net.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'epsilon': self.epsilon,
+            'training_step': self.training_step,
             'memory_size': len(self.memory)
         }, filepath)
-        print(f" Model saved to {filepath}")
+        print(f"✓ Model saved to {filepath}")
     
     def load(self, filepath: str):
-        """Load model checkpoint."""
         checkpoint = torch.load(filepath, map_location=self.device)
         self.policy_net.load_state_dict(checkpoint['policy_net'])
         self.target_net.load_state_dict(checkpoint['target_net'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.scheduler.load_state_dict(checkpoint['scheduler'])
         self.epsilon = checkpoint['epsilon']
+        self.training_step = checkpoint.get('training_step', 0)
         print(f"✓ Model loaded from {filepath}")
         print(f"  Epsilon: {self.epsilon:.4f}")
+        print(f"  Training Step: {self.training_step:,}")
