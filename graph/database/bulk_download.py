@@ -29,7 +29,7 @@ class SemanticScholarBulkLoader:
         neo4j_username: str,
         neo4j_password: str,
         batch_size: int = 1000,
-        download_dir: str = "./s2_datasets"
+        download_dir: str = "/Users/kaushikmuthukumar/Downloads/s2_datasets"
     ):
         """
         Initialize bulk loader.
@@ -780,8 +780,8 @@ Examples:
     parser.add_argument('--neo4j-user', default='neo4j', help='Neo4j username (default: neo4j)')
     
     # Processing configuration
-    parser.add_argument('--download-dir', default='./s2_datasets', help='Download directory (default: ./s2_datasets)')
-    parser.add_argument('--batch-size', type=int, default=10000, help='Neo4j batch size (default: 1000)')
+    parser.add_argument('--download-dir', default='/Users/kaushikmuthukumar/Downloads/s2_datasets', help='Download directory (default: ./s2_datasets)')
+    parser.add_argument('--batch-size', type=int, default=100000, help='Neo4j batch size (default: 1000)')
     parser.add_argument('--max-files', type=int, help='Max files to download/process')
     
     # Dataset type

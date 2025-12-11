@@ -9,7 +9,7 @@ from neo4j import AsyncGraphDatabase
 import os
 from typing import Tuple, Set
 
-URI = os.environ.get("NEO4J_URI", "neo4j://localhost:7687")
+URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 AUTH = ("neo4j", "diam0ndman@3")
 
 @dataclass
