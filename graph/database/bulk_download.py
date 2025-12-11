@@ -776,28 +776,33 @@ Examples:
     parser.add_argument('--neo4j-password', required=True, help='Neo4j password')
     
     # Optional Neo4j configuration
-    parser.add_argument('--neo4j-uri', default='bolt://localhost:7687', help='Neo4j URI (default: bolt://localhost:7687)')
-    parser.add_argument('--neo4j-user', default='neo4j', help='Neo4j username (default: neo4j)')
+    parser.add_argument('--neo4j-uri', default='bolt://localhost:7687', help='Neo4j URI')
+    parser.add_argument('--neo4j-user', default='neo4j', help='Neo4j username')
     
     # Processing configuration
-    parser.add_argument('--download-dir', default='/Users/kaushikmuthukumar/Downloads/s2_datasets', help='Download directory (default: ./s2_datasets)')
-    parser.add_argument('--batch-size', type=int, default=100000, help='Neo4j batch size (default: 1000)')
+    parser.add_argument('--download-dir', default='/Users/kaushikmuthukumar/Downloads/s2_datasets', 
+                       help='Download directory')
+    parser.add_argument('--batch-size', type=int, default=500000, help='Neo4j batch size')
     parser.add_argument('--max-files', type=int, help='Max files to download/process')
     
     # Dataset type
     parser.add_argument('--dataset-type', default='papers', choices=['papers', 'citations'], 
-                       help='Dataset type to download/process (default: papers)')
+                       help='Dataset type to download/process')
     
     # Operation mode
     parser.add_argument('--download-only', action='store_true', help='Only download, don\'t process')
     parser.add_argument('--process-only', action='store_true', help='Only process existing files')
     
     # Filters (only for papers)
-    parser.add_argument('--filter-fields', nargs='+', help='Filter by fields of study (e.g., "Computer Science" "Medicine")')
-    parser.add_argument('--year-min', type=int, default=2018, help='Minimum year (default: 2018)')
-    parser.add_argument('--year-max', type=int, default=2025, help='Maximum year (default: 2025)')
+    parser.add_argument('--filter-fields', nargs='+', help='Filter by fields of study (papers only)')
+    parser.add_argument('--year-min', type=int, default=2018, help='Minimum year (papers only)')
+    parser.add_argument('--year-max', type=int, default=2025, help='Maximum year (papers only)')
     
     args = parser.parse_args()
+    
+    # Validation
+    if args.dataset_type == 'citations' and (args.filter_fields or args.year_min != 2018 or args.year_max != 2025):
+        logger.warning("⚠️  Filters (--filter-fields, --year-min, --year-max) are ignored for citation files!")
     
     logger.info("="*60)
     logger.info("SEMANTIC SCHOLAR BULK LOADER")
@@ -818,18 +823,20 @@ Examples:
         sys.exit(1)
     
     try:
+        # FIXED: Only download if not process-only
         if not args.process_only:
-            # Download dataset
-            logger.info("\nDOWNLOAD PHASE")
-            logger.info("-"*60)
+            logger.info("\n" + "="*60)
+            logger.info("DOWNLOAD PHASE")
+            logger.info("="*60)
             release_id = loader.get_latest_release()
             loader.get_available_datasets(release_id)
             loader.download_dataset(release_id, args.dataset_type, max_files=args.max_files)
         
+        # FIXED: Only process if not download-only
         if not args.download_only:
-            # Process and load into Neo4j
-            logger.info("\nPROCESSING PHASE")
-            logger.info("-"*60)
+            logger.info("\n" + "="*60)
+            logger.info("PROCESSING PHASE")
+            logger.info("="*60)
             
             if args.dataset_type == 'papers':
                 loader.process_all_papers(
@@ -839,7 +846,8 @@ Examples:
                     max_files=args.max_files
                 )
             elif args.dataset_type == 'citations':
-                loader.process_all_citations(max_files=None)
+                # FIXED: Pass max_files argument
+                loader.process_all_citations(max_files=args.max_files)
     
     except KeyboardInterrupt:
         logger.warning("\n\nInterrupted by user. Flushing remaining batches...")
@@ -848,6 +856,7 @@ Examples:
         logger.error(f"Error during execution: {e}", exc_info=True)
     finally:
         loader.close()
+
 
 
 if __name__ == "__main__":

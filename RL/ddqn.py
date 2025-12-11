@@ -69,7 +69,7 @@ class DDQLAgent:
         else:
             self.memory = deque(maxlen=200000)
         
-        self.batch_size = 16  # FIXED: Reduced for faster training
+        self.batch_size = 16 
         self.gamma = 0.99 
         
         self.epsilon = 1.0
@@ -79,10 +79,10 @@ class DDQLAgent:
         self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
         self.precomputed_embeddings = precomputed_embeddings or {}
         
-        self.n_step_buffer = NStepBuffer(n=1, gamma=self.gamma)  # FIXED: n=1 instead of n=3
+        self.n_step_buffer = NStepBuffer(n=1, gamma=self.gamma)  
         
         self.training_step = 0
-        self.warmup_steps = 32  # FIXED: Reduced from 5000
+        self.warmup_steps = 32  
         
         print(f"DDQN Agent initialized on {self.device}")
         print(f"Prioritized Replay: {use_prioritized}")
@@ -100,7 +100,7 @@ class DDQLAgent:
         return onehot
     
 
-    # In ddqn.py, replace _encode_node method:
+
 
     def _encode_node(self, node: Dict) -> np.ndarray:
         paper_id = node.get('paper_id')
@@ -109,7 +109,7 @@ class DDQLAgent:
             return self.precomputed_embeddings[paper_id]
         
         title = node.get('title', '')
-        abstract = node.get('abstract', '') or ''  # FIXED: Handle None
+        abstract = node.get('abstract', '') or ''  
         text = f"{title} {abstract[:200]}" if abstract else title
         
         if not text.strip():
@@ -126,7 +126,6 @@ class DDQLAgent:
         if not valid_actions:
             return None
         
-        # FIXED: Sample if too many actions with prioritization
         if len(valid_actions) > max_actions:
             scored = []
             for node, rtype in valid_actions:
@@ -140,7 +139,6 @@ class DDQLAgent:
         
         self.policy_net.reset_noise()
         
-        # FIXED: Always use epsilon-greedy (no warmup override)
         if np.random.rand() < self.epsilon:
             return random.choice(valid_actions)
         
@@ -186,7 +184,8 @@ class DDQLAgent:
                     self.memory.add(*trans)
                 else:
                     self.memory.append(trans)
-    
+
+                
     def replay_prioritized(self) -> float:
         if len(self.memory) < self.warmup_steps:
             return 0.0
@@ -221,6 +220,15 @@ class DDQLAgent:
             rewards.append(reward)
             next_states.append(next_state)
             dones.append(float(done))
+
+            #if next_actions and len(next_actions) < 1 and reward < 0: 
+            #    worst_q = float('inf')
+            #    worst_emb = None 
+            #    worst_rel = None
+                
+
+
+                
             
             if next_actions and not done:
                 best_next_q = -float('inf')
@@ -267,6 +275,10 @@ class DDQLAgent:
             target_q_values = rewards_t + self.gamma * next_q_values * (1 - dones_t)
         
         td_errors = (q_values - target_q_values).abs().detach().cpu().numpy().flatten()
+        #counterfactual learning: 
+        if td_errors < 0.2: 
+            #introduce bad actions
+            
         self.memory.update_priorities(indices, td_errors)
         
         loss = (weights_t * F.huber_loss(q_values, target_q_values, reduction='none', delta=1.0)).mean()
@@ -279,7 +291,6 @@ class DDQLAgent:
         
         self.training_step += 1
         
-        # FIXED: Decay epsilon from start
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
         
