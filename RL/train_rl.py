@@ -2,69 +2,158 @@ import asyncio
 import numpy as np
 import pickle
 import os
-import signal
-import sys
-from sentence_transformers import SentenceTransformer
 from RL.ddqn import DDQLAgent
 from RL.env import AdvancedGraphTraversalEnv
 from graph.database.store import EnhancedStore
 
 
-async def build_query_paper_pools(store, queries):
-    """Build relevant paper pools for each query"""
-    query_paper_pools = {}
+
+async def diagnose_graph_sparsity(store):
+    """Check citation graph connectivity."""
     
-    print("Building relevant paper pools...")
-    for query in queries:
-        pool = []
-        keywords = query.split()
-        
-        for kw in keywords:
-            if len(kw) < 4:
-                continue
-            papers = await store.get_paper_by_title(kw)
-            pool.extend(papers[:10])
-        
-        # Deduplicate
-        seen = set()
-        unique_pool = []
-        for p in pool:
-            pid = p.get('paper_id')
-            if pid and pid not in seen:
-                seen.add(pid)
-                unique_pool.append(p)
-        
-        query_paper_pools[query] = unique_pool[:30]
-        print(f"  {query}: {len(unique_pool)} papers")
+    # 1. Check if CITES relationships exist
+    query1 = """
+    MATCH ()-[r:CITES]->()
+    RETURN count(r) as total_citations
+    """
+    result1 = await store._run_query_method(query1)
+    total_citations = result1[0]['total_citations'] if result1 else 0
     
-    return query_paper_pools
+    # 2. Check papers with 0 citations
+    query2 = """
+    MATCH (p:Paper)
+    WHERE NOT exists((p)-[:CITES]->())
+      AND NOT exists(()-[:CITES]->(p))
+    RETURN count(p) as isolated_papers
+    """
+    result2 = await store._run_query_method(query2)
+    isolated = result2[0]['isolated_papers'] if result2 else 0
+    
+    # 3. Check average degree
+    query3 = """
+    MATCH (p:Paper)
+    OPTIONAL MATCH (p)-[:CITES]->(ref)
+    OPTIONAL MATCH (citing)-[:CITES]->(p)
+    WITH p, count(DISTINCT ref) as out_degree, count(DISTINCT citing) as in_degree
+    RETURN 
+        avg(out_degree + in_degree) as avg_degree,
+        max(out_degree + in_degree) as max_degree,
+        min(out_degree + in_degree) as min_degree
+    """
+    result3 = await store._run_query_method(query3)
+    
+    # 4. Sample a paper and check neighbors
+    query4 = """
+    MATCH (p:Paper)
+    WHERE p.citationCount > 20
+    WITH p LIMIT 1
+    OPTIONAL MATCH (p)-[:CITES]->(ref)
+    OPTIONAL MATCH (citing)-[:CITES]->(p)
+    OPTIONAL MATCH (p)<-[:WROTE]-(a:Author)
+    RETURN 
+        p.paperId as paper_id,
+        p.title as title,
+        count(DISTINCT ref) as references,
+        count(DISTINCT citing) as citations,
+        count(DISTINCT a) as authors
+    """
+    result4 = await store._run_query_method(query4)
+    
+    print("\n" + "="*70)
+    print("GRAPH CONNECTIVITY DIAGNOSIS")
+    print("="*70)
+    print(f"Total CITES edges: {total_citations:,}")
+    print(f"Isolated papers (no edges): {isolated:,}")
+    
+    if result3:
+        print(f"\nDegree statistics:")
+        print(f"  Average: {result3[0]['avg_degree']:.2f}")
+        print(f"  Max: {result3[0]['max_degree']}")
+        print(f"  Min: {result3[0]['min_degree']}")
+    
+    if result4:
+        print(f"\nSample paper:")
+        print(f"  Title: {result4[0]['title'][:60]}")
+        print(f"  References: {result4[0]['references']}")
+        print(f"  Citations: {result4[0]['citations']}")
+        print(f"  Authors: {result4[0]['authors']}")
+    
+    print("="*70 + "\n")
+    
+    # Verdict
+    if total_citations == 0:
+        print("⚠️  CRITICAL: No CITES relationships found!")
+        print("   Your citation graph is EMPTY. You need to:")
+        print("   1. Re-run your data loader with citation edges")
+        print("   2. Check if your source data includes references/citations")
+    elif result3 and result3[0]['avg_degree'] < 2:
+        print("⚠️  WARNING: Very sparse graph (avg degree < 2)")
+        print("   Most papers have <1 neighbor on average")
+    elif result3 and result3[0]['avg_degree'] < 5:
+        print("⚠️  Graph is sparse but workable (avg degree 2-5)")
+    else:
+        print("✓ Graph connectivity looks good")
 
 
-async def precompute_embeddings(papers, encoder):
-    """Precompute embeddings for all papers"""
-    embeddings = {}
+async def sample_fresh_subgraph(store, query, encoder, embeddings, k=100):
+    """Sample a fresh connected subgraph for each episode."""
+    query_emb = encoder.encode_with_cache(query, cache_key=f"query_{query}")
     
-    print(f"\nPrecomputing {len(papers)} embeddings...")
-    for i, paper in enumerate(papers):
-        pid = paper.get('paper_id')
-        if pid and pid not in embeddings:
+    # Get ALL papers from Neo4j (not just cached)
+    cypher = """
+    MATCH (p:Paper)
+    WHERE p.citationCount > 20
+      AND p.year > 2015
+      AND p.abstract IS NOT NULL
+      AND size(p.title) > 10
+    RETURN p.paperId as paper_id, p.title as title, p.abstract as abstract
+    ORDER BY rand()
+    LIMIT 500
+    """
+    
+    candidates = await store._run_query_method(cypher)
+    
+    # Score and pick best starting paper
+    scores = []
+    for paper in candidates:
+        pid = paper['paper_id']
+        
+        # Use cached embedding if available, else encode on-the-fly
+        if pid in embeddings:
+            paper_emb = embeddings[pid]
+        else:
             title = paper.get('title', '')
-            abstract = paper.get('abstract', '') or ''
-            text = f"{title} {abstract[:200]}"
-            
-            if text.strip():
-                embeddings[pid] = encoder.encode(text)
-            else:
-                embeddings[pid] = encoder.encode(f"Paper {pid}")
+            abstract = (paper.get('abstract', '') or '')[:200]
+            text = f"{title} {abstract}"
+            paper_emb = encoder.encode_with_cache(text, cache_key=pid)
+            embeddings[pid] = paper_emb
         
-        if (i + 1) % 100 == 0:
-            print(f"  Progress: {i + 1}/{len(papers)}")
+        sim = np.dot(query_emb, paper_emb) / (
+            np.linalg.norm(query_emb) * np.linalg.norm(paper_emb) + 1e-9
+        )
+        scores.append((sim, paper))
+    
+    # Pick top paper
+    scores.sort(reverse=True, key=lambda x: x[0])
+    return scores[0][1] if scores else None
+
+
+async def load_cached_data():
+    """Load embeddings only (no query pools)."""
+    print("Loading embeddings cache...")
+    
+    with open('embeddings_cache.pkl', 'rb') as f:
+        embeddings = pickle.load(f)
+    
+    print(f"  ✓ Loaded {len(embeddings):,} embeddings")
     
     return embeddings
 
 
 async def train():
     store = EnhancedStore()
+
+    await diagnose_graph_sparsity(store)
     
     queries = [
         "attention mechanism transformers",
@@ -74,129 +163,121 @@ async def train():
         "natural language processing"
     ]
     
-    # Build query-specific paper pools
-    query_paper_pools = await build_query_paper_pools(store, queries)
+    # Load embeddings only
+    embeddings = await load_cached_data()
     
-    # Precompute embeddings
-    encoder = SentenceTransformer('all-MiniLM-L6-v2')
+    # Initialize encoder for on-the-fly encoding
+    from utils.batchencoder import BatchEncoder
+    encoder = BatchEncoder(
+        model_name='all-MiniLM-L6-v2',
+        batch_size=256,
+        cache_file='embeddings_cache.pkl'
+    )
     
-    all_papers = []
-    for papers in query_paper_pools.values():
-        all_papers.extend(papers)
+    env = AdvancedGraphTraversalEnv(
+        store, 
+        precomputedembeddings=embeddings,
+        use_communities=True,
+        use_authors=True
+    )
     
-    # Deduplicate all papers
-    seen_pids = set()
-    unique_papers = []
-    for p in all_papers:
-        pid = p.get('paper_id')
-        if pid and pid not in seen_pids:
-            seen_pids.add(pid)
-            unique_papers.append(p)
+    agent = DDQLAgent(
+        state_dim=773, 
+        text_dim=384, 
+        precomputed_embeddings=embeddings
+    )
     
-    embeddings = await precompute_embeddings(unique_papers, encoder)
+    agent.epsilon = 0.8
+    agent.epsilon_decay = 0.998
+    agent.epsilon_min = 0.05
     
-    print(f"\nTotal unique papers: {len(unique_papers)}")
-    print(f"Total embeddings: {len(embeddings)}")
-    
-    # Initialize environment and agent
-    env = AdvancedGraphTraversalEnv(store, precomputedembeddings=embeddings)
-    agent = DDQLAgent(state_dim=773, text_dim=384, precomputed_embeddings=embeddings)
-    
-    print(f"\nStarting training...")
-    print(f"Warmup: {agent.warmup_steps}, Batch: {agent.batch_size}")
-    print(f"=" * 70)
+    print(f"\n{'='*70}")
+    print("TRAINING START")
+    print(f"{'='*70}\n")
     
     episode_rewards = []
     episode_similarities = []
     
     for episode in range(500):
         query = np.random.choice(queries)
-        paper_pool = query_paper_pools[query]
         
-        if not paper_pool:
-            print(f"[ERROR] No papers for query: {query}")
+        # Sample a FRESH starting paper each episode
+        start_paper = await sample_fresh_subgraph(store, query, encoder, embeddings)
+        
+        if not start_paper:
+            print(f"[ERROR] Couldn't sample paper for query: {query}")
             continue
         
-        start_paper = np.random.choice(paper_pool)
+        start_id = start_paper['paper_id']
+        
+        if episode % 10 == 0:
+            title = start_paper.get('title', 'Unknown')[:60]
+            print(f"\n[EP {episode}] Query: '{query[:40]}'")
+            print(f"[EP {episode}] Start: '{title}'")
         
         try:
-            state = await env.reset(query, intent=1, start_node_id=start_paper['paper_id'])
+            state = await env.reset(query, intent=1, start_node_id=start_id)
         except Exception as e:
             print(f"[ERROR] Reset failed: {e}")
             continue
         
         episode_reward = 0
         steps = 0
-        dead_end_count = 0
-        max_retries = 3
-        
-        # FIXED: Limit steps per episode to prevent hanging
-        max_steps_per_episode = min(env.max_steps, 10)  # Cap at 10 steps
+        max_steps_per_episode = 15  # Increased from 10
         
         for step in range(max_steps_per_episode):
-            print(f"  [STEP] Episode {episode}, Step {step}")  # Progress tracking
-            
-            # Manager step
             manager_actions = await env.get_manager_actions()
-            if not manager_actions:
-                dead_end_count += 1
-                if dead_end_count > max_retries:
-                    print(f"  [BREAK] Dead end at step {step}")
-                    break
-                continue
             
-            # Prefer CITEDBY to reduce dead ends
-            if 1 in manager_actions and len(env.visited) > 2:
+            if not manager_actions:
+                if step == 0:
+                    print(f"    [ERROR] No manager actions at start!")
+                break
+            
+            # Prioritize citation-based exploration
+            if 1 in manager_actions:  # CITEDBY
                 manager_action = 1
-            elif 1 in manager_actions:
-                manager_action = 1
+            elif 0 in manager_actions:  # CITES
+                manager_action = 0
+            elif 2 in manager_actions:  # WROTE
+                manager_action = 2
+            elif 3 in manager_actions:  # AUTHORED
+                manager_action = 3
             else:
-                manager_action = np.random.choice(manager_actions)
+                # Filter noisy relations
+                if agent.epsilon > 0.5:
+                    filtered = [a for a in manager_actions if a not in [6, 7]]
+                    manager_action = np.random.choice(filtered if filtered else manager_actions)
+                else:
+                    manager_action = np.random.choice(manager_actions)
             
             is_terminal, manager_reward = await env.manager_step(manager_action)
             episode_reward += manager_reward
             
             if is_terminal:
-                print(f"  [BREAK] Terminal at step {step}")
                 break
             
-            # Worker step
             worker_actions = await env.get_worker_actions()
+            
             if not worker_actions:
-                dead_end_count += 1
-                if dead_end_count > max_retries:
-                    print(f"  [SKIP] No worker actions at episode {episode}, step {step}")
-                    break
-                continue
+                break
             
-            # FIXED: Limit worker actions to prevent slow Q-value computation
+            # Limit action space
             if len(worker_actions) > 20:
-                print(f"  [LIMIT] Sampling 20 from {len(worker_actions)} worker actions")
-                worker_actions = worker_actions[:20]  # Just take first 20
+                worker_actions = worker_actions[:20]
             
-            dead_end_count = 0
-            
-            print(f"  [ACT] Computing action for {len(worker_actions)} options...")
             best_action = agent.act(state, worker_actions)
             if not best_action:
-                print(f"  [BREAK] No action selected at step {step}")
                 break
             
             chosen_node, _ = best_action
-            print(f"  [WORKER] Executing worker step...")
             next_state, worker_reward, done = await env.worker_step(chosen_node)
             episode_reward += worker_reward
             steps += 1
             
-            if not done:
-                next_actions = await env.get_worker_actions()
-                # Limit next actions too
-                if len(next_actions) > 20:
-                    next_actions = next_actions[:20]
-            else:
-                next_actions = []
+            next_actions = await env.get_worker_actions() if not done else []
+            if len(next_actions) > 20:
+                next_actions = next_actions[:20]
             
-            print(f"  [REMEMBER] Storing transition...")
             agent.remember(
                 state=state,
                 action_tuple=best_action,
@@ -207,23 +288,13 @@ async def train():
             )
             
             state = next_state
-            
             if done:
-                print(f"  [DONE] Episode complete at step {step}")
                 break
         
-        # Train every episode
-        print(f"  [TRAIN] Training agent...")
-        if len(agent.memory) >= agent.batch_size:
-            loss = agent.replay()
-            print(f"  [TRAIN] Loss: {loss:.4f}")
-        else:
-            loss = 0.0
-            print(f"  [TRAIN] Skipped (memory: {len(agent.memory)}/{agent.batch_size})")
+        # Train
+        loss = agent.replay() if len(agent.memory) >= agent.batch_size else 0.0
         
-        # Update target network periodically
         if episode % 10 == 0 and episode > 0:
-            print(f"  [TARGET] Updating target network...")
             agent.update_target()
         
         episode_rewards.append(episode_reward)
@@ -231,31 +302,25 @@ async def train():
         
         # Logging
         if episode % 10 == 0:
-            avg_reward = np.mean(episode_rewards[-20:]) if episode_rewards else 0
-            avg_sim = np.mean(episode_similarities[-20:]) if episode_similarities else 0
+            avg_reward = np.mean(episode_rewards[-20:]) if len(episode_rewards) >= 20 else np.mean(episode_rewards)
+            avg_sim = np.mean(episode_similarities[-20:]) if len(episode_similarities) >= 20 else np.mean(episode_similarities)
             best_sim = max(episode_similarities) if episode_similarities else 0
-            best_ep = episode_similarities.index(best_sim) if episode_similarities else 0
             
             print(f"\n{'='*70}")
             print(f"Episode {episode}/500")
             print(f"{'='*70}")
-            print(f"  Reward: {episode_reward:+.2f} | Avg(20): {avg_reward:+.2f}")
-            print(f"  Steps: {steps:2d} | RL Loss: {loss:.4f}")
-            print(f"  Similarity: {env.best_similarity_so_far:.3f} | Avg(20): {avg_sim:.3f}")
-            print(f"  Best Sim: {best_sim:.3f} (ep {best_ep})")
-            print(f"  Epsilon: {agent.epsilon:.3f} | Memory: {len(agent.memory)}")
-            print(f"  Total Steps: {agent.training_step}")
+            print(f"  Reward: {episode_reward:+6.2f} | Avg(20): {avg_reward:+6.2f}")
+            print(f"  Similarity: {env.best_similarity_so_far:.3f} | Avg: {avg_sim:.3f} | Best: {best_sim:.3f}")
+            print(f"  Steps: {steps:2d} | Loss: {loss:.4f} | ε: {agent.epsilon:.3f} | Mem: {len(agent.memory)}")
+            print(f"  Cache size: {len(embeddings):,}")
             print(f"{'='*70}\n")
         
-        # Save checkpoints
         if episode % 50 == 0 and episode > 0:
             os.makedirs('checkpoints', exist_ok=True)
             agent.save(f'checkpoints/agent_ep{episode}.pt')
-            print(f"[CHECKPOINT] Saved at episode {episode}")
+            print(f"[SAVE] Checkpoint at episode {episode}")
     
-    print("\n" + "="*70)
-    print("Training complete!")
-    print("="*70)
+    print("\n✓ Training complete!")
     agent.save('final_agent.pt')
 
 

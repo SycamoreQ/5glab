@@ -356,12 +356,12 @@ class EnhancedStore:
     
     async def get_influence_path_papers(self, author_id: str, limit: int = 10):
         query = """
-        MATCH (a:Author {authorId: $author_id})-[:WROTE]->(p1:Paper)
+        MATCH (a:Author {authorId: $1})-[:WROTE]->(p1:Paper)
         MATCH (p1)-[:CITES]->(p2:Paper)
         MATCH (p2)<-[:WROTE]-(a2:Author)
         WITH DISTINCT p2
         ORDER BY p2.citationCount DESC
-        LIMIT $limit
+        LIMIT $2
         RETURN 
             p2.paperId as paper_id,
             p2.title as title,

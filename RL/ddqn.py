@@ -72,9 +72,9 @@ class DDQLAgent:
         self.batch_size = 16 
         self.gamma = 0.99 
         
-        self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.9995
+        self.epsilon = 0.8
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.9998
         
         self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
         self.precomputed_embeddings = precomputed_embeddings or {}

@@ -952,6 +952,8 @@ class AdvancedGraphTraversalEnv:
             worker_reward = 10.0 + 40.0 * ((semantic_sim - 0.3) / 0.2) ** 2
         elif semantic_sim > 0.15:
             worker_reward = (semantic_sim - 0.15) * 20.0
+        elif semantic_sim > 0.0: 
+            worker_reward = semantic_sim * 10.0
         else:
             worker_reward = -20.0 + semantic_sim * 50.0
         
