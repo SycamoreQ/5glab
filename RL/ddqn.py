@@ -275,11 +275,6 @@ class DDQLAgent:
             target_q_values = rewards_t + self.gamma * next_q_values * (1 - dones_t)
         
         td_errors = (q_values - target_q_values).abs().detach().cpu().numpy().flatten()
-        #counterfactual learning: 
-        if td_errors < 0.2: 
-            #introduce bad actions
-            
-        self.memory.update_priorities(indices, td_errors)
         
         loss = (weights_t * F.huber_loss(q_values, target_q_values, reduction='none', delta=1.0)).mean()
     

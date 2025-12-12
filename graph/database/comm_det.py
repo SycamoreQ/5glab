@@ -353,7 +353,7 @@ class CommunityDetector:
         author_file = 'training_authors.pkl'
         
         if os.path.exists(author_file):
-            print(f"  ✓ Loading from cache: {author_file}")
+            print(f" Loading from cache: {author_file}")
             try:
                 with open(author_file, 'rb') as f:
                     all_authors = pickle.load(f)

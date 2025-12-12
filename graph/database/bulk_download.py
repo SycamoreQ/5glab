@@ -78,6 +78,7 @@ class SemanticScholarBulkLoader:
             'citations_processed': 0,
             'papers_inserted': 0,
             'authors_inserted': 0,
+            'abstracts_updated': 0,
             'duplicates_skipped': 0
         }
         
@@ -240,19 +241,16 @@ class SemanticScholarBulkLoader:
     
     def _process_paper(self, paper: Dict):
         """Process a single paper record with duplicate checking."""
-        # FIXED: Use lowercase field names (actual format in dataset)
         corpus_id = paper.get('corpusid')
         if not corpus_id:
             return
         
         paper_id = str(corpus_id)
         
-        # Check if paper already exists in cache
         if self.cache_loaded and paper_id in self.existing_papers_cache:
             self.stats['duplicates_skipped'] += 1
             return
         
-        # Prepare paper data - FIXED: use lowercase keys
         paper_data = {
             'paperId': paper_id,
             'externalIds': json.dumps(paper.get('externalids', {})),
@@ -273,14 +271,13 @@ class SemanticScholarBulkLoader:
         self.paper_batch.append(paper_data)
         self.existing_papers_cache.add(paper_id)
         
-        # Process authors - FIXED: lowercase 'authorid'
+        # Process authors
         authors = paper.get('authors', []) or []
         for author in authors:
             author_id = author.get('authorid') or author.get('authorId')
             if author_id:
                 author_id_str = str(author_id)
                 
-                # Only add author if not in cache
                 if author_id_str not in self.existing_authors_cache:
                     author_data = {
                         'authorId': author_id_str,
@@ -289,13 +286,12 @@ class SemanticScholarBulkLoader:
                     self.author_batch.append(author_data)
                     self.existing_authors_cache.add(author_id_str)
                 
-                # WROTE relationship
                 self.wrote_batch.append({
                     'authorId': author_id_str,
                     'paperId': paper_id
                 })
         
-        # Process references - FIXED: lowercase
+        # Process references
         references = paper.get('references', []) or []
         for reference in references[:100]:
             ref_id = reference.get('corpusid')
@@ -324,7 +320,7 @@ class SemanticScholarBulkLoader:
             self.flush_wrote_batch()
         if len(self.cites_batch) >= self.batch_size:
             self.flush_cites_batch()
-    
+
     def flush_paper_batch(self):
         """Flush papers to Neo4j."""
         if not self.paper_batch:
@@ -352,9 +348,19 @@ class SemanticScholarBulkLoader:
                     p.createdAt = datetime()
                 ON MATCH SET
                     p.lastUpdated = datetime(),
-                    p.citationCount = CASE WHEN paper.citationCount IS NOT NULL 
-                                           THEN paper.citationCount 
-                                           ELSE p.citationCount END
+                    p.title = CASE WHEN paper.title IS NOT NULL THEN paper.title ELSE p.title END,
+                    p.abstract = CASE WHEN paper.abstract IS NOT NULL THEN paper.abstract ELSE p.abstract END,
+                    p.year = CASE WHEN paper.year IS NOT NULL THEN paper.year ELSE p.year END,
+                    p.publicationDate = CASE WHEN paper.publicationDate IS NOT NULL THEN paper.publicationDate ELSE p.publicationDate END,
+                    p.citationCount = CASE WHEN paper.citationCount IS NOT NULL THEN paper.citationCount ELSE p.citationCount END,
+                    p.referenceCount = CASE WHEN paper.referenceCount IS NOT NULL THEN paper.referenceCount ELSE p.referenceCount END,
+                    p.fieldsOfStudy = CASE WHEN paper.fieldsOfStudy IS NOT NULL AND SIZE(paper.fieldsOfStudy) > 0 THEN paper.fieldsOfStudy ELSE p.fieldsOfStudy END,
+                    p.publicationTypes = CASE WHEN paper.publicationTypes IS NOT NULL AND SIZE(paper.publicationTypes) > 0 THEN paper.publicationTypes ELSE p.publicationTypes END,
+                    p.venue = CASE WHEN paper.venue IS NOT NULL THEN paper.venue ELSE p.venue END,
+                    p.openAccessPdf = CASE WHEN paper.openAccessPdf IS NOT NULL THEN paper.openAccessPdf ELSE p.openAccessPdf END,
+                    p.externalIds = CASE WHEN paper.externalIds IS NOT NULL THEN paper.externalIds ELSE p.externalIds END,
+                    p.s2FieldsOfStudy = CASE WHEN paper.s2FieldsOfStudy IS NOT NULL THEN paper.s2FieldsOfStudy ELSE p.s2FieldsOfStudy END,
+                    p.publicationVenue = CASE WHEN paper.publicationVenue IS NOT NULL THEN paper.publicationVenue ELSE p.publicationVenue END
                 """
                 
                 session.run(query, batch=self.paper_batch)
@@ -454,14 +460,12 @@ class SemanticScholarBulkLoader:
         """
         logger.info(f"Processing file: {filepath}")
         
-        # Load existing papers cache on first file
         if not self.cache_loaded:
             self.load_existing_papers_cache()
             self.load_existing_authors_cache()
         
         initial_duplicates = self.stats['duplicates_skipped']
         
-        # Diagnostic counters
         total_lines = 0
         filtered_by_year = 0
         filtered_by_field = 0
@@ -475,7 +479,6 @@ class SemanticScholarBulkLoader:
                         paper = json.loads(line)
                         total_lines += 1
                         
-                        # Show first 3 papers for debugging
                         if sample_papers_shown < 3:
                             logger.info(f"\n=== SAMPLE PAPER {sample_papers_shown + 1} ===")
                             logger.info(f"Title: {paper.get('title', 'N/A')[:100]}")
@@ -484,18 +487,15 @@ class SemanticScholarBulkLoader:
                             logger.info(f"Corpus ID: {paper.get('corpusid')}")
                             sample_papers_shown += 1
                         
-                        # FIXED: Check for corpus ID (lowercase)
                         corpus_id = paper.get('corpusid')
                         if not corpus_id:
                             missing_corpus_id += 1
                             continue
                         
-                        # Check for duplicate before filtering (faster)
                         if str(corpus_id) in self.existing_papers_cache:
                             self.stats['duplicates_skipped'] += 1
                             continue
                         
-                        # Apply year filters
                         paper_year = paper.get('year')
                         if filter_year_min and paper_year:
                             if paper_year < filter_year_min:
@@ -507,12 +507,9 @@ class SemanticScholarBulkLoader:
                                 filtered_by_year += 1
                                 continue
                         
-                        # FIXED: Apply field filters using s2fieldsofstudy
                         if filter_fields:
                             paper_fields = paper.get('s2fieldsofstudy', []) or []
                             
-                            # Extract 'category' from s2fieldsofstudy objects
-                            # Format: [{"category": "Computer Science", "source": "s2-fos-model"}]
                             field_names = []
                             if isinstance(paper_fields, list):
                                 for field in paper_fields:
@@ -525,14 +522,11 @@ class SemanticScholarBulkLoader:
                                 filtered_by_field += 1
                                 continue
                         
-                        # Process paper
                         self._process_paper(paper)
                         self.stats['papers_processed'] += 1
                         
-                        # Periodic cache refresh
                         self.refresh_cache_if_needed()
                         
-                        # Periodic flush and logging
                         if self.stats['papers_processed'] % 10000 == 0:
                             self.flush_all_batches()
                             logger.info(f"Progress: {self.stats['papers_processed']:,} papers processed")
@@ -545,12 +539,10 @@ class SemanticScholarBulkLoader:
                         logger.error(f"Error processing line {line_num}: {e}")
                         continue
             
-            # Final flush
             self.flush_all_batches()
             
             duplicates_in_file = self.stats['duplicates_skipped'] - initial_duplicates
             
-            # Diagnostic summary
             logger.info(f"\n{'='*60}")
             logger.info(f"FILE PROCESSING SUMMARY: {os.path.basename(filepath)}")
             logger.info(f"{'='*60}")
@@ -585,13 +577,11 @@ class SemanticScholarBulkLoader:
                         citation = json.loads(line)
                         total_lines += 1
                         
-                        # Show first 3 citations for debugging
                         if citations_added < 3:
                             logger.info(f"\n=== SAMPLE CITATION {citations_added + 1} ===")
                             logger.info(f"Citing: {citation.get('citingcorpusid')}")
                             logger.info(f"Cited: {citation.get('citedcorpusid')}")
                         
-                        # Get citation pair (lowercase keys)
                         citing_id = citation.get('citingcorpusid')
                         cited_id = citation.get('citedcorpusid')
                         
@@ -599,7 +589,6 @@ class SemanticScholarBulkLoader:
                             missing_ids += 1
                             continue
                         
-                        # Add to batch
                         self.cites_batch.append({
                             'citingPaperId': str(citing_id),
                             'citedPaperId': str(cited_id)
@@ -607,11 +596,9 @@ class SemanticScholarBulkLoader:
                         
                         citations_added += 1
                         
-                        # Flush if batch size reached
                         if len(self.cites_batch) >= self.batch_size:
                             self.flush_cites_batch()
                         
-                        # Periodic logging
                         if citations_added % 100000 == 0:
                             self.flush_cites_batch()
                             logger.info(f"Progress: {citations_added:,} citations processed")
@@ -623,7 +610,6 @@ class SemanticScholarBulkLoader:
                         logger.error(f"Error processing line {line_num}: {e}")
                         continue
             
-            # Final flush
             self.flush_cites_batch()
             
             logger.info(f"\n{'='*60}")
@@ -636,6 +622,110 @@ class SemanticScholarBulkLoader:
             
         except Exception as e:
             logger.error(f"Failed to process citations file {filepath}: {e}")
+
+    def process_abstracts_file(self, filepath: str):
+        """
+        Process an abstracts JSONL.gz file and update existing papers in Neo4j.
+        
+        Args:
+            filepath: Path to the .gz abstracts file
+        """
+        logger.info(f"Processing abstracts file: {filepath}")
+        
+        total_lines = 0
+        abstracts_updated = 0
+        missing_corpus_id = 0
+        missing_abstract = 0
+        sample_shown = 0  # FIX: Track samples separately
+        
+        try:
+            abstract_batch = []
+            
+            with gzip.open(filepath, 'rt', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    try:
+                        record = json.loads(line)
+                        total_lines += 1
+                        
+                        # FIX: Show first 3 samples with valid data
+                        if sample_shown < 3:
+                            corpus_id_sample = record.get('corpusid')
+                            abstract_sample = record.get('abstract')
+                            if corpus_id_sample and abstract_sample:  # Only show valid samples
+                                logger.info(f"\n=== SAMPLE ABSTRACT {sample_shown + 1} ===")
+                                logger.info(f"Corpus ID: {corpus_id_sample}")
+                                logger.info(f"Abstract: {str(abstract_sample)[:100]}...")
+                                sample_shown += 1
+                        
+                        corpus_id = record.get('corpusid')
+                        abstract = record.get('abstract')
+                        
+                        if not corpus_id:
+                            missing_corpus_id += 1
+                            continue
+                        
+                        # FIX: Skip if abstract is None or empty
+                        if not abstract or abstract.strip() == "":
+                            missing_abstract += 1
+                            continue
+                        
+                        abstract_batch.append({
+                            'paperId': str(corpus_id),
+                            'abstract': abstract
+                        })
+                        
+                        abstracts_updated += 1
+                        
+                        if len(abstract_batch) >= self.batch_size:
+                            self._flush_abstract_batch(abstract_batch)
+                            abstract_batch.clear()
+                        
+                        if abstracts_updated % 10000 == 0:
+                            logger.info(f"Progress: {abstracts_updated:,} abstracts processed")
+                    
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON decode error at line {line_num}: {e}")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error processing line {line_num}: {e}")
+                        continue
+            
+            if abstract_batch:
+                self._flush_abstract_batch(abstract_batch)
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"ABSTRACTS FILE SUMMARY: {os.path.basename(filepath)}")
+            logger.info(f"{'='*60}")
+            logger.info(f"Total lines read: {total_lines:,}")
+            logger.info(f"Missing corpus ID: {missing_corpus_id:,}")
+            logger.info(f"Missing/empty abstracts: {missing_abstract:,}")  # FIX: Show this stat
+            logger.info(f"Abstracts updated: {abstracts_updated:,}")
+            logger.info(f"{'='*60}\n")
+            
+            self.stats['abstracts_updated'] += abstracts_updated
+            
+        except Exception as e:
+            logger.error(f"Failed to process abstracts file {filepath}: {e}")
+
+    
+    def _flush_abstract_batch(self, abstract_batch: List[Dict]):
+        """Flush abstract updates to Neo4j."""
+        if not abstract_batch:
+            return
+        
+        try:
+            with self.driver.session() as session:
+                query = """
+                UNWIND $batch AS item
+                MATCH (p:Paper {paperId: item.paperId})
+                SET p.abstract = item.abstract,
+                    p.lastUpdated = datetime()
+                """
+                
+                session.run(query, batch=abstract_batch)
+                logger.info(f"Updated {len(abstract_batch)} paper abstracts")
+        except Exception as e:
+            logger.error(f"Error flushing abstract batch: {e}")
     
     def process_all_papers(
         self,
@@ -653,7 +743,6 @@ class SemanticScholarBulkLoader:
             filter_year_max: Maximum year
             max_files: Maximum number of files to process
         """
-        # FIXED: Look for .gz files (not .jsonl.gz)
         files = sorted([f for f in os.listdir(self.download_dir) if f.endswith('.gz')])
         
         if not files:
@@ -709,18 +798,48 @@ class SemanticScholarBulkLoader:
         
         self.print_statistics()
     
+    def process_all_abstracts(self, max_files: Optional[int] = None):
+        """
+        Process all downloaded abstract files.
+        
+        Args:
+            max_files: Maximum number of files to process
+        """
+        files = sorted([f for f in os.listdir(self.download_dir) if f.endswith('.gz')])
+        
+        if not files:
+            logger.error(f"No .gz files found in {self.download_dir}")
+            return
+        
+        if max_files:
+            files = files[:max_files]
+        
+        logger.info(f"Found {len(files)} abstract files to process")
+        
+        for i, filename in enumerate(files, 1):
+            filepath = os.path.join(self.download_dir, filename)
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing abstract file {i}/{len(files)}: {filename}")
+            logger.info(f"{'='*60}")
+            
+            self.process_abstracts_file(filepath)
+        
+        self.print_statistics()
+    
     def print_statistics(self):
         """Print loading statistics."""
-        # Get actual counts from Neo4j
         try:
             with self.driver.session() as session:
                 paper_count = session.run("MATCH (p:Paper) RETURN count(p) as count").single()['count']
                 author_count = session.run("MATCH (a:Author) RETURN count(a) as count").single()['count']
                 cites_count = session.run("MATCH ()-[r:CITES]->() RETURN count(r) as count").single()['count']
                 wrote_count = session.run("MATCH ()-[r:WROTE]->() RETURN count(r) as count").single()['count']
+                papers_with_abstracts = session.run(
+                    "MATCH (p:Paper) WHERE p.abstract IS NOT NULL RETURN count(p) as count"
+                ).single()['count']
         except Exception as e:
             logger.error(f"Error getting database statistics: {e}")
-            paper_count = author_count = cites_count = wrote_count = 0
+            paper_count = author_count = cites_count = wrote_count = papers_with_abstracts = 0
         
         print("\n" + "="*60)
         print("BULK LOAD STATISTICS")
@@ -730,10 +849,12 @@ class SemanticScholarBulkLoader:
         print(f"Papers inserted (batch): {self.stats['papers_inserted']:,}")
         print(f"Authors inserted (batch): {self.stats['authors_inserted']:,}")
         print(f"Citations processed: {self.stats['citations_processed']:,}")
+        print(f"Abstracts updated: {self.stats['abstracts_updated']:,}")
         print("\n" + "-"*60)
         print("CURRENT DATABASE TOTALS")
         print("-"*60)
         print(f"Total Papers in DB: {paper_count:,}")
+        print(f"Papers with abstracts: {papers_with_abstracts:,}")
         print(f"Total Authors in DB: {author_count:,}")
         print(f"Total CITES relationships: {cites_count:,}")
         print(f"Total WROTE relationships: {wrote_count:,}")
@@ -761,6 +882,10 @@ Examples:
   python bulk_loader.py --api-key YOUR_KEY --neo4j-password PASS \\
     --dataset-type citations --download-dir ./s2_citations --batch-size 5000
 
+  # Download and process abstracts
+  python bulk_loader.py --api-key YOUR_KEY --neo4j-password PASS \\
+    --dataset-type abstracts --process-only
+
   # Download only (first run)
   python bulk_loader.py --api-key YOUR_KEY --neo4j-password PASS \\
     --download-only --max-files 5
@@ -786,7 +911,8 @@ Examples:
     parser.add_argument('--max-files', type=int, help='Max files to download/process')
     
     # Dataset type
-    parser.add_argument('--dataset-type', default='papers', choices=['papers', 'citations'], 
+    parser.add_argument('--dataset-type', default='papers', 
+                       choices=['papers', 'citations', 'abstracts'], 
                        help='Dataset type to download/process')
     
     # Operation mode
@@ -801,8 +927,8 @@ Examples:
     args = parser.parse_args()
     
     # Validation
-    if args.dataset_type == 'citations' and (args.filter_fields or args.year_min != 2018 or args.year_max != 2025):
-        logger.warning("⚠️  Filters (--filter-fields, --year-min, --year-max) are ignored for citation files!")
+    if args.dataset_type in ['citations', 'abstracts'] and (args.filter_fields or args.year_min != 2018 or args.year_max != 2025):
+        logger.warning("⚠️  Filters (--filter-fields, --year-min, --year-max) are ignored for citations and abstracts!")
     
     logger.info("="*60)
     logger.info("SEMANTIC SCHOLAR BULK LOADER")
@@ -823,7 +949,6 @@ Examples:
         sys.exit(1)
     
     try:
-        # FIXED: Only download if not process-only
         if not args.process_only:
             logger.info("\n" + "="*60)
             logger.info("DOWNLOAD PHASE")
@@ -832,7 +957,6 @@ Examples:
             loader.get_available_datasets(release_id)
             loader.download_dataset(release_id, args.dataset_type, max_files=args.max_files)
         
-        # FIXED: Only process if not download-only
         if not args.download_only:
             logger.info("\n" + "="*60)
             logger.info("PROCESSING PHASE")
@@ -846,8 +970,9 @@ Examples:
                     max_files=args.max_files
                 )
             elif args.dataset_type == 'citations':
-                # FIXED: Pass max_files argument
                 loader.process_all_citations(max_files=args.max_files)
+            elif args.dataset_type == 'abstracts':
+                loader.process_all_abstracts(max_files=args.max_files)
     
     except KeyboardInterrupt:
         logger.warning("\n\nInterrupted by user. Flushing remaining batches...")
@@ -856,7 +981,6 @@ Examples:
         logger.error(f"Error during execution: {e}", exc_info=True)
     finally:
         loader.close()
-
 
 
 if __name__ == "__main__":

@@ -571,32 +571,52 @@ class AdvancedGraphTraversalEnv:
             return np.zeros(self.text_dim, dtype=np.float32)
         
         paper_id = node.get('paper_id')
+        author_id = node.get('author_id')
         
         if paper_id and paper_id in self.precomputed_embeddings:
             return self.precomputed_embeddings[paper_id]
+        if author_id and author_id in self.precomputed_embeddings: 
+            return self.precomputed_embeddings[author_id]
         
-        title = str(node.get('title', '')) if node.get('title') else ''
+        node_text = None 
         
-        INVALID_TITLES = {'', 'NA', '...', 'Unknown', 'null', 'None', 'undefined'}
-        node_text = None
+        if paper_id: 
         
-        if title and title not in INVALID_TITLES and len(title) >= 3:
-            fields = str(node.get('fields', '')) if node.get('fieldsOfStudy') else ''
-            keywords = ', '.join(fields) if isinstance(fields, list) else str(fields)
-            abstract = str(node.get('abstract', '')) if node.get('abstract') else ''
-            abstract = abstract or ''  # FIXED: Handle None
-            pub_name = str(node.get('venue', '')) if node.get('venue') else ''
+            title = str(node.get('title', '')) if node.get('title') else ''
             
-            parts = [title]
-            if keywords:
-                parts.append(keywords)
-            if abstract and len(abstract) > 20:
-                parts.append(abstract[:500])
-            elif pub_name:
-                parts.append(pub_name)
+            INVALID_TITLES = {'', 'NA', '...', 'Unknown', 'null', 'None', 'undefined'}
             
-            node_text = ' '.join(parts).strip()
-        
+            if title and title not in INVALID_TITLES and len(title) >= 3:
+                fields = str(node.get('fields', '')) if node.get('fieldsOfStudy') else ''
+                keywords = ', '.join(fields) if isinstance(fields, list) else str(fields)
+                abstract = str(node.get('abstract', '')) if node.get('abstract') else ''
+                abstract = abstract or ''  # FIXED: Handle None
+                pub_name = str(node.get('venue', '')) if node.get('venue') else ''
+                
+                parts = [title]
+                if keywords:
+                    parts.append(keywords)
+                if abstract and len(abstract) > 20:
+                    parts.append(abstract[:500])
+                elif pub_name:
+                    parts.append(pub_name)
+                
+                node_text = ' '.join(parts).strip()
+            
+                
+        elif author_id: 
+            name = str(node.get('name' , '')) if node.get('name') else ''
+            
+            INVALID_NAMES = {'' , 'NA' , '...' , 'Unknown' , 'NULL' , 'null' , 'None' , 'undefined' , 'XYZ'}
+            if name and name not in INVALID_NAMES and len(name) > 1: 
+                paper_count = node.get('paper_count', 0)
+                h_index = node.get('h_index', 0)
+                
+                if paper_count or h_index:
+                    node_text = f"{name}, {paper_count} papers, h-index {h_index}"
+                else:
+                    node_text = f"Author: {name}"
+
         if not node_text or len(node_text) < 5:
             if paper_id:
                 node_text = f"Research paper {paper_id[-10:]}"
@@ -605,6 +625,7 @@ class AdvancedGraphTraversalEnv:
                     logging.warning(f"Node has no usable text: {paper_id}")
                 return np.zeros(self.text_dim, dtype=np.float32)
         
+            
         try:
             if hasattr(self.encoder, 'encode_with_cache'):
                 embedding = self.encoder.encode_with_cache(node_text, cache_keys=[paper_id])
@@ -623,8 +644,6 @@ class AdvancedGraphTraversalEnv:
         except Exception as e:
             logging.error(f"Encoding exception: {e}. Node: {paper_id}")
             return np.zeros(self.text_dim, dtype=np.float32)
-
-
 
 
 
@@ -679,11 +698,11 @@ class AdvancedGraphTraversalEnv:
             if collabs:
                 valid_relations.append(RelationType.COLLAB)
             
-            second_collabs = await self.store.get_second_degree_collaborators(author_id)
+            second_collabs = await self.store.get_second_degree_collaborators(author_id , limit = 20)
             if second_collabs:
                 valid_relations.append(RelationType.SECOND_COLLAB)
             
-            influence = await self.store.get_influence_path_papers(author_id)
+            influence = await self.store.get_influence_path_papers(author_id , limit = 10)
             if influence:
                 valid_relations.append(RelationType.INFLUENCE_PATH)
         
@@ -732,7 +751,7 @@ class AdvancedGraphTraversalEnv:
             
             if current_relation_name == focus:
                 manager_reward += 2.0
-                logging.info(f"✓ Manager chose query-aligned relation: {focus}")
+                logging.info(f"Manager chose query-aligned relation: {focus}")
             
 
             if self.current_query_facets.get('paper_operation') == 'citations':
@@ -780,9 +799,9 @@ class AdvancedGraphTraversalEnv:
         elif relation_type == RelationType.NEWER_CITED_BY and paper_id:
             raw_nodes = await self.store.get_newer_citations(paper_id)
         elif relation_type == RelationType.SECOND_COLLAB and author_id:
-            raw_nodes = await self.store.get_second_degree_collaborators(author_id)
+            raw_nodes = await self.store.get_second_degree_collaborators(author_id , limit=20)
         elif relation_type == RelationType.INFLUENCE_PATH and author_id:
-            raw_nodes = await self.store.get_influence_path_papers(author_id)
+            raw_nodes = await self.store.get_influence_path_papers(author_id , limit = 10)
         if relation_type == RelationType.STOP:
             if self.current_step < 5:
                 return False, -5.0 
