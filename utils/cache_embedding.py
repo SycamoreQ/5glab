@@ -95,7 +95,7 @@ def cache_embeddings():
             for sim, paper, pid in paper_scores[:200]:
                 refs = await store.get_references_by_paper(pid)
                 cites = await store.get_citations_by_paper(pid)
-                authors_list = await store.get_authors_by_paperid(pid)
+                authors_list = await store.get_author_by_id(pid)
                 
                 total_neighbors = len(refs or []) + len(cites or []) + len(authors_list or [])
                 

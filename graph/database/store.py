@@ -478,3 +478,4 @@ class EnhancedStore:
         """
         return await self._run_query_method(query, [author_name])
 
+    
