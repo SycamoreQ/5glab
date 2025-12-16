@@ -1,288 +1,457 @@
 import dspy
-from typing import Dict, Any, List, Optional , Literal
-from datetime import datetime
+from typing import List, Optional, Literal, Any, Dict, Tuple
 from pydantic import BaseModel, Field
-from unified import UnifiedQueryParser
-from pydantic import BaseModel
 
 
-class QueryFacets(BaseModel):
-    """Enhanced structured output for parsed query."""
+class Constraint(BaseModel):
+    """Single constraint on entities."""
+    field: str
+    operator: Literal['equals', 'contains', 'greater_than', 'less_than', 'between', 'in_list']
+    value: Any
     
-    semantic: str = Field(description="Core research topic/keywords")
-    temporal: Optional[List[int]] = Field(
-        default=None, 
-        description="Year range as [start_year, end_year] or null"
-    )
-    entities: List[str] = Field(
-        default_factory=list,
-        description="Key technical terms/topics"
-    )
+    def __str__(self):
+        return f"{self.field} {self.operator} {self.value}"
+
+class QueryIntent(BaseModel):
+    """Hierarchical query representation."""
+    target_entity: Literal['papers', 'authors', 'venues', 'collaborations', 'communities']
+    operation: Literal[
+        'find', 'citations', 'references', 'authors', 'papers', 
+        'collaborators', 'related', 'count', 'traverse'
+    ] = 'find'
+    semantic: str = ""
+    constraints: List[Constraint] = Field(default_factory=list)
+
+    author: Optional[str] = None
+    paper_title: Optional[str] = None
+    venue: Optional[str] = None
+    temporal: Optional[List[int]] = None
+    field_of_study: Optional[str] = None
+    min_citation_count: Optional[int] = None
+    max_citation_count: Optional[int] = None
+    min_author_count: Optional[int] = None
+    sort_by: Optional[str] = None
+    limit: Optional[int] = None
     
-    author: Optional[str] = Field(
-        default=None,
-        description="Author name if mentioned"
-    )
-    author_search_mode: bool = Field(
-        default=False,
-        description="True if query asks for author's work"
-    )
-    institutional: Optional[str] = Field(
-        default=None,
-        description="University/company affiliation"
-    )
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class ParseComplexQuery(dspy.Signature):
+    """Parse hierarchical research query into structured format.
     
-    venue: Optional[str] = Field(
-        default=None,
-        description="Conference/journal name"
-    )
+    IMPORTANT INSTRUCTIONS:
+    - target_entity: MUST be one of: papers, authors, venues, collaborations, communities
+    - operation: MUST be one of: find, citations, references, authors, papers, collaborators, related
+    - semantic: ONLY the core research topic (remove ALL constraints like venue, year, author names, citation counts)
+    - constraints_json: JSON array of constraints. Each constraint MUST have:
+      * field: venue, field_of_study, author, paper_title, citation_count, year, author_count
+      * operator: MUST be exactly one of: equals, contains, greater_than, less_than, between, in_list
+      * value: the constraint value
     
-    intent: Optional[str] = Field(
-        default=None,
-        description="One of: survey, methodology, application, theory, empirical, author_works, paper_navigation"
-    )
+    EXAMPLES:
     
-    paper_title: Optional[str] = Field(
-        default=None,
-        description="Specific paper title if mentioned (e.g., 'paper titled XYZ')"
-    )
+    Query: "Get me authors who wrote papers in 'IEEJ Transactions' in the field of Physics"
+    target_entity: authors
+    operation: find
+    semantic: Physics
+    constraints_json: [{"field": "venue", "operator": "contains", "value": "IEEJ Transactions"}, {"field": "field_of_study", "operator": "contains", "value": "Physics"}]
     
-    paper_search_mode: bool = Field(
-        default=False,
-        description="True if query is about a specific paper (not a topic search)"
-    )
+    Query: "papers on transformers with more than 100 citations from 2020-2023"
+    target_entity: papers
+    operation: find
+    semantic: transformers
+    constraints_json: [{"field": "citation_count", "operator": "greater_than", "value": 100}, {"field": "year", "operator": "between", "value": [2020, 2023]}]
     
-    paper_operation: Optional[Literal[
-        'citations',       # Papers citing this paper (CITED_BY)
-        'references',      # Papers cited by this paper (CITES)
-        'related',         # Similar papers
-        'coauthors',       # Authors of this paper
-        'venue_papers',    # Other papers in same venue
-        'find_paper'       # Just finding the paper itself
-    ]] = Field(
-        default=None,
-        description="Specific operation on a paper"
-    )
+    Query: "deep learning papers"
+    target_entity: papers
+    operation: find
+    semantic: deep learning
+    constraints_json: []
+    """
     
-    relation_focus: Optional[Literal[
-        'CITES',           # Focus on reference relationships
-        'CITED_BY',        # Focus on citation relationships
-        'WROTE',           # Focus on authorship
-        'COLLAB',          # Focus on collaborations
-        'PUBLISHED_IN',    # Focus on venue
-        'SAME_COMMUNITY'   # Focus on research communities
-    ]] = Field(
-        default=None,
-        description="Specific relationship type to explore"
-    )
+    query: str = dspy.InputField(desc="User's natural language research query")
     
-    hop_depth: Optional[int] = Field(
-        default=None,
-        description="Number of hops to traverse (e.g., 'second-order citations')"
-    )
+    # Output fields
+    target_entity: str = dspy.OutputField(desc="MUST be one of: papers, authors, venues, collaborations, communities")
+    operation: str = dspy.OutputField(desc="MUST be one of: find, citations, references, authors, papers, collaborators, related")
+    semantic: str = dspy.OutputField(desc="Core topic ONLY (no constraints)")
+    constraints_json: str = dspy.OutputField(desc='JSON array: [{"field": "venue", "operator": "contains", "value": "..."}]. Operator MUST be: equals, contains, greater_than, less_than, between, in_list')
 
 
 
-class ParseResearchQuery(dspy.Signature): 
-    query = dspy.InputField(desc = "Natural Language Research Query")
-    facets = dspy.OutputField(
-        desc = "Structured Query Facets as JSON with paper specific fields",
-        type = QueryFacets
-    )
-
-
-class OptimQueryParser(dspy.Module): 
-
-    def __init__(self , model:str = 'llama3.2' , use_optimized: bool = True ): 
+class HierarchicalQueryParser(dspy.Module):
+    """Modular hierarchical parser using DSPy with Ollama."""
+    
+    def __init__(self, use_cot: bool = True):
         super().__init__()
-        lm = dspy.LM(model , max_tokens=400)
-        dspy.configure(lm = lm )
-        self.parse = dspy.Predict(ParseResearchQuery)
-        self.current_year = datetime.now().year 
+        
 
-    def forward(self, query: str) -> QueryFacets:
-        """Parse query with paper-specific handling."""
-        
-        enhanced_query = f"{query} [Current year: {self.current_year}]"
-        
-        result = self.parse(query=enhanced_query)
-        
-        return result.facets
-    
-    def parse(self, query: str) -> Dict[str, Any]:
-        """Parse query and return dict (for unified interface)."""
-        facets = self.forward(query)
-        
-        # Convert Pydantic model to dict
-        if hasattr(facets, 'dict'):
-            result = facets.dict()
-        elif hasattr(facets, 'model_dump'):
-            result = facets.model_dump()
+        if use_cot:
+            self.parse = dspy.ChainOfThought(ParseComplexQuery)
         else:
-            result = dict(facets)
-        
-        result['original'] = query
-        
-        # Convert temporal list to tuple
-        if result.get('temporal') and isinstance(result['temporal'], list):
-            result['temporal'] = tuple(result['temporal'])
-        
-        return result
-    
+            self.parse = dspy.Predict(ParseComplexQuery)
 
-def create_training_examples() -> List[dspy.Example]:
-    """Enhanced examples including paper-specific queries."""
+    def _normalize_operator(self, op: str) -> str:
+        op = op.lower().strip()
+    
+        operator_map = {
+            'eq': 'equals',
+            '==': 'equals',
+            'equal': 'equals',
+            'equals': 'equals',
+            
+            'contains': 'contains',
+            'include': 'contains',
+            'includes': 'contains',
+            'in': 'contains',
+            
+            'gt': 'greater_than',
+            '>': 'greater_than',
+            'greater': 'greater_than',
+            'greater_than': 'greater_than',
+            'more_than': 'greater_than',
+            
+            'lt': 'less_than',
+            '<': 'less_than',
+            'less': 'less_than',
+            'less_than': 'less_than',
+            
+            'between': 'between',
+            'range': 'between',
+            
+            'in_list': 'in_list',
+            'one_of': 'in_list',
+        }
+        
+        return operator_map.get(op, 'contains') 
+    
+    def forward(self, query: str) -> QueryIntent:
+        """Parse query into QueryIntent."""
+        try:
+            result = self.parse(query=query)
+            
+            target_entity = result.target_entity.lower().strip()
+            operation = result.operation.lower().strip()
+            semantic = result.semantic.strip()
+            
+            constraints = []
+            try:
+                import json
+                constraints_str = result.constraints_json.strip()
+                if constraints_str.startswith('```'):
+                    constraints_str = constraints_str.split('```')[1]
+                    if constraints_str.startswith('json'):
+                        constraints_str = constraints_str[4:]
+                constraints_str = constraints_str.strip()
+                
+                constraints_data = json.loads(constraints_str)
+                for c in constraints_data:
+                    constraints.append(Constraint(**c))
+            except Exception as e:
+                print(f"[WARN] Constraint parsing failed: {e}")
+                pass
+            
+            # Validate target_entity
+            valid_targets = ['papers', 'authors', 'venues', 'collaborations', 'communities']
+            if target_entity not in valid_targets:
+                target_entity = 'papers'
+            
+            # Validate operation
+            valid_ops = ['find', 'citations', 'references', 'authors', 'papers', 'collaborators', 'related', 'count', 'traverse']
+            if operation not in valid_ops:
+                operation = 'find'
+            
+            # Build QueryIntent
+            intent = QueryIntent(
+                target_entity=target_entity,
+                operation=operation,
+                semantic=semantic,
+                constraints=constraints
+            )
+            
+            # Extract legacy fields
+            for constraint in constraints:
+                if constraint.field == 'venue':
+                    intent.venue = str(constraint.value)
+                elif constraint.field == 'author':
+                    intent.author = str(constraint.value)
+                elif constraint.field == 'paper_title':
+                    intent.paper_title = str(constraint.value)
+                elif constraint.field == 'field_of_study':
+                    intent.field_of_study = str(constraint.value)
+                elif constraint.field == 'year' and constraint.operator == 'between':
+                    intent.temporal = constraint.value
+                elif constraint.field == 'citation_count' and constraint.operator == 'greater_than':
+                    intent.min_citation_count = int(constraint.value)
+            
+            return intent
+            
+        except Exception as e:
+            print(f"[ERROR] DSPy parsing failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fallback
+            return QueryIntent(
+                target_entity='papers',
+                operation='find',
+                semantic=query,
+                constraints=[]
+            )
+
+def create_hierarchical_examples() -> List[dspy.Example]:
+    """Create training examples for DSPy optimization."""
     
     examples = [
         dspy.Example(
-            query="what is the recent publication by author XYZ",
-            facets=QueryFacets(
-                semantic="publications",
-                temporal=[2021, 2024],
-                author="XYZ",
-                author_search_mode=True,
-                intent="author_works"
-            )
-        ).with_inputs("query"),
+            query="deep learning papers",
+            target_entity='papers',
+            operation='find',
+            semantic='deep learning',
+            constraints_json='[]'
+        ).with_inputs('query'),
         
         dspy.Example(
-            query="deep learning papers on medical imaging from Stanford 2020-2023",
-            facets=QueryFacets(
-                semantic="deep learning medical imaging",
-                temporal=[2020, 2023],
-                institutional="Stanford",
-                intent="application",
-                entities=["deep learning", "medical imaging"]
-            )
-        ).with_inputs("query"),
+            query="Get me authors who wrote papers in 'IEEJ Transactions' in the field of Physics",
+            target_entity='authors',
+            operation='find',
+            semantic='Physics',
+            constraints_json='[{"field": "venue", "operator": "contains", "value": "IEEJ Transactions"}, {"field": "field_of_study", "operator": "contains", "value": "Physics"}]'
+        ).with_inputs('query'),
         
         dspy.Example(
-            query="Get me the citations of this paper titled Attention Is All You Need",
-            facets=QueryFacets(
-                semantic="",  # Not a topic search
-                paper_title="Attention Is All You Need",
-                paper_search_mode=True,
-                paper_operation="citations",
-                relation_focus="CITED_BY",
-                intent="paper_navigation"
-            )
-        ).with_inputs("query"),
+            query="papers on transformers with more than 100 citations from 2020-2023",
+            target_entity='papers',
+            operation='find',
+            semantic='transformers',
+            constraints_json='[{"field": "citation_count", "operator": "greater_than", "value": 100}, {"field": "year", "operator": "between", "value": [2020, 2023]}]'
+        ).with_inputs('query'),
         
         dspy.Example(
-            query="what papers does the BERT paper cite",
-            facets=QueryFacets(
-                semantic="",
-                paper_title="BERT",
-                paper_search_mode=True,
-                paper_operation="references",
-                relation_focus="CITES",
-                intent="paper_navigation"
-            )
-        ).with_inputs("query"),
+            query="papers that cite BERT",
+            target_entity='papers',
+            operation='citations',
+            semantic='',
+            constraints_json='[{"field": "paper_title", "operator": "equals", "value": "BERT"}]'
+        ).with_inputs('query'),
         
         dspy.Example(
-            query="show me papers similar to AlexNet",
-            facets=QueryFacets(
-                semantic="convolutional neural networks image classification",  # Infer topic
-                paper_title="AlexNet",
-                paper_search_mode=True,
-                paper_operation="related",
-                intent="paper_navigation"
-            )
-        ).with_inputs("query"),
-        
-        dspy.Example(
-            query="who are the authors of ImageNet Classification with Deep Convolutional Neural Networks",
-            facets=QueryFacets(
-                semantic="",
-                paper_title="ImageNet Classification with Deep Convolutional Neural Networks",
-                paper_search_mode=True,
-                paper_operation="coauthors",
-                relation_focus="WROTE",
-                intent="paper_navigation"
-            )
-        ).with_inputs("query"),
-        
-        dspy.Example(
-            query="find papers that cite ResNet and are published in CVPR",
-            facets=QueryFacets(
-                semantic="",
-                paper_title="ResNet",
-                paper_search_mode=True,
-                paper_operation="citations",
-                venue="CVPR",
-                relation_focus="CITED_BY",
-                intent="paper_navigation"
-            )
-        ).with_inputs("query"),
-        
-        dspy.Example(
-            query="what are the second-order citations of the GPT-3 paper",
-            facets=QueryFacets(
-                semantic="",
-                paper_title="GPT-3",
-                paper_search_mode=True,
-                paper_operation="citations",
-                relation_focus="CITED_BY",
-                hop_depth=2,
-                intent="paper_navigation"
-            )
-        ).with_inputs("query"),
-        
-        dspy.Example(
-            query="references of Transformer paper from 2020 onwards",
-            facets=QueryFacets(
-                semantic="",
-                paper_title="Transformer",
-                paper_search_mode=True,
-                paper_operation="references",
-                relation_focus="CITES",
-                temporal=[2020, 2024],
-                intent="paper_navigation"
-            )
-        ).with_inputs("query"),
-        
-        dspy.Example(
-            query="papers on attention mechanisms that cite the Transformer paper",
-            facets=QueryFacets(
-                semantic="attention mechanisms",
-                paper_title="Transformer",
-                paper_search_mode=True, 
-                paper_operation="citations",
-                relation_focus="CITED_BY",
-                entities=["attention mechanisms"],
-                intent="paper_navigation"
-            )
-        ).with_inputs("query"),
-    
-
-        dspy.Example(
-            query = "who has author XYZ collaborted with in the year 2020?",
-            facets = QueryFacets(
-                semantic="",
-                temporal=[2020],
-                author="XYZ",
-                relation_focus= "COLLAB",
-                intent="author_collab",
-            )
-        ).with_inputs("query"), 
+            query="collaborators of Yann LeCun who published in NeurIPS",
+            target_entity='authors',
+            operation='collaborators',
+            semantic='',
+            constraints_json='[{"field": "author", "operator": "equals", "value": "Yann LeCun"}, {"field": "venue", "operator": "contains", "value": "NeurIPS"}]'
+        ).with_inputs('query'),
     ]
     
     return examples
 
+class DSPyHierarchicalParser:
+    """
+    DSPy-based parser with proper Ollama integration.
+    """
+    
+    def __init__(self, model: str = "llama3.2", optimize: bool = False):
+        try:
+            lm = dspy.LM(
+                model=f'ollama_chat/{model}',
+                api_base='http://localhost:11434',
+                temperature=0.1,
+                max_tokens=600
+            )
+            dspy.configure(lm=lm)
+            print(f"[DSPy] Configured with Ollama model: {model}")
+            
+        except Exception as e:
+            print(f"[ERROR] DSPy LM configuration failed: {e}")
+            print("[INFO] Falling back to direct ollama/ prefix...")
+            
+            try:
+                lm = dspy.LM(
+                    model=f'ollama/{model}',
+                    api_base='http://localhost:11434',
+                    temperature=0.1,
+                    max_tokens=600
+                )
+                dspy.configure(lm=lm)
+                print(f"[DSPy] Configured with fallback method")
+            except Exception as e2:
+                print(f"[ERROR] Both methods failed: {e2}")
+                raise
+
+        self.parser = HierarchicalQueryParser(use_cot=True)
+
+        if optimize:
+            print("[DSPy] Optimizing parser with examples...")
+            examples = create_hierarchical_examples()
+            
+            try:
+                from dspy.teleprompt import BootstrapFewShot
+                
+                def metric(example, pred, trace=None):
+                    score = 0.0
+                    if hasattr(pred, 'target_entity') and example.target_entity:
+                        if pred.target_entity.lower() == example.target_entity.lower():
+                            score += 50.0
+                    if hasattr(pred, 'operation') and example.operation:
+                        if pred.operation.lower() == example.operation.lower():
+                            score += 50.0
+                    return score
+                
+                optimizer = BootstrapFewShot(
+                    metric=metric,
+                    max_bootstrapped_demos=3,
+                    max_labeled_demos=3
+                )
+                
+                self.parser = optimizer.compile(
+                    self.parser,
+                    trainset=examples
+                )
+                print("[DSPy] Optimization complete!")
+                
+            except Exception as e:
+                print(f"[WARN] Optimization failed: {e}. Using unoptimized parser.")
+    
+    def parse(self, query: str) -> QueryIntent:
+        """Parse query using DSPy."""
+        return self.parser(query=query)
+    
+    def to_dict(self, intent: QueryIntent) -> Dict[str, Any]:
+        """Convert to dict."""
+        return {
+            'target_entity': intent.target_entity,
+            'operation': intent.operation,
+            'semantic': intent.semantic,
+            'constraints': [
+                {'field': c.field, 'operator': c.operator, 'value': c.value}
+                for c in intent.constraints
+            ],
+            'author': intent.author,
+            'paper_title': intent.paper_title,
+            'venue': intent.venue,
+            'temporal': intent.temporal,
+            'field_of_study': intent.field_of_study,
+            'min_citation_count': intent.min_citation_count,
+        }
 
 
-def parsing_metric(example , prediction , trace = None) -> float: 
-    gold = example.facets
-    pred = prediction.facets 
+class HierarchicalRewardMapper:
+    """Enhanced reward mapper for hierarchical queries."""
+    
+    def __init__(self, config):
+        self.config = config
+    
+    def get_manager_reward(
+        self,
+        relation_type: int,
+        query_intent: QueryIntent,
+        current_node: Dict[str, Any]
+    ) -> Tuple[float, str]:
+        """Calculate manager reward."""
+        from RL.env import RelationType
+        
+        reward = 0.0
+        reasons = []
+        
+        if query_intent.operation == 'citations':
+            if relation_type == RelationType.CITED_BY:
+                reward += 25.0
+                reasons.append("op:citations")
+        elif query_intent.operation == 'references':
+            if relation_type == RelationType.CITES:
+                reward += 25.0
+                reasons.append("op:references")
+        elif query_intent.operation == 'authors':
+            if relation_type == RelationType.WROTE:
+                reward += 25.0
+                reasons.append("op:authors")
+        elif query_intent.operation == 'collaborators':
+            if relation_type == RelationType.COLLAB:
+                reward += 25.0
+                reasons.append("op:collab")
+        
+        if query_intent.target_entity == 'authors':
+            if relation_type in [RelationType.WROTE, RelationType.AUTHORED]:
+                reward += 15.0
+                reasons.append("target:authors")
 
-    score = 0.0
-    total_fields = 0
-
-    fields = [
-        'semantic', 'author', 'author_search_mode', 'institutional', 
-        'venue', 'intent', 'paper_title', 'paper_search_mode', 
-        'paper_operation', 'relation_focus'
-    ]
+        for constraint in query_intent.constraints:
+            if constraint.field == 'venue' and relation_type == RelationType.VENUE_JUMP:
+                reward += 15.0
+                reasons.append(f"venue:{str(constraint.value)[:15]}")
+            elif constraint.field == 'field_of_study' and relation_type == RelationType.KEYWORD_JUMP:
+                reward += 12.0
+                reasons.append(f"field:{str(constraint.value)[:15]}")
+        
+        return reward, " | ".join(reasons) if reasons else "none"
     
 
+
+    def get_worker_reward(
+        self,
+        node: Dict[str, Any],
+        query_intent: QueryIntent,
+        semantic_sim: float
+    ) -> Tuple[float, str]:
+        """Calculate worker reward checking constraints."""
+        reward = 0.0
+        reasons = []
+        
+        paper_id = node.get('paper_id') or node.get('paperId')
+        author_id = node.get('author_id') or node.get('authorId')
+        
+        for constraint in query_intent.constraints:
+            if constraint.field == 'venue':
+                node_venue = (node.get('venue', '') or node.get('publicationName', '')).lower()
+                constraint_value = str(constraint.value).lower()
+                
+                if constraint.operator == 'contains':
+                    if constraint_value in node_venue:
+                        reward += 20.0
+                        reasons.append(f"✓venue")
+                    else:
+                        reward -= 15.0
+                        reasons.append(f"✗venue")
+            
+            elif constraint.field == 'field_of_study':
+                node_fields = node.get('fieldsOfStudy', []) or node.get('fields', [])
+                if isinstance(node_fields, list):
+                    match = any(str(constraint.value).lower() in str(f).lower() for f in node_fields)
+                    if match:
+                        reward += 18.0
+                        reasons.append(f"✓field")
+                    else:
+                        reward -= 12.0
+                        reasons.append(f"✗field")
+            
+            elif constraint.field == 'citation_count':
+                cit_count = node.get('citationCount', 0)
+                if constraint.operator == 'greater_than':
+                    if cit_count > constraint.value:
+                        reward += 15.0
+                        reasons.append(f"✓cit:{cit_count}")
+                    else:
+                        reward -= 20.0
+                        reasons.append(f"✗cit:{cit_count}")
+            
+            elif constraint.field == 'year':
+                paper_year = node.get('year')
+                if constraint.operator == 'between' and paper_year:
+                    start, end = constraint.value
+                    if start <= paper_year <= end:
+                        reward += 12.0
+                        reasons.append(f"✓year:{paper_year}")
+                    else:
+                        reward -= 15.0
+                        reasons.append(f"✗year:{paper_year}")
+        
+        if query_intent.constraints:
+            passed = sum(1 for r in reasons if r.startswith('✓'))
+            total = len(query_intent.constraints)
+            if passed == total:
+                reward += 30.0
+                reasons.append(f"✓✓ALL({passed})")
+        
+        return reward, " | ".join(reasons) if reasons else "none"

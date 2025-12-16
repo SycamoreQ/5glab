@@ -7,52 +7,42 @@ from sentence_transformers import SentenceTransformer
 from RL.ddqn import DDQLAgent
 from RL.env import AdvancedGraphTraversalEnv, RelationType
 from graph.database.store import EnhancedStore
-from model.llm.parser.unified import UnifiedQueryParser, ParserType  
+from RL.dspy_hierarchical_parser import DSPyHierarchicalParser, HierarchicalRewardMapper
 import math
 
 COMPLEX_QUERIES = [
-    # Semantic
     "deep learning transformers",
-    
-    # Paper operations
     "citations of Attention Is All You Need paper",
     "papers that cite BERT",
     "references of ResNet paper",
     "who are the authors of ImageNet paper",
-    
-    # Author operations
     "recent papers by Geoffrey Hinton",
     "collaborators of Yann LeCun",
     "papers by Yoshua Bengio on deep learning",
-    
-    # Constraints
     "papers on computer vision with more than 100 citations",
     "recent NLP papers published in ACL",
     "deep learning papers from Stanford 2020-2023",
-    
-    # Multi-hop
     "second-order citations of GPT-3 paper",
+    "Get me authors who wrote papers in 'IEEJ Transactions' in the field of Physics",
+    "papers on transformers with more than 100 citations from 2020-2023",
+    "collaborators of Yann LeCun who published in NeurIPS"
 ]
 
 async def load_training_cache():
-    """Load the training cache."""
     print("Loading training cache...")
     
     cache_dir = 'training_cache'
     
-    # Load papers
     papers_file = os.path.join(cache_dir, 'training_papers_1M.pkl')
     with open(papers_file, 'rb') as f:
         papers = pickle.load(f)
     print(f"✓ Loaded {len(papers):,} papers")
     
-    # Load edge cache
     edges_file = os.path.join(cache_dir, 'edge_cache_1M.pkl')
     with open(edges_file, 'rb') as f:
         edge_cache = pickle.load(f)
     print(f"✓ Loaded edge cache with {sum(len(e) for e in edge_cache.values())//2:,} edges")
     
-    # Load paper ID set
     index_file = os.path.join(cache_dir, 'paper_id_set_1M.pkl')
     with open(index_file, 'rb') as f:
         paper_id_set = pickle.load(f)
@@ -76,7 +66,6 @@ async def build_embeddings():
     embeddings = encoder.cache 
     embeddings = {str(k): v for k, v in embeddings.items()}
 
-
     edge_cache_str = {}
     for src, edges in edge_cache.items():
         src = str(src)
@@ -87,27 +76,21 @@ async def build_embeddings():
     
     return papers, edge_cache, paper_id_set, embeddings, encoder
 
-
 async def prepare_query_pools(encoder, papers, paper_id_set):
-    """Pre-compute query pools for faster training."""
     print("\nPreparing query pools...")
     
     query_pools = {}
     
     for query in COMPLEX_QUERIES:
-        # Encode query
         query_emb = encoder.encode([query])[0]
         
-        # Score all papers
         scored_papers = []
         for paper in papers:
             pid = str(paper.get('paperId') or paper.get('paper_id'))
             
-            # Skip if not in graph
             if pid not in paper_id_set:
                 continue
             
-            # Skip if no embedding
             if pid not in encoder.cache:
                 continue
             
@@ -118,39 +101,29 @@ async def prepare_query_pools(encoder, papers, paper_id_set):
             
             scored_papers.append((sim, paper))
         
-        # Sort by similarity
         scored_papers.sort(key=lambda x: x[0], reverse=True)
         
-        # Store top papers
         query_pools[query] = [p for _, p in scored_papers[:100]] 
         
         print(f"  {query[:50]:50s} -> {len(query_pools[query]):3d} papers (max_sim: {scored_papers[0][0]:.3f})")
     
     return query_pools
 
-
 async def train():
-    """Main training loop."""
-    query = np.random.choice(COMPLEX_QUERIES)
-    
     papers, edge_cache, paper_id_set, embeddings, encoder = await build_embeddings()
     
     store = EnhancedStore(pool_size=10)
-
-
-    query_parser = UnifiedQueryParser(
-        primary_parser=ParserType.RULE_BASED, 
-        fallback_on_error=True
-    )
-    print("✓ Loaded query parser")
 
     env = AdvancedGraphTraversalEnv(
         store, 
         precomputed_embeddings=embeddings,
         use_communities=False,  
         use_feedback=False,
+        use_query_parser=True,
+        parser_type='dspy', 
         require_precomputed_embeddings=True
     )
+    
     embedded_ids = set(embeddings.keys())
     env.training_paper_ids = embedded_ids  
     
@@ -180,7 +153,7 @@ async def train():
         title = p.get('title') or 'Unknown Title' 
         paper_titles[pid] = title
 
-    for query in QUERIES[:3]:  # Check first 3 queries
+    for query in COMPLEX_QUERIES[:3]:
         print(f"\n📊 Query: '{query}'")
         print("-" * 80)
         
@@ -216,13 +189,13 @@ async def train():
     )
     
     print("\n" + "="*80)
-    print("🚀 STARTING TRAINING")
+    print("STARTING TRAINING")
     print("="*80)
     print(f"Training papers: {len(papers):,}")
     print(f"Embeddings: {len(embeddings):,}")
     print(f"Dense subgraph: {len(env.training_paper_ids):,} papers")
     print(f"Edge cache: {sum(len(e) for e in env.training_edge_cache.values()):,} edges")
-    print(f"Queries: {len(QUERIES)}")
+    print(f"Queries: {len(COMPLEX_QUERIES)}")
     print(f"Max steps per episode: 8")
     print(f"Target episodes: 500")
     print("="*80 + "\n")
@@ -233,24 +206,14 @@ async def train():
     dead_end_count = 0
     success_count = 0
     
-    for episode in range(500):  
-        query = np.random.choice(QUERIES)
+    for episode in range(500):
+        query = np.random.choice(COMPLEX_QUERIES)
         paper_pool = query_pools[query]
         
         if not paper_pool:
             print(f"[SKIP] No papers for query: {query}")
             continue
         
-        query_facets = query_parser.parse(query)
-        query_mode = 'semantic' 
-        
-
-        if query_facets.get('author_search_mode'):
-            query_mode = 'author'
-        elif query_facets.get('paper_search_mode'):
-            query_mode = 'paper'
-        
-
         start_idx = np.random.choice(min(10, len(paper_pool)))
         start_paper = paper_pool[start_idx]
         start_paper_id = str(start_paper.get('paperId') or start_paper.get('paper_id'))
@@ -304,7 +267,6 @@ async def train():
                         done = True
                         break
 
-                    # Manager step
                     relation_type = int(np.random.choice(manager_actions))
                     is_terminal, manager_reward = await env.manager_step(relation_type)
                     episode_reward += manager_reward
@@ -313,10 +275,8 @@ async def train():
                         done = True
                         break
 
-                    # Get worker actions
                     worker_actions = await env.get_worker_actions()
                     
-                    # Filter to only embedded papers
                     worker_actions = [
                         (n, r) for (n, r) in worker_actions
                         if str(n.get("paperid") or n.get("paperId") or n.get("paper_id")) in embedded_ids
@@ -328,21 +288,17 @@ async def train():
                 if done or not worker_actions:
                     break
 
-                # Limit actions
                 worker_actions = worker_actions[:5]
                 
-                # Agent selects action
                 best_action = agent.act(state, worker_actions, max_actions=5)
                 if not best_action:
                     break
 
-                # Execute worker step
                 chosen_node, _ = best_action
                 next_state, worker_reward, done = await env.worker_step(chosen_node)
                 episode_reward += worker_reward
                 steps += 1
                 
-                # Store experience
                 next_actions = await env.get_worker_actions() if not done else []
                 next_actions = [
                     (n, r) for n, r in next_actions 
@@ -370,7 +326,6 @@ async def train():
         if len(agent.memory) >= agent.batch_size:
             loss = agent.replay()
         
-        # Update target network
         if episode % 10 == 0 and episode > 0:
             agent.update_target()
         
@@ -404,6 +359,10 @@ async def train():
             print(f"  Success rate:   {success_rate:.1f}% (sim > 0.5)")
             print(f"  Dead ends:      {dead_end_rate:.1f}%")
             print(f"  Loss: {loss:.4f} | ε: {agent.epsilon:.3f}")
+            
+            if env.query_intent:
+                print(f"  Parsed: {env.query_intent.target_entity}/{env.query_intent.operation} | {len(env.query_intent.constraints)} constraints")
+            
             print(f"{'='*70}\n")
         
         if (episode + 1) % 100 == 0:

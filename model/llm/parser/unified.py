@@ -1,4 +1,5 @@
-from typing import Dict, Any, Optional , Tuple
+from typing import Dict, Any, Optional , Tuple , Literal , List
+from pydantic import BaseModel, Field
 from enum import Enum , IntEnum
 import logging
 import numpy as np
@@ -18,6 +19,57 @@ class RelationType(IntEnum):
     SECOND_COLLAB = 10
     STOP = 11
     INFLUENCE_PATH = 12
+
+
+class Constraint: 
+    field: str  # 'venue', 'year', 'field', 'citation_count', etc.
+    operator: Literal['equals', 'contains', 'greater_than', 'less_than', 'between', 'in_list']
+    value: Any
+    
+    def __str__(self):
+        return f"{self.field} {self.operator} {self.value}"
+
+class QueryIntent: 
+    target_entity = Literal['paper' , 'authors' , 'venues' , 'collaborations' , 'subjects' , 'communities']
+    operations: Optional[Literal[
+        'find',           # Find entities matching criteria
+        'citations',      # Get citations
+        'references',     # Get references
+        'authors',        # Get authors of papers
+        'papers',         # Get papers by authors
+        'collaborators',  # Get collaborators
+        'related',        # Get related entities
+        'count',          # Count entities
+        'traverse'        # Multi-hop traversal
+    ]] = 'find'
+
+    semantic: str = ""
+    
+    # Constraints (can be nested)
+    constraints: List[Constraint] = Field(default_factory=list)
+    
+    # Multi-step chain (e.g., "authors who wrote papers that cite X")
+    chain: Optional[List['QueryIntent']] = None
+    
+    # Original fields (for compatibility)
+    author: Optional[str] = None
+    paper_title: Optional[str] = None
+    venue: Optional[str] = None
+    temporal: Optional[List[int]] = None
+    field_of_study: Optional[str] = None
+    
+    # Aggregation/filtering
+    min_citation_count: Optional[int] = None
+    max_citation_count: Optional[int] = None
+    min_author_count: Optional[int] = None
+    max_author_count: Optional[int] = None
+    
+    # Sorting
+    sort_by: Optional[Literal['relevance', 'citations', 'year', 'h_index']] = None
+    limit: Optional[int] = None
+    
+    class Config:
+        arbitrary_types_allowed = True
 
 
 class ParserType(Enum):
@@ -466,3 +518,5 @@ class QueryRewardCalculator:
         from difflib import SequenceMatcher
         similarity = SequenceMatcher(None, str1, str2).ratio()
         return similarity >= threshold
+    
+    

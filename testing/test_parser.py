@@ -1,40 +1,29 @@
-"""Test paper-specific query parsing."""
+# testing/test_parser.py
+from model.llm.parser.dspy_parser import DSPyHierarchicalParser
 
-from model.llm.parser.dspy_parser import OptimQueryParser
-
-
-def test_paper_queries():
-    parser = OptimQueryParser()
+def test():
+    parser = DSPyHierarchicalParser(model="llama3.2", optimize=False)
     
-    test_queries = [
-        "Get me the citations of this paper titled Attention Is All You Need",
-        "what papers does the BERT paper cite",
-        "show me papers similar to AlexNet",
-        "who are the authors of ImageNet Classification paper",
-        "find papers that cite ResNet and are published in CVPR",
-        "what are the second-order citations of GPT-3",
-        "references of Transformer paper from 2020 onwards",
-    ]
+    query = "Get me authors who wrote papers in 'IEEJ Transactions' in the field of Physics with more than 50 citations"
     
-    print("\n" + "="*80)
-    print("PAPER-SPECIFIC QUERY PARSING TEST")
-    print("="*80)
+    print(f"Query: {query}\n")
+    intent = parser.parse(query)
     
-    for query in test_queries:
-        print(f"\nQuery: {query}")
-        print("-" * 80)
-        
-        facets = parser.parse(query)
-        
-        print(f"  Paper title: {facets['paper_title']}")
-        print(f"  Paper-centric: {facets['paper_search_mode']}")
-        print(f"  Operation: {facets['paper_operation']}")
-        print(f"  Relation focus: {facets['relation_focus']}")
-        print(f"  Hop depth: {facets['hop_depth']}")
-        print(f"  Semantic: {facets['semantic']}")
-        print(f"  Temporal: {facets['temporal']}")
-        print(f"  Venue: {facets['venue']}")
-
+    print(f"Target Entity: {intent.target_entity}")
+    print(f"Operation: {intent.operation}")
+    print(f"Semantic: {intent.semantic}")
+    print(f"Constraints ({len(intent.constraints)}):")
+    for c in intent.constraints:
+        print(f"  • {c}")
+    
+    # Expected output:
+    # Target Entity: authors
+    # Operation: find
+    # Semantic: Physics
+    # Constraints (3):
+    #   • venue contains IEEJ Transactions
+    #   • field_of_study contains Physics
+    #   • citation_count greater_than 50
 
 if __name__ == "__main__":
-    test_paper_queries()
+    test()

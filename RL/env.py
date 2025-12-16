@@ -12,6 +12,7 @@ from model.llm.parser.unified import ParserType , UnifiedQueryParser , QueryRewa
 from utils.attention_selector import HybridAttentionSelector
 from RL.curiousity import CuriosityModule
 import random
+from model.llm.parser.dspy_parser import DSPyHierarchicalParser , QueryIntent , HierarchicalRewardMapper
 
 try:
     from graph.database.comm_det import CommunityDetector
@@ -205,13 +206,23 @@ class AdvancedGraphTraversalEnv:
             model="llama3.2",
             fallback_on_error=True 
         )
-        
-        self.reward_mapper = QueryRewardCalculator(self.config)
-        self.current_query_facets = None
-        self.query_facets = {}
-        self.current_query_mode = 'semantic' # 'semantic', 'author', 'paper', 'community'
 
-        
+        if use_query_parser and parser_type == "dspy":
+            self.query_parser = DSPyHierarchicalParser(
+                model="llama3.2",
+                optimize=False 
+            )
+            self.reward_mapper = HierarchicalRewardMapper(self.config)
+            self.query_intent = None
+            print("[ENV] Using DSPy hierarchical parser")
+        else:
+            self.query_parser = None
+            self.reward_mapper = None
+            self.query_intent = None
+
+        self.hierarchical_reward_mapper = HierarchicalRewardMapper(self.config)
+        self.query_intent: Optional[QueryIntent] = None
+
         if use_manager_policy: 
             from RL.manager_policy import AdaptiveManagerPolicy
             self.manager_policy = AdaptiveManagerPolicy(state_dim=self.state_dim)
@@ -518,197 +529,21 @@ class AdvancedGraphTraversalEnv:
         div = 1 - avg_sim
         div_reward = max(0 , div*20)
         return div_reward 
-         
-    def _determine_query_mode(self , force_mode: Optional[str] = None) -> str: 
-        if force_mode: 
-            return force_mode
-        
-        if self.query_facets.get('author_search_mode') and self.query_facets.get('author'):
-            return 'author'
-        
-        if self.query_facets.get('paper_search_mode') and self.query_facets.get('paper_title'):
-            return 'paper'
-        
-        if self.query_facets.get('relation_focus') == 'SAME_COMMUNITY':
-            return 'community'
-
-        return 'semantic'
-    
-    async def _initialize_author_query(self) -> Optional[Dict]:
-        author_name = self.query_facets.get('author')
-        if not author_name:
-            return None
-        
-        print(f"  [INIT] Searching for author: {author_name}")
-        
-        # Search for author in Neo4j
-        query = """
-        MATCH (a:Author)
-        WHERE toLower(a.name) CONTAINS toLower($1)
-        RETURN a.authorId as author_id,
-               a.name as name,
-               a.paperCount as paper_count,
-               a.citationCount as citation_count,
-               a.hIndex as h_index
-        ORDER BY a.citationCount DESC
-        LIMIT 1
-        """
-        
-        try:
-            result = await self.store._run_query_method(query, [author_name])
-            if result and len(result) > 0:
-                author = result[0]
-                print(f"  [FOUND] Author: {author['name']} (papers: {author.get('paper_count', 'N/A')})")
-                return {
-                    'author_id': author['author_id'],
-                    'name': author['name'],
-                    'paperCount': author.get('paper_count', 0),
-                    'citationCount': author.get('citation_count', 0),
-                    'hIndex': author.get('h_index', 0)
-                }
-        except Exception as e:
-            print(f"  [ERROR] Author search failed: {e}")
-        
-        return None
-    
-    async def _initialize_paper_query(self) -> Optional[Dict]:
-        paper_title = self.query_facets.get('paper_title')
-        if not paper_title:
-            return None
-        
-        print(f"  [INIT] Searching for paper: {paper_title}")
-        
-        # Search for paper in Neo4j
-        query = """
-        MATCH (p:Paper)
-        WHERE toLower(p.title) CONTAINS toLower($1)
-        RETURN p.paperId as paper_id,
-               p.title as title,
-               p.abstract as abstract,
-               p.year as year,
-               p.citationCount as citation_count
-        ORDER BY p.citationCount DESC
-        LIMIT 1
-        """
-        
-        try:
-            result = await self.store._run_query_method(query, [paper_title])
-            if result and len(result) > 0:
-                paper = result[0]
-                print(f"  [FOUND] Paper: {paper['title'][:60]}... (year: {paper.get('year', 'N/A')})")
-                return {
-                    'paper_id': paper['paper_id'],
-                    'title': paper['title'],
-                    'abstract': paper.get('abstract', ''),
-                    'year': paper.get('year'),
-                    'citationCount': paper.get('citation_count', 0)
-                }
-        except Exception as e:
-            print(f"  [ERROR] Paper search failed: {e}")
-        
-        return None
-    
-
-    async def _initialize_community_query(self): 
-        if not self.community_detector:
-            return None 
-        print(f"  [INIT] Community-based initialization")
-
-        target_communities= [
-                comm_id  for comm_id , size in self.community_detector.paper_communities.sizes.items()
-                if 10 <= size <= 100
-        ]
-
-        if not target_communities: 
-            return None 
-        
-        target_community = random.choice(target_communities)
-
-        papers_in_community = [
-            paper_id for paper_id , comm_id in self.community_detector.paper_communities.items()
-            if comm_id == target_communities
-        ]
-
-        if not papers_in_community:
-            return None
-        
-        paper_id = random.choice(papers_in_community)
-
-        query = """
-                MATCH (p:Paper {paperId : $1})
-                RETURN p.paperId as paper_id,
-                       p.title as title,
-                       p.abstract as abstract,
-                       p.year as year
-                """
-        
-        try:
-            result = await self.store._run_query_method(query, [paper_id])
-            if result and len(result) > 0:
-                paper = result[0]
-                print(f"  [COMMUNITY] {target_community} | Paper: {paper['title'][:50]}...")
-                return paper
-        except:
-            pass
-        
-        return None
-    
-
-    def _format_facets(self, facets: Dict[str, Any]) -> str:
-        """Format facets for logging."""
-        parts = []
-        if facets.get('author'):
-            parts.append(f"author={facets['author']}")
-        if facets.get('temporal'):
-            parts.append(f"year={facets['temporal']}")
-        if facets.get('venue'):
-            parts.append(f"venue={facets['venue']}")
-        if facets.get('intent'):
-            parts.append(f"intent={facets['intent']}")
-        if facets.get('paper_title'):
-            parts.append(f"paper={facets['paper_title'][:30]}")
-        
-        return " | ".join(parts) if parts else "semantic_only"
-
-        
-
-
+                 
     async def reset(self, query: str, intent: int, start_node_id: str = None , force_mode: Optional[str] = None) -> Tuple[np.ndarray , Dict]:
-        if query is None: 
-            query_pool = [
-                "reinforcement learning policy gradient",
-                "transformer architecture attention mechanism",
-                "graph neural networks",
-                "Large Language Models",
-                "Graphic Processing Units Clusters",
-                "Convolutional Neural Networks",
-            ]
-            query = random.choice(query_pool)
-        print(f"\n[RESET] Query: {query}")
-        
-        if self.use_query_parser: 
+        if self.query_parser:
+            self.query_intent = self.query_parser.parse(query)
             
-            self.query_facets = self.query_parser.parse(query)
-            print(f"[PARSER] Facets: {self._format_facets(self.query_facets)}")
+            if self.current_step <= 1: 
+                print(f"\n[QUERY] {query}")
+                print(f"[PARSE] Target: {self.query_intent.target_entity} | Op: {self.query_intent.operation}")
+                print(f"[PARSE] Semantic: {self.query_intent.semantic}")
+                if self.query_intent.constraints:
+                    print(f"[PARSE] Constraints: {len(self.query_intent.constraints)}")
+                    for c in self.query_intent.constraints:
+                        print(f" - {c}")
         else: 
             self.query_facets = {'semantic' : query , 'original' : query}
-            
-        self.current_query_mode = self._determine_query_mode(force_mode)
-        print(f"[MODE] Query mode : {self.current_query_mode}")
-
-        if self.current_query_mode == 'author':
-            start_node = await self._initialize_author_query()
-        elif self.current_query_mode == 'paper':
-            start_node = await self._initialize_paper_query()
-        elif self.current_query_mode == 'community':
-            start_node  = await self._initialize_community_query()
-        else:  # 'semantic'
-            start_node = await self._initialize_semantic_query()
-        
-        if start_node is None:
-            print("[ERROR] Failed to initialize query, falling back to semantic mode")
-            self.current_query_mode = 'semantic'
-            start_node = await self._initialize_semantic_query()
 
         self.query_embedding = self.encoder.encode(query)
         self.current_intent = intent
@@ -1152,16 +987,17 @@ class AdvancedGraphTraversalEnv:
         
         print(f"  [MANAGER] Relation {relation_type}: fetched {len(raw_nodes)} raw nodes")
 
-        if self.query_facets:
-            query_reward, reason = self.reward_mapper.get_manager_reward(
+        if self.query_intent and self.reward_mapper:
+            h_reward, h_reason = self.reward_mapper.get_manager_reward(
                 relation_type=relation_type,
-                query_facet=self.query_facets,
-                current_node=self.current_node
+                query_intent= self.query_intent,
+                current_node= self.current_node
             )
-            manager_reward += query_reward
             
-            if query_reward != 0:
-                print(f"  [MANAGER] Query-driven reward: {query_reward:+.1f} ({reason})")
+            if h_reward != 0:
+                manager_reward += h_reward
+                if self.current_step <= 5: 
+                    print(f"  [DSPy-MGR] {h_reward:+.1f} ({h_reason})")
     
         
         normalized_nodes = [self._normalize_node_keys(node) for node in raw_nodes]
@@ -1427,16 +1263,18 @@ class AdvancedGraphTraversalEnv:
             elif progress < -0.05:
                 worker_reward -= 15.0
 
-        if self.query_facets:
-            query_reward, reason = self.reward_mapper.get_worker_reward(
+
+        if self.query_intent and self.reward_mapper:
+            h_reward, h_reason = self.reward_mapper.get_worker_reward(
                 node=self.current_node,
-                query_facet= self.query_facets,
+                query_intent=self.query_intent,
                 semantic_sim=semantic_sim
             )
-            worker_reward += query_reward
-        
-        if query_reward != 0 and self.current_step <= 3:
-            print(f"  [WORKER] Query-driven reward: {query_reward:+.1f} ({reason})")
+            
+            if h_reward != 0:
+                worker_reward += h_reward
+                if self.current_step <= 5:  
+                    print(f"  [DSPy-WKR] {h_reward:+.1f} ({h_reason})")
 
 
         if is_revisit:
@@ -1456,7 +1294,7 @@ class AdvancedGraphTraversalEnv:
                 penalty = self.config.COMMUNITY_STUCK_PENALTY
                 if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
                     penalty *= self.config.SEVERE_STUCK_MULTIPLIER
-                worker_reward += penalty  # Negative value
+                worker_reward += penalty 
             
             # Loop penalty (-5)
             if len(self.community_history) > 1:
@@ -1464,7 +1302,7 @@ class AdvancedGraphTraversalEnv:
                 if self.current_community in previous_communities:
                     worker_reward += self.config.COMMUNITY_LOOP_PENALTY
             
-            # Diversity bonus (Max: +10)
+            # Diversity bonus (+10)
             unique_communities = len(self.visited_communities)
             if unique_communities >= 5:
                 diversity_bonus = min((unique_communities - 4) * 2.0, 10.0)
@@ -1473,12 +1311,12 @@ class AdvancedGraphTraversalEnv:
             # Community size bonus (+2)
             if self.current_community:
                 size = self.community_detector.get_community_size(self.current_community)
-                if 5 <= size <= 50:  # Sweet spot
+                if 5 <= size <= 50:  
                     worker_reward += self.config.COMMUNITY_SIZE_BONUS
                 elif 50 <= size <= 200:
                     worker_reward += 0.5
             
-            # Temporal jump bonus (+3 for newer, -2 for older)
+            # Temporal jump bonus (+3)
             if len(self.community_history) > 1 and self.current_community:
                 try:
                     prev_comm = self.community_history[-2]
