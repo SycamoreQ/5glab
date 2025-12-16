@@ -9,7 +9,6 @@ from tqdm import tqdm
 import argparse
 import sys
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -636,7 +635,7 @@ class SemanticScholarBulkLoader:
         abstracts_updated = 0
         missing_corpus_id = 0
         missing_abstract = 0
-        sample_shown = 0  # FIX: Track samples separately
+        sample_shown = 0 
         
         try:
             abstract_batch = []
@@ -647,11 +646,10 @@ class SemanticScholarBulkLoader:
                         record = json.loads(line)
                         total_lines += 1
                         
-                        # FIX: Show first 3 samples with valid data
                         if sample_shown < 3:
                             corpus_id_sample = record.get('corpusid')
                             abstract_sample = record.get('abstract')
-                            if corpus_id_sample and abstract_sample:  # Only show valid samples
+                            if corpus_id_sample and abstract_sample: 
                                 logger.info(f"\n=== SAMPLE ABSTRACT {sample_shown + 1} ===")
                                 logger.info(f"Corpus ID: {corpus_id_sample}")
                                 logger.info(f"Abstract: {str(abstract_sample)[:100]}...")
@@ -664,7 +662,6 @@ class SemanticScholarBulkLoader:
                             missing_corpus_id += 1
                             continue
                         
-                        # FIX: Skip if abstract is None or empty
                         if not abstract or abstract.strip() == "":
                             missing_abstract += 1
                             continue
@@ -698,7 +695,7 @@ class SemanticScholarBulkLoader:
             logger.info(f"{'='*60}")
             logger.info(f"Total lines read: {total_lines:,}")
             logger.info(f"Missing corpus ID: {missing_corpus_id:,}")
-            logger.info(f"Missing/empty abstracts: {missing_abstract:,}")  # FIX: Show this stat
+            logger.info(f"Missing/empty abstracts: {missing_abstract:,}")
             logger.info(f"Abstracts updated: {abstracts_updated:,}")
             logger.info(f"{'='*60}\n")
             
@@ -928,7 +925,7 @@ Examples:
     
     # Validation
     if args.dataset_type in ['citations', 'abstracts'] and (args.filter_fields or args.year_min != 2018 or args.year_max != 2025):
-        logger.warning("⚠️  Filters (--filter-fields, --year-min, --year-max) are ignored for citations and abstracts!")
+        logger.warning(" Filters (--filter-fields, --year-min, --year-max) are ignored for citations and abstracts!")
     
     logger.info("="*60)
     logger.info("SEMANTIC SCHOLAR BULK LOADER")
@@ -950,9 +947,7 @@ Examples:
     
     try:
         if not args.process_only:
-            logger.info("\n" + "="*60)
-            logger.info("DOWNLOAD PHASE")
-            logger.info("="*60)
+            logger.info("DOWNLOAD PHASE:")
             release_id = loader.get_latest_release()
             loader.get_available_datasets(release_id)
             loader.download_dataset(release_id, args.dataset_type, max_files=args.max_files)

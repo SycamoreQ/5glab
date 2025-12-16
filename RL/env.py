@@ -11,6 +11,7 @@ from utils.userfeedback import UserFeedbackTracker
 from model.llm.parser.unified import ParserType , UnifiedQueryParser , QueryRewardCalculator
 from utils.attention_selector import HybridAttentionSelector
 from RL.curiousity import CuriosityModule
+import random
 
 try:
     from graph.database.comm_det import CommunityDetector
@@ -72,6 +73,7 @@ class CommunityAwareRewardConfig:
     STUCK_THRESHOLD = 2               # Steps in same community = "stuck"
     SEVERE_STUCK_THRESHOLD = 4         # Very stuck threshold
     SEVERE_STUCK_MULTIPLIER = 2.0      # Multiply penalty when severely stuck
+    MAX_NOVELTY_BONUS = 10.0 
 
 
     TOP_VENUES = {
@@ -109,6 +111,9 @@ class AdvancedGraphTraversalEnv:
         self.text_dim = 384
         self.intent_dim = 5
         self.state_dim = self.text_dim * 2 + self.intent_dim
+        self.training_edge_cache = None
+        self.require_precomputed_embeddings = bool(kwargs.get("require_precomputed_embeddings", True))
+
         
         self.pending_manager_action = None
         self.available_worker_nodes = []
@@ -234,11 +239,20 @@ class AdvancedGraphTraversalEnv:
             clean_key = key.split('.')[-1] if '.' in key else key
             normalized[clean_key] = value
         
-        # Map old field names to new ones for compatibility
         if 'fields' in normalized and 'fieldsOfStudy' not in normalized:
             normalized['fieldsOfStudy'] = normalized['fields']
         if 'venue' not in normalized and 'publication_name' in normalized:
             normalized['venue'] = normalized['publication_name']
+
+        if 'paperId' in normalized and 'paper_id' not in normalized:
+            normalized['paper_id'] = str(normalized['paperId'])
+        if 'paper_id' in normalized and 'paperId' not in normalized:
+            normalized['paperId'] = str(normalized['paper_id'])
+
+        if 'authorId' in normalized and 'author_id' not in normalized:
+            normalized['author_id'] = str(normalized['authorId'])
+        if 'author_id' in normalized and 'authorId' not in normalized:
+            normalized['authorId'] = str(normalized['author_id'])
         
         return normalized
 
@@ -477,6 +491,33 @@ class AdvancedGraphTraversalEnv:
         return ((paper_reward , "Paper") , reason_str) if paper_id else ((author_reward , "Author") , reason_str)
     
 
+    def _calculate_trajectory_rewards(self) -> float:
+        if len(self.trajectory_history) < 2 :
+            return 0.0
+
+        visited_embeddings = []
+        for traj in self.trajectory_history: 
+            node = traj['node']
+            paper_id = node.get('paper_id')
+            if paper_id and paper_id in self.precomputed_embeddings: 
+                visited_embeddings.append(self.precomputed_embeddings[paper_id])
+
+        if len(visited_embeddings) < 2: 
+            return 0.0 
+
+
+        embeddings = np.array(visited_embeddings)
+        from sklearn.metrics.pairwise import cosine_similarity
+        sim = cosine_similarity(embeddings)
+
+        n = len(sim)
+        avg_sim = (sim.sum()-n)/(n*(n - 1))
+        div = 1 - avg_sim
+        div_reward = max(0 , div*20)
+        return div_reward 
+         
+        
+
     async def reset(self, query: str, intent: int, start_node_id: str = None):
         self.query_embedding = self.encoder.encode(query)
         self.current_intent = intent
@@ -488,8 +529,7 @@ class AdvancedGraphTraversalEnv:
         self.relation_types_used = set()
         self.best_similarity_so_far = -1.0
         self.previous_node_embedding = None
-        
-        # Reset community tracking
+
         self.current_community = None
         self.community_history = []
         self.community_visit_count = Counter()
@@ -511,14 +551,12 @@ class AdvancedGraphTraversalEnv:
         
         self.current_query_facets = self.query_parser.parse(query)
         
-        # FIXED: Better starting paper selection
         if start_node_id:
             node = await self.store.get_paper_by_id(start_node_id)
             if not node:
                 raise ValueError(f"Paper with ID {start_node_id} not found.")
             self.current_node = self._normalize_node_keys(node)
         else:
-            # Try keyword matching first
             keywords = query.lower().split()
             candidates = []
             
@@ -562,7 +600,128 @@ class AdvancedGraphTraversalEnv:
         return await self._get_state()
     
 
-    # In env.py, find get_node_embedding and update the abstract handling:
+    async def reset_with_cache_validation(self, query: str, intent: int, start_node_id: str = None):
+        """
+        Improved reset with cache validation and semantic starting node selection.
+        """
+        if not hasattr(self, 'training_paper_ids'):
+            if self.precomputed_embeddings:
+                self.training_paper_ids = set(self.precomputed_embeddings.keys())
+                print(f"[INIT] Auto-initialized training_paper_ids with {len(self.training_paper_ids):,} papers from embeddings")
+            else:
+                self.training_paper_ids = set()
+                print("[WARN] No training_paper_ids or precomputed_embeddings available")
+        
+        self.query_embedding = self.encoder.encode(query)
+        self.current_intent = intent
+        self.visited = set()
+        self.current_step = 0
+        self.pending_manager_action = None
+        self.available_worker_nodes = []
+        self.trajectory_history = []
+        self.relation_types_used = set()
+        self.best_similarity_so_far = -1.0
+        self.previous_node_embedding = None
+        
+        # Reset community tracking
+        self.current_community = None
+        self.community_history = []
+        self.community_visit_count = Counter()
+        self.steps_in_current_community = 0
+        self.previous_community = None
+        self.visited_communities = set()
+        
+        self.episode_stats = {
+            'total_nodes_explored': 0,
+            'unique_relation_types': 0,
+            'dead_ends_hit': 0,
+            'revisits': 0,
+            'max_similarity_achieved': 0.0,
+            'unique_communities_visited': 0,
+            'community_switches': 0,
+            'max_steps_in_community': 0,
+            'community_loops': 0
+        }
+        
+        self.current_query_facets = self.query_parser.parse(query)
+        
+        if start_node_id:
+            node = await self.store.get_paper_by_id(start_node_id)
+            if not node:
+                raise ValueError(f"Paper with ID {start_node_id} not found.")
+            self.current_node = self._normalize_node_keys(node)
+        else:
+            candidates = []
+            
+            if hasattr(self, 'training_paper_ids') and len(self.training_paper_ids) > 0:
+                sample_size = min(500, len(self.training_paper_ids))
+                sample_ids = random.sample(list(self.training_paper_ids), sample_size)
+
+                for pid in sample_ids:
+                    if pid in self.precomputed_embeddings:
+                        paper = await self.store.get_paper_by_id(pid)
+                        if paper:
+                            candidates.append(paper)
+            
+            if not candidates and self.precomputed_embeddings:
+                print("[INIT] Using precomputed_embeddings for candidate selection")
+                sample_pids = list(self.precomputed_embeddings.keys())[:1000]
+                for pid in sample_pids:
+                    paper = await self.store.get_paper_by_id(pid)
+                    if paper:
+                        candidates.append(paper)
+                        if len(candidates) >= 100:
+                            break
+            
+            if not candidates:
+                print("[INIT] Falling back to keyword matching")
+                keywords = query.lower().split()
+                for keyword in keywords:
+                    if len(keyword) < 3:
+                        continue
+                    results = await self.store.get_paper_by_title(keyword)
+                    candidates.extend(results[:20])
+                    if len(candidates) >= 50:
+                        break
+            
+            if not candidates:
+                raise ValueError(f"Could not find ANY starting papers for query: {query}")
+            
+            best_sim = -1.0
+            best_paper = None
+            
+            for paper in candidates:
+                paper_emb = await self._get_node_embedding(self._normalize_node_keys(paper))
+                if paper_emb is not None and isinstance(paper_emb, np.ndarray):
+                    sim = np.dot(self.query_embedding, paper_emb) / (
+                        np.linalg.norm(self.query_embedding) * np.linalg.norm(paper_emb) + 1e-9
+                    )
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_paper = paper
+            
+            if best_paper is None:
+                best_paper = np.random.choice(candidates)
+                print(f"[INIT] Random starting paper (no embeddings matched)")
+            else:
+                print(f"[INIT] Starting similarity: {best_sim:.3f}")
+            
+            self.current_node = self._normalize_node_keys(best_paper)
+        
+        if not self.current_node:
+            raise ValueError(f"Failed to initialize current_node")
+        
+        paper_id = self.current_node.get('paper_id')
+        if not paper_id:
+            raise ValueError(f"Node has no paper_id")
+        
+        self.visited.add(paper_id)
+        self._update_community_tracking(paper_id)
+        self.previous_node_embedding = await self._get_node_embedding(self.current_node)
+        
+        return await self._get_state()
+
+
 
     async def _get_node_embedding(self, node: Dict[str, Any]) -> np.ndarray:
         """Get embedding for a node. ALWAYS returns valid ndarray, never None."""
@@ -570,8 +729,9 @@ class AdvancedGraphTraversalEnv:
             logging.warning("Empty node passed to function")
             return np.zeros(self.text_dim, dtype=np.float32)
         
-        paper_id = node.get('paper_id')
-        author_id = node.get('author_id')
+        paper_id = node.get('paper_id') or node.get('paperId')
+        author_id = node.get('author_id') or node.get('authorId')
+
         
         if paper_id and paper_id in self.precomputed_embeddings:
             return self.precomputed_embeddings[paper_id]
@@ -582,30 +742,44 @@ class AdvancedGraphTraversalEnv:
         
         if paper_id: 
         
-            title = str(node.get('title', '')) if node.get('title') else ''
+            title = str(node.get('title', ''))[:200] if node.get('title') else ''
+            abstract = str(node.get('abstract', ''))[:1500] if node.get('abstract') else ''
             
-            INVALID_TITLES = {'', 'NA', '...', 'Unknown', 'null', 'None', 'undefined'}
+            INVALID_TITLES = {'', 'NA', '...', 'Unknown', 'null', 'None'}
             
-            if title and title not in INVALID_TITLES and len(title) >= 3:
-                fields = str(node.get('fields', '')) if node.get('fieldsOfStudy') else ''
-                keywords = ', '.join(fields) if isinstance(fields, list) else str(fields)
-                abstract = str(node.get('abstract', '')) if node.get('abstract') else ''
-                abstract = abstract or ''  # FIXED: Handle None
-                pub_name = str(node.get('venue', '')) if node.get('venue') else ''
+            if title in INVALID_TITLES or len(title) < 3:
+
+                fields = node.get('fieldsOfStudy', []) or node.get('fields', [])
+                venue = node.get('venue', '') or node.get('publication_name', '')
+                year = node.get('year', '')
+                meta = []
+
+                if fields:
+                    meta.append("fields" + ",".join(str(fields[:5])))
+
+                if venue: 
+                    meta.append("venue" + str(venue))
                 
+                if year: 
+                    meta.append("year" + str(year))
+                    
+                else:
+                    cc = node.get('citationCount') or node.get('citation_count') or ''
+
+                    fallback_parts = [f"Research paper {paper_id}"]
+                    if cc:
+                        fallback_parts.append(f"citations {cc}")
+
+                    node_text = ", ".join(str(x) for x in fallback_parts if x) 
+
                 parts = [title]
-                if keywords:
-                    parts.append(keywords)
                 if abstract and len(abstract) > 20:
                     parts.append(abstract[:500])
-                elif pub_name:
-                    parts.append(pub_name)
-                
-                node_text = ' '.join(parts).strip()
+                node_text = ' '.join(parts)
             
                 
         elif author_id: 
-            name = str(node.get('name' , '')) if node.get('name') else ''
+            name = str(node.get('name' , ''))[:50] if node.get('name') else ''
             
             INVALID_NAMES = {'' , 'NA' , '...' , 'Unknown' , 'NULL' , 'null' , 'None' , 'undefined' , 'XYZ'}
             if name and name not in INVALID_NAMES and len(name) > 1: 
@@ -614,8 +788,12 @@ class AdvancedGraphTraversalEnv:
                 
                 if paper_count or h_index:
                     node_text = f"{name}, {paper_count} papers, h-index {h_index}"
+            
                 else:
                     node_text = f"Author: {name}"
+        
+            if not node_text: 
+                node_text = f"Author {author_id}"
 
         if not node_text or len(node_text) < 5:
             if paper_id:
@@ -628,7 +806,7 @@ class AdvancedGraphTraversalEnv:
             
         try:
             if hasattr(self.encoder, 'encode_with_cache'):
-                embedding = self.encoder.encode_with_cache(node_text, cache_keys=[paper_id])
+                embedding = self.encoder.encode_with_cache(node_text, cache_key=paper_id)
             else:
                 embedding = self.encoder.encode(node_text)
             
@@ -653,6 +831,7 @@ class AdvancedGraphTraversalEnv:
         intent_vec = self._get_intent_vector(self.current_intent)
         return np.concatenate([self.query_embedding, node_emb, intent_vec])
 
+
     async def get_manager_actions(self) -> List[int]:
         """Manager decides which relation type to explore."""
         paper_id = self.current_node.get('paper_id')
@@ -662,199 +841,215 @@ class AdvancedGraphTraversalEnv:
         
         if paper_id:
             refs = await self.store.get_references_by_paper(paper_id)
-            if refs:
+            if refs and any(not self._is_visited(self._normalize_node_keys(r)) for r in refs):
                 valid_relations.append(RelationType.CITES)
             
+            # 2. CITED
             cites = await self.store.get_citations_by_paper(paper_id)
-            if cites:
+            if cites and any(not self._is_visited(self._normalize_node_keys(c)) for c in cites):
                 valid_relations.append(RelationType.CITED_BY)
             
+            # 3. WROTE
             authors = await self.store.get_authors_by_paper_id(paper_id)
-            if authors:
+            if authors and any(not self._is_visited(self._normalize_node_keys(a)) for a in authors):
                 valid_relations.append(RelationType.WROTE)
             
-            keywords = self.current_node.get('fieldOfStudy' , '') or self.current_node.get('fields' , '')
-            if keywords:
+            # 4. KEYWORD JUMP
+            keywords = self.current_node.get('fieldsOfStudy') or self.current_node.get('fields')
+            if keywords: 
                 valid_relations.append(RelationType.KEYWORD_JUMP)
             
+            # 5. VENUE JUMP
             venue = self.current_node.get('publication_name') or self.current_node.get('venue')
-            if venue:
+            if venue: 
                 valid_relations.append(RelationType.VENUE_JUMP)
             
+            # 6. OLDER/NEWER 
             older = await self.store.get_older_references(paper_id)
-            if older:
+            if older and any(not self._is_visited(self._normalize_node_keys(o)) for o in older):
                 valid_relations.append(RelationType.OLDER_REF)
             
             newer = await self.store.get_newer_citations(paper_id)
-            if newer:
+            if newer and any(not self._is_visited(self._normalize_node_keys(n)) for n in newer):
                 valid_relations.append(RelationType.NEWER_CITED_BY)
         
         elif author_id:
             papers = await self.store.get_papers_by_author_id(author_id)
-            if papers:
+            if papers and any(not self._is_visited(self._normalize_node_keys(p)) for p in papers):
                 valid_relations.append(RelationType.AUTHORED)
             
             collabs = await self.store.get_collabs_by_author(author_id)
-            if collabs:
+            if collabs and any(not self._is_visited(self._normalize_node_keys(c)) for c in collabs):
                 valid_relations.append(RelationType.COLLAB)
             
             second_collabs = await self.store.get_second_degree_collaborators(author_id , limit = 20)
-            if second_collabs:
+            if second_collabs and any(not self._is_visited(self._normalize_node_keys(c)) for c in second_collabs):
                 valid_relations.append(RelationType.SECOND_COLLAB)
             
             influence = await self.store.get_influence_path_papers(author_id , limit = 10)
-            if influence:
+            if influence and any(not self._is_visited(self._normalize_node_keys(i)) for i in influence):
                 valid_relations.append(RelationType.INFLUENCE_PATH)
         
         valid_relations.append(RelationType.STOP)
         
         return valid_relations
     
+
     async def manager_step(self, relation_type: int) -> Tuple[bool, float]:
-        """Manager step with standard rewards."""
+        """Manager step with IMPROVED action sampling using HybridAttentionSelector."""
         self.pending_manager_action = relation_type
         
-        relation = RelationType()
         if relation_type == RelationType.STOP:
             self.current_step = self.max_steps
-            
             if self.previous_node_embedding is None:
                 return True, -1.0
             
-            current_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
-                np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
-            )
+            current_sim = np.dot(self.query_embedding, self.previous_node_embedding) / \
+                         (np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9)
             
-            if current_sim > 0.7:
+            if current_sim >= 0.7:
                 return True, self.config.GOAL_REACHED_BONUS
-            elif current_sim > 0.4:
+            elif current_sim >= 0.4:
                 return True, 0.5
             else:
                 return True, -1.0
         
         manager_reward = 0.0
         
-        # Query-aligned relation bonus
-        if self.current_query_facets and self.current_query_facets.get('relation_focus'):
-            focus = self.current_query_facets['relation_focus']
-            
-            relation_map = {
-                RelationType.CITES: 'CITES',
-                RelationType.CITED_BY: 'CITED_BY',
-                RelationType.WROTE: 'WROTE',
-                RelationType.AUTHORED: 'WROTE',
-                RelationType.COLLAB: 'COLLAB',
-                RelationType.SECOND_COLLAB: 'COLLAB',
-            }
-            
-            current_relation_name = relation_map.get(relation_type)
-            
-            if current_relation_name == focus:
-                manager_reward += 2.0
-                logging.info(f"Manager chose query-aligned relation: {focus}")
-            
-
-            if self.current_query_facets.get('paper_operation') == 'citations':
-                if relation_type == RelationType.CITED_BY:
-                    manager_reward += 1.5
-            elif self.current_query_facets.get('paper_operation') == 'references':
-                if relation_type == RelationType.CITES:
-                    manager_reward += 1.5
-        
-        if relation_type == self.current_intent:
-            manager_reward += self.config.INTENT_MATCH_REWARD
-        else:
-            manager_reward += self.config.INTENT_MISMATCH_PENALTY
-        
-        if relation_type not in self.relation_types_used:
-            manager_reward += self.config.DIVERSITY_BONUS
-            self.relation_types_used.add(relation_type)
-            self.episode_stats['unique_relation_types'] += 1
-        
-        paper_id = self.current_node.get('paper_id')
-        author_id = self.current_node.get('author_id')
+        paper_id = self.current_node.get('paper_id') or self.current_node.get('paperId')
+        author_id = self.current_node.get('author_id') or self.current_node.get('authorId')
         raw_nodes = []
-        
-        if relation_type == RelationType.CITES and paper_id:
-            raw_nodes = await self.store.get_references_by_paper(paper_id)
-        elif relation_type == RelationType.CITED_BY and paper_id:
-            raw_nodes = await self.store.get_citations_by_paper(paper_id)
+
+        if hasattr(self, 'training_edge_cache') and self.training_edge_cache and paper_id:
+            edges = self.training_edge_cache.get(paper_id, [])
+            if relation_type in (RelationType.CITES, RelationType.CITED_BY):
+                want = 'cites' if relation_type == RelationType.CITES else 'cited_by'
+                target_ids = [tid for et, tid in edges if et == want]
+                raw_nodes = []
+                for tid in target_ids:
+                    n = await self.store.get_paper_by_id(tid)
+                    if n:
+                        raw_nodes.append(n)
+
         elif relation_type == RelationType.WROTE and paper_id:
-            raw_nodes = await self.store.get_authors_by_paper_id(paper_id)
+            raw_nodes = await self.store.get_authors_by_paperid(paper_id)
         elif relation_type == RelationType.AUTHORED and author_id:
-            raw_nodes = await self.store.get_papers_by_author_id(author_id)
+            raw_nodes = await self.store.get_papers_by_authorid(author_id)
         elif relation_type == RelationType.COLLAB and author_id:
             raw_nodes = await self.store.get_collabs_by_author(author_id)
         elif relation_type == RelationType.KEYWORD_JUMP and paper_id:
-            keywords = self.current_node.get('keywords', '')
+            keywords = self.current_node.get('fieldsOfStudy') or self.current_node.get('fields') or self.current_node.get('keywords') or []
             if keywords:
-                keyword = keywords.split(',')[0].strip() if isinstance(keywords, str) else str(keywords[0])
-                raw_nodes = await self.store.get_papers_by_keyword(keyword, limit=5, exclude_paper_id=paper_id)
+                keyword = keywords[0]
+                raw_nodes = await self.store.get_papers_by_keyword(keyword, limit=20, exclude_paperid=paper_id)
         elif relation_type == RelationType.VENUE_JUMP and paper_id:
-            venue = self.current_node.get('publication_name') or self.current_node.get('venue')
+            venue = self.current_node.get('publicationName') or self.current_node.get('venue')
             if venue:
-                raw_nodes = await self.store.get_papers_by_venue(venue, exclude_paper_id=paper_id)
+                raw_nodes = await self.store.get_papers_by_venue(venue, exclude_paperid=paper_id)
         elif relation_type == RelationType.OLDER_REF and paper_id:
             raw_nodes = await self.store.get_older_references(paper_id)
         elif relation_type == RelationType.NEWER_CITED_BY and paper_id:
             raw_nodes = await self.store.get_newer_citations(paper_id)
         elif relation_type == RelationType.SECOND_COLLAB and author_id:
-            raw_nodes = await self.store.get_second_degree_collaborators(author_id , limit=20)
+            raw_nodes = await self.store.get_second_degree_collaborators(author_id, limit=20)
         elif relation_type == RelationType.INFLUENCE_PATH and author_id:
-            raw_nodes = await self.store.get_influence_path_papers(author_id , limit = 10)
+            raw_nodes = await self.store.get_influence_path_papers(author_id, limit=10)
+        
         if relation_type == RelationType.STOP:
             if self.current_step < 5:
-                return False, -5.0 
-
+                return False, -5.0
+            return True, 0.0
+        
         print(f"  [MANAGER] Relation {relation_type}: fetched {len(raw_nodes)} raw nodes")
         
         normalized_nodes = [self._normalize_node_keys(node) for node in raw_nodes]
+
         
-        INVALID_VALUES = {'', 'N/A', '...', 'Unknown', 'null', 'None', 'undefined'}
-        valid_nodes = []
-        
+        valid_unvisited = []
+        valid_embeddings = []
+
         for node in normalized_nodes:
-            title = str(node.get('title', '')) if node.get('title') else ''
-            name = str(node.get('name', '')) if node.get('name') else ''
-            
-            # Validate title (for papers)
-            title_valid = (title and 
-                        title not in INVALID_VALUES and 
-                        len(title.strip()) > 3 and
-                        not title.strip().startswith('N/A'))
-            
-            # Validate name (for authors)
-            name_valid = (name and 
-                        name not in INVALID_VALUES and 
-                        len(name.strip()) > 2)
-            
-            # Keep node if either is valid
-            if title_valid or name_valid:
-                valid_nodes.append(node)
+            pid = node.get('paper_id') or node.get('paperId')
+            if self.require_precomputed_embeddings and pid and pid not in self.precomputed_embeddings:
+                continue
+
+            if self._is_visited(node):
+                continue
+
+            emb = await self._get_node_embedding(node)
+            if emb is None or not isinstance(emb, np.ndarray):
+                continue
+            if np.allclose(emb, 0.0):
+                continue
+
+            valid_unvisited.append(node)
+            valid_embeddings.append(emb)
+
         
-        self.available_worker_nodes = [(node, relation_type) for node in valid_nodes]
-    
+        print(f"  [MANAGER] After filtering: {len(valid_unvisited)} valid unvisited nodes")
         
-        self.available_worker_nodes = [
-            (node, r_type) for node, r_type in self.available_worker_nodes 
-            if not self._is_visited(node)
-        ]
+        MAX_WORKER_ACTIONS = 20  
         
-        print(f"  [MANAGER] After filtering: {len(self.available_worker_nodes)} valid unvisited nodes")
+        if len(valid_unvisited) > MAX_WORKER_ACTIONS:
+            if self.use_attention and hasattr(self, 'attention_selector'):
+                ranked_actions = self.attention_selector.get_ranked_actions(
+                    query_emb=self.query_embedding,
+                    candidate_nodes=valid_unvisited,
+                    candidate_embs=valid_embeddings,
+                    relation_types=[relation_type] * len(valid_unvisited),
+                    current_state=await self._get_state() if hasattr(self, 'get_state') else None,
+                    current_community=self.current_community if self.use_communities else None,
+                    community_history=self.community_history if self.use_communities else None,
+                    community_sizes={comm: self.community_detector.get_community_size(comm) 
+                                   for comm in set(self.community_history)} if self.use_communities and self.community_detector else None,
+                    community_detector=self.community_detector if self.use_communities else None,
+                    top_k=MAX_WORKER_ACTIONS
+                )
+                
+                valid_unvisited = [action['node'] for action in ranked_actions]
+                print(f"  [MANAGER] Attention-based sampling: selected {len(valid_unvisited)} actions")
+            else:
+                sims = []
+                for emb in valid_embeddings:
+                    sim = np.dot(self.query_embedding, emb) / \
+                          (np.linalg.norm(self.query_embedding) * np.linalg.norm(emb) + 1e-9)
+                    sims.append(sim)
+                
+                top_k = int(MAX_WORKER_ACTIONS * 0.6)
+                top_indices = np.argsort(sims)[-top_k:]
+                
+                # Random 40% for exploration
+                remaining = [i for i in range(len(valid_unvisited)) if i not in top_indices]
+                random_k = MAX_WORKER_ACTIONS - top_k
+                if remaining and random_k > 0:
+                    random_indices = np.random.choice(remaining, size=min(random_k, len(remaining)), replace=False)
+                    selected_indices = np.concatenate([top_indices, random_indices])
+                else:
+                    selected_indices = top_indices
+                
+                valid_unvisited = [valid_unvisited[i] for i in selected_indices]
+                print(f"  [MANAGER] Similarity-based sampling: selected {len(valid_unvisited)} actions")
+        
+        self.available_worker_nodes = [(node, relation_type) for node in valid_unvisited]
+        
         num_available = len(self.available_worker_nodes)
         if num_available == 0:
-            manager_reward += self.config.DEAD_END_PENALTY
+            manager_reward = self.config.DEAD_END_PENALTY
             self.episode_stats['dead_ends_hit'] += 1
-        elif num_available > 10:
-            manager_reward += self.config.HIGH_DEGREE_BONUS
+            self.current_step = self.max_steps
+            return True, manager_reward
+        
+        elif num_available >= 10:
+            manager_reward = self.config.HIGH_DEGREE_BONUS
         elif num_available >= 5:
-            manager_reward += 0.5
+            manager_reward = 0.5
         
         return False, manager_reward
 
 
+
     async def manager_step_with_policy(self , state: np.ndarray) -> Tuple[bool , float , int]: 
-        if not self.use_manager_policy or self.use_manager_policy is None:
+        if not hasattr(self, 'manager_policy') or self.manager_policy is None:
             relation_type = 1 if 1 in await self.get_manager_actions() else None
             if relation_type is None: 
                 return True, -1.0, None 
@@ -885,7 +1080,7 @@ class AdvancedGraphTraversalEnv:
             env_state
         )
 
-        is_terminal , reward = self.manager_step(relation_type)
+        is_terminal , reward = await self.manager_step(relation_type)
 
         self.manager_policy.update_policy(state, strategy, reward)
         
@@ -897,13 +1092,72 @@ class AdvancedGraphTraversalEnv:
         paper_id = node.get('paper_id')
         author_id = node.get('author_id')
         return (paper_id and paper_id in self.visited) or (author_id and author_id in self.visited)
-
-    async def get_worker_actions(self) -> List[Tuple[Dict, int]]:
-        """Get worker actions."""
-        return self.available_worker_nodes
     
 
+    async def get_worker_actions(self):
+        if not self.current_node:
+            return []
+        
+        paper_id = self.current_node.get('paperId') or self.current_node.get('paper_id')
+        if not paper_id:
+            return []
+        
+        actions = []
+        
+        if hasattr(self, 'training_edge_cache') and self.training_edge_cache:
+            edges = self.training_edge_cache.get(paper_id, [])
+            
+            print(f"  [WORKER] Found {len(edges)} edges in cache for {paper_id[:10]}...")
+            
+            for edge_type, target_id in edges:
+                if target_id in self.visited:
+                    continue
+                
+                try:
+                    target_paper = await self.store.get_paper_by_id(target_id)
+                    if target_paper:
+                        normalized = self._normalize_node_keys(target_paper)
+                        pid = normalized.get('paper_id') or normalized.get('paperId')
+                        if self.require_precomputed_embeddings and pid and pid not in self.precomputed_embeddings:
+                            continue
+                        emb = await self._get_node_embedding(normalized)
+                        if emb is None or not isinstance(emb, np.ndarray) or np.allclose(emb, 0.0):
+                            continue
+                        
+                        if edge_type == 'cites':
+                            actions.append((normalized, RelationType.CITES))
+                        elif edge_type == 'cited_by':
+                            actions.append((normalized, RelationType.CITED_BY))
+                except Exception as e:
+                    print(f"  [WORKER] Error fetching paper {target_id}: {e}")
+                    continue
+            
+            print(f"  [WORKER] Returning {len(actions)} valid actions from cache")
+            return actions
+        
+        else:
+            print(f"  [WORKER] No edge cache, querying Neo4j...")
+            
+            try:
+                refs = await self.store.get_references_by_paper(paper_id)
+                actions = [(self._normalize_node_keys(n), RelationType.CITES) for n in refs]
+            except:
+                refs = []
+
+            try:
+                cites = await self.store.get_citations_by_paper(paper_id)
+                actions += [(self._normalize_node_keys(n), RelationType.CITED_BY) for n in cites]
+            except:
+                pass
+            
+            actions = [(node, r_type) for node, r_type in actions if not self._is_visited(node)]
+            
+            print(f"  [WORKER] Returning {len(actions)} valid actions from Neo4j")
+            return actions
+        
+
     async def worker_step(self, chosen_node: Dict) -> Tuple[np.ndarray, float, bool]:
+        """Enhanced worker step with balanced rewards."""
         self.current_step += 1
         self.episode_stats['total_nodes_explored'] += 1
         
@@ -911,6 +1165,7 @@ class AdvancedGraphTraversalEnv:
         paper_id = self.current_node.get('paper_id')
         author_id = self.current_node.get('author_id')
         
+        # Track revisits
         is_revisit = False
         if paper_id and paper_id in self.visited:
             is_revisit = True
@@ -952,8 +1207,6 @@ class AdvancedGraphTraversalEnv:
             worker_reward = 10.0 + 40.0 * ((semantic_sim - 0.3) / 0.2) ** 2
         elif semantic_sim > 0.15:
             worker_reward = (semantic_sim - 0.15) * 20.0
-        elif semantic_sim > 0.0: 
-            worker_reward = semantic_sim * 10.0
         else:
             worker_reward = -20.0 + semantic_sim * 50.0
         
@@ -978,130 +1231,154 @@ class AdvancedGraphTraversalEnv:
             worker_reward -= 50.0
         
         if paper_id and self.use_communities and semantic_sim > 0.3:
-            # Community switch bonus
+            # Community switch bonus (+5)
             if self.previous_community and self.current_community != self.previous_community:
                 worker_reward += self.config.COMMUNITY_SWITCH_BONUS
                 
-                # Extra bonus for discovering new community
+                # New community discovery (+3)
                 if self.current_community not in self.visited_communities:
                     worker_reward += 3.0
             
-            # Penalty for staying stuck in same community
+            # Stuck penalty (escalating)
             if self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
                 penalty = self.config.COMMUNITY_STUCK_PENALTY
                 if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
                     penalty *= self.config.SEVERE_STUCK_MULTIPLIER
-                worker_reward += penalty
+                worker_reward += penalty  # Negative value
             
-            # Penalty for looping back to previous communities
+            # Loop penalty (-5)
             if len(self.community_history) > 1:
                 previous_communities = [c for c in self.community_history[:-1]]
                 if self.current_community in previous_communities:
                     worker_reward += self.config.COMMUNITY_LOOP_PENALTY
             
-            # Bonus for diverse community exploration
+            # Diversity bonus (Max: +10)
             unique_communities = len(self.visited_communities)
             if unique_communities >= 5:
                 diversity_bonus = min((unique_communities - 4) * 2.0, 10.0)
                 worker_reward += diversity_bonus
             
-            # Community size bonus (medium-sized communities are best)
+            # Community size bonus (+2)
             if self.current_community:
                 size = self.community_detector.get_community_size(self.current_community)
-                if 5 <= size <= 50:
+                if 5 <= size <= 50:  # Sweet spot
                     worker_reward += self.config.COMMUNITY_SIZE_BONUS
                 elif 50 <= size <= 200:
-                    worker_reward += 0.1
+                    worker_reward += 0.5
             
-            # Temporal jump bonus (prefer newer papers)
+            # Temporal jump bonus (+3 for newer, -2 for older)
             if len(self.community_history) > 1 and self.current_community:
                 try:
                     prev_comm = self.community_history[-2]
-                    prev_year = int(prev_comm.split('_')[0])
-                    curr_year = int(self.current_community.split('_')[0])
+                    curr_comm_parts = self.current_community.split('_')
+                    prev_comm_parts = prev_comm.split('_')
                     
-                    if prev_year < curr_year:
+                    if curr_comm_parts[0] == 'L': 
+                        curr_year = int(curr_comm_parts[2])
+                        prev_year = int(prev_comm_parts[2])
+                    else: 
+                        curr_year = int(curr_comm_parts[1])
+                        prev_year = int(prev_comm_parts[1])
+                    
+                    if curr_year > prev_year:
                         worker_reward += self.config.TEMPORAL_JUMP_BONUS
-                    else:
+                    elif curr_year < prev_year:
                         worker_reward += self.config.TEMPORAL_JUMP_PENALTY
                 except:
                     pass
         
         if author_id and self.use_communities and semantic_sim > 0.2:
-            # Community switch bonus for authors
+            # Community switch for authors (+5)
             if self.previous_community and self.current_community != self.previous_community:
                 worker_reward += self.config.COMMUNITY_SWITCH_BONUS
                 
                 if self.current_community not in self.visited_communities:
                     worker_reward += 3.0
             
-            # Stuck penalty for authors
+            # Stuck penalty
             if self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
                 penalty = self.config.COMMUNITY_STUCK_PENALTY
                 if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
                     penalty *= self.config.SEVERE_STUCK_MULTIPLIER
                 worker_reward += penalty
             
-            # Author-specific rewards
-            # Prolific author bonus 
+            # Prolific author bonus (Max: +5)
             paper_count = self.current_node.get('paperCount', 0) or self.current_node.get('paper_count', 0)
             if paper_count >= self.config.PROLIFIC_THRESHOLD:
-                prolific_bonus = min(paper_count / 50.0, 5.0)  # Max +5
+                prolific_bonus = min(paper_count / 50.0, 5.0)
                 worker_reward += prolific_bonus
             
-            # H-index bonus 
+            # H-index bonus (Max: +3)
             h_index = self.current_node.get('hIndex', 0) or self.current_node.get('h_index', 0)
             if h_index > 0:
                 if author_id not in self.h_index_cache:
                     self.h_index_cache[author_id] = h_index
                     self.author_stats['max_h_index'] = max(self.author_stats['max_h_index'], h_index)
                 
-                h_index_bonus = min(h_index / 20.0, 3.0)  # Max +3
+                h_index_bonus = min(h_index / 20.0, 3.0)
                 worker_reward += h_index_bonus
             
-            # Citation velocity bonus 
+            # Citation velocity bonus (Max: +2)
             citation_count = self.current_node.get('citationCount', 0)
             if citation_count > 1000:
-                velocity_bonus = min(np.log10(citation_count) - 3, 2.0)  # Max +2
+                velocity_bonus = min(np.log10(citation_count) - 3, 2.0)
                 worker_reward += velocity_bonus
             
-            # Collaboration bonus 
-            if self.steps_in_current_community == 1:  
-                worker_reward += 2.0 
-        
-        # Node type switch bonus(Paper to Author transitions)
+            # Collaboration bonus (+2)
+            if self.steps_in_current_community == 1:
+                worker_reward += 2.0
+
         if hasattr(self, 'previous_node_type'):
             previous_was_paper = self.previous_node_type == 'paper'
             current_is_paper = paper_id is not None
             
             if previous_was_paper != current_is_paper:
-                worker_reward += self.config.NODE_TYPE_SWITCH 
+                worker_reward += self.config.NODE_TYPE_SWITCH
         
         self.previous_node_type = 'paper' if paper_id else 'author'
         
+
         if not is_revisit and semantic_sim > 0.2:
-            novelty_bonus = self.curiosity_module.get_novelty_bonus(paper_id or author_id)
+            node_id = paper_id or author_id
+            novelty_bonus = self.curiosity_module.get_novelty_bonus(node_id)
+            
+            # Intrinsic curiosity (forward model prediction error)
+            current_state = await self._get_state()
             intrinsic = self.curiosity_module.compute_intrinsic_reward(
-                await self._get_state(), node_emb, await self._get_state()
+                current_state, node_emb, current_state
             )
-            curiosity_total = min(novelty_bonus + intrinsic * 0.3, self.config.NOVELTY_BONUS)
+            
+            curiosity_total = min(novelty_bonus + intrinsic * 0.3, self.config.MAX_NOVELTY_BONUS)
             worker_reward += curiosity_total
         
-        worker_reward -= 0.5 
+        worker_reward -= 0.5
         
         if semantic_sim > 0.65 and self.current_step <= 10:
-            worker_reward += 30.0 
+            worker_reward += 30.0
+        if self.use_communities:
+            community_reward = self._calculate_community_reward()
+            worker_reward += community_reward
 
-        worker_reward = np.clip(worker_reward, -50.0, 300.0)
+
+        worker_reward = np.clip(worker_reward, -100.0, 250.0)
         
+        # Update previous state
         self.previous_node_embedding = node_emb
         
+        # Check if episode done
         done = self.current_step >= self.max_steps
         if done:
+            # ADD TRAJECTORY DIVERSITY BONUS AT END
+            diversity_reward = self._calculate_trajectory_rewards()
+            worker_reward += diversity_reward
+            
             print(f"  [TERM] Episode ended: step={self.current_step}/{self.max_steps}")
+            print(f"  [REWARD] Trajectory diversity bonus: +{diversity_reward:.1f}")
         
+        # Get next state
         next_state = await self._get_state()
         
+        # Log trajectory
         self.trajectory_history.append({
             'node': self.current_node,
             'similarity': semantic_sim,
@@ -1112,6 +1389,9 @@ class AdvancedGraphTraversalEnv:
         })
         
         return next_state, worker_reward, done
+
+
+
 
 
     
@@ -1177,7 +1457,6 @@ class AdvancedGraphTraversalEnv:
         total_reward = (0.6 * struct_reward) + (0.4 * sem_reward)
         done = self.current_step >= self.max_steps
         return await self._get_state(), total_reward, done
-    
 
     
 class MetaPathReward: 

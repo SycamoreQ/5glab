@@ -108,24 +108,6 @@ class WorkerRegistry:
         if worker_id in self.workers:
             self.workers[worker_id].jobs_failed += 1
     
-    def check_worker_health(self) -> Dict[str, WorkerStatus]:
-        current_time = time.time()
-        health_status = {}
-        
-        for worker_id, worker in self.workers.items():
-            time_since_heartbeat = current_time - worker.last_heartbeat
-            
-            if time_since_heartbeat > self.heartbeat_timeout:
-                worker.status = WorkerStatus.OFFLINE
-                print(f"⚠ Worker {worker_id} is OFFLINE (no heartbeat for {time_since_heartbeat:.1f}s)")
-            elif worker.cpu_usage_percent > 90 or worker.ram_usage_percent > 90:
-                worker.status = WorkerStatus.DEGRADED
-            else:
-                worker.status = WorkerStatus.HEALTHY
-            
-            health_status[worker_id] = worker.status
-        
-        return health_status
     
 
     def get_available_workers(

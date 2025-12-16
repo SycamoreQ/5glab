@@ -69,12 +69,13 @@ class DDQLAgent:
         else:
             self.memory = deque(maxlen=200000)
         
-        self.batch_size = 16 
+        self.batch_size = 32
         self.gamma = 0.99 
-        
-        self.epsilon = 0.8
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.9998
+
+        # ✅ FIXED: Proper epsilon initialization and decay
+        self.epsilon = 0.95           # Start at 95% exploration
+        self.epsilon_min = 0.10       # End at 10% exploration
+        self.epsilon_decay = 0.0017   # Linear decay: (0.95-0.10)/500 = 0.0017
         
         self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
         self.precomputed_embeddings = precomputed_embeddings or {}
@@ -99,33 +100,36 @@ class DDQLAgent:
             onehot[0][0] = 1.0
         return onehot
     
-
-
-
     def _encode_node(self, node: Dict) -> np.ndarray:
-        paper_id = node.get('paper_id')
-        
+        paper_id = node.get('paper_id') or node.get('paperId')
+
         if paper_id and paper_id in self.precomputed_embeddings:
             return self.precomputed_embeddings[paper_id]
-        
-        title = node.get('title', '')
-        abstract = node.get('abstract', '') or ''  
+
+        title = node.get('title') or ''
+        abstract = node.get('abstract') or ''
+
+        title = str(title)
+        abstract = str(abstract)
+
         text = f"{title} {abstract[:200]}" if abstract else title
-        
+
         if not text.strip():
-            # Fallback to paper_id if no text
             if paper_id:
                 text = f"Paper {paper_id}"
             else:
                 return np.zeros(self.text_dim)
-        
+
         return self.encoder.encode(text, convert_to_numpy=True)
 
-    
     def act(self, state: np.ndarray, valid_actions: List[Tuple[Dict, int]], max_actions: int = 10) -> Optional[Tuple[Dict, int]]:
+        """Select action with epsilon-greedy and decay."""
         if not valid_actions:
             return None
         
+        print(f"    [AGENT] act() called with {len(valid_actions)} actions, max={max_actions}")
+        
+        # Limit actions
         if len(valid_actions) > max_actions:
             scored = []
             for node, rtype in valid_actions:
@@ -134,21 +138,28 @@ class DDQLAgent:
                 score = len(title) + len(abstract[:100])
                 scored.append((score, (node, rtype)))
             
-            scored.sort(key = lambda x: x[0] , reverse=True) 
+            scored.sort(key=lambda x: x[0], reverse=True)
             valid_actions = [action for _, action in scored[:max_actions]]
+            print(f"    [AGENT] Limited to {len(valid_actions)} actions")
         
         self.policy_net.reset_noise()
         
+        # Epsilon-greedy
         if np.random.rand() < self.epsilon:
-            return random.choice(valid_actions)
+            action = random.choice(valid_actions)
+            print(f"    [AGENT] Random action (ε={self.epsilon:.3f})")
+            self.epsilon = max(self.epsilon_min, self.epsilon - self.epsilon_decay)
+            return action
         
+        # Q-value computation
         state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        
         best_q = -float('inf')
         best_action = None
         
         self.policy_net.eval()
         with torch.no_grad():
-            for node, r_type in valid_actions:
+            for i, (node, r_type) in enumerate(valid_actions):
                 node_emb = self._encode_node(node)
                 node_emb_t = torch.FloatTensor(node_emb).unsqueeze(0).to(self.device)
                 relation_onehot_t = self._get_relation_onehot(r_type).to(self.device)
@@ -158,10 +169,16 @@ class DDQLAgent:
                 if q_value.item() > best_q:
                     best_q = q_value.item()
                     best_action = (node, r_type)
+                
+                if (i + 1) % 5 == 0:
+                    print(f"    [AGENT] Processed {i+1}/{len(valid_actions)} actions")
         
         self.policy_net.train()
+        
+        print(f"    [AGENT] Best Q={best_q:.3f}")
+        self.epsilon = max(self.epsilon_min, self.epsilon - self.epsilon_decay)
         return best_action
-    
+
     def remember(self, state, action_tuple, reward, next_state, done, next_actions):
         node, r_type = action_tuple
         act_emb = self._encode_node(node)
@@ -179,13 +196,12 @@ class DDQLAgent:
         
         if done:
             for trans in self.n_step_buffer.flush():
-                print(f"  [MEM] Episode done, flushing {len(trans)} transitions")
+                print(f"  [MEM] Episode done, flushing transitions")
                 if self.use_prioritized:
                     self.memory.add(*trans)
                 else:
                     self.memory.append(trans)
 
-                
     def replay_prioritized(self) -> float:
         if len(self.memory) < self.warmup_steps:
             return 0.0
@@ -220,15 +236,6 @@ class DDQLAgent:
             rewards.append(reward)
             next_states.append(next_state)
             dones.append(float(done))
-
-            #if next_actions and len(next_actions) < 1 and reward < 0: 
-            #    worst_q = float('inf')
-            #    worst_emb = None 
-            #    worst_rel = None
-                
-
-
-                
             
             if next_actions and not done:
                 best_next_q = -float('inf')
@@ -275,6 +282,7 @@ class DDQLAgent:
             target_q_values = rewards_t + self.gamma * next_q_values * (1 - dones_t)
         
         td_errors = (q_values - target_q_values).abs().detach().cpu().numpy().flatten()
+        self.memory.update_priorities(indices, td_errors)
         
         loss = (weights_t * F.huber_loss(q_values, target_q_values, reduction='none', delta=1.0)).mean()
     
@@ -285,9 +293,7 @@ class DDQLAgent:
         self.scheduler.step()
         
         self.training_step += 1
-        
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+
         
         return loss.item()
     

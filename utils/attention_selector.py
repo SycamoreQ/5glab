@@ -6,7 +6,7 @@ from typing import List, Tuple, Dict, Any, Optional
 
 
 class GraphAttentionSelector(nn.Module): 
-    def __init__(self , embed_dim: int = 384 , hidden_dim:int = 256 , num_heads:int = 4): 
+    def __init__(self, embed_dim: int = 384, hidden_dim: int = 256, num_heads: int = 4): 
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -22,47 +22,82 @@ class GraphAttentionSelector(nn.Module):
         self.layer_norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(0.1)
 
-    def forward(self , query_emb , candidate_emb , relation_type = None , current_state = None):
-        batch_size = 1 
+    def forward(self, query_emb, candidate_emb, relation_type=None, current_state=None):
+        batch_size = 1
         num_candidates = len(candidate_emb)
         
         if num_candidates == 0:
-            return torch.Tensor([])
+            return torch.tensor([])
         
-        query_tensor = torch.FloatTensor(query_emb).unsqueeze(0)
-        candidate_tensor = torch.FloatTensor(candidate_emb).unsqueeze(0)
+        # Validate embeddings
+        normalized_candidates = []
+        for i, emb in enumerate(candidate_emb):
+            if isinstance(emb, torch.Tensor):
+                emb = emb.cpu().numpy()
+            emb = np.array(emb).flatten()
+            if emb.shape[0] != self.embed_dim:
+                if emb.shape[0] < self.embed_dim:
+                    emb = np.pad(emb, (0, self.embed_dim - emb.shape[0]))
+                else:
+                    emb = emb[:self.embed_dim]
+            normalized_candidates.append(emb)
         
-        Q = self.query_proj(query_tensor)
-        K = self.key_proj(candidate_tensor)
-        V = self.value_proj(candidate_tensor)
+        candidate_array = np.stack(normalized_candidates, axis=0)
+        
+        # Tensors
+        query_tensor = torch.FloatTensor(query_emb).unsqueeze(0)  # (1, embed_dim)
+        candidate_tensor = torch.FloatTensor(candidate_array)  # (num_candidates, embed_dim)
+        
+        # Project query and candidates
+        Q = self.query_proj(query_tensor)  # (1, hidden_dim)
+        K = self.key_proj(candidate_tensor)  # (num_candidates, hidden_dim)
+        V = self.value_proj(candidate_tensor)  # (num_candidates, hidden_dim)
+        
+        # Multi-head attention setup
+        Q = Q.view(1, self.num_heads, self.head_dim)  # (1, num_heads, head_dim)
+        K = K.view(num_candidates, self.num_heads, self.head_dim)  # (num_candidates, num_heads, head_dim)
+        V = V.view(num_candidates, self.num_heads, self.head_dim)  # (num_candidates, num_heads, head_dim)
+        
+        Q = Q.transpose(0, 1)  # (num_heads, 1, head_dim)
+        K = K.transpose(0, 1)  # (num_heads, num_candidates, head_dim)
+        V = V.transpose(0, 1)  # (num_heads, num_candidates, head_dim)
+        
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(self.head_dim)  # (num_heads, 1, num_candidates)
 
-        Q = Q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(num_candidates, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
-        V = V.view(num_candidates, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
-
-        scores = torch.matmul(Q , K.transpose(-2 , -1))/np.sqrt(self.head_dim) + 1e-6
-
-        if relation_type is not None : 
-            rel_tensor = torch.LongTensor(relation_type)
-            rel_emb = self.relation_embed(rel_tensor)
-            rel_emb = rel_emb.view(num_candidates, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
-            rel_scores = torch.matmul(Q, rel_emb.transpose(-2, -1)) / np.sqrt(self.head_dim)
+        if relation_type is not None:
+            rel_tensor = torch.LongTensor(relation_type)  # (num_candidates,)
+            rel_emb = self.relation_embed(rel_tensor)  # (num_candidates, hidden_dim)
+            rel_emb = rel_emb.view(num_candidates, self.num_heads, self.head_dim)  # (num_candidates, num_heads, head_dim)
+            rel_emb = rel_emb.transpose(0, 1)  # (num_heads, num_candidates, head_dim)
+            
+            rel_scores = torch.matmul(Q, rel_emb.transpose(-2, -1)) / np.sqrt(self.head_dim)  # (num_heads, 1, num_candidates)
             scores = scores + 0.3 * rel_scores
         
-        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = F.softmax(scores, dim=-1)  # (num_heads, 1, num_candidates)
         attn_weights = self.dropout(attn_weights)
         
-        attn_output = torch.matmul(attn_weights, V)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, -1)
+        # Weighted sum of values
+        attn_output = torch.matmul(attn_weights, V)  # (num_heads, 1, head_dim)
+        attn_output = attn_output.transpose(0, 1).contiguous()  # (1, num_heads, head_dim)
+        attn_output = attn_output.view(1, -1)  # (1, hidden_dim)
         
-        if current_state is not None:
-            state_tensor = torch.FloatTensor(current_state).unsqueeze(0).unsqueeze(1)
-            state_proj = self.query_proj(state_tensor[:, :, :self.embed_dim])
-            attn_output = self.layer_norm(attn_output + state_proj)
+        candidate_repr = V.transpose(0, 1).contiguous().view(num_candidates, -1)  # (num_candidates, hidden_dim)
         
-        scores = self.out_proj(attn_output).squeeze()
+        # Broadcast query representation to match candidates
+        query_repr = attn_output.expand(num_candidates, -1)  # (num_candidates, hidden_dim)
+        
+        # Combine query and candidate representations
+        combined = self.layer_norm(query_repr + candidate_repr)  # (num_candidates, hidden_dim)
+        
+        # Project to scores
+        scores = self.out_proj(combined).squeeze()  # (num_candidates,)
+        
+        # Handle single candidate case
+        if num_candidates == 1:
+            scores = scores.unsqueeze(0)
         
         return torch.softmax(scores, dim=0).detach().numpy()
+
     
 
 class CommunityAwareAttention(nn.Module):
@@ -95,39 +130,51 @@ class CommunityAwareAttention(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
-    def encode_community_context(self , community_id , community_history , community_sizes): 
+    def encode_community_context(self, community_id, community_history, community_sizes): 
         if community_id is None:
-            return torch.Tensor(256)
+            return torch.zeros(256)
         
         visit_count = community_history.count(community_id)
-        size = community_sizes.get(community_id , 100)
+        size = community_sizes.get(community_id, 100)
         
         recency = 0.0 
         if community_id in community_history:
             last_idx = len(community_history) - 1 - community_history[::-1].index(community_id)
             recency = 1.0 / (len(community_history) - last_idx + 1)
 
-            features = torch.FloatTensor([
+        features = torch.FloatTensor([
             visit_count / 10.0,
             np.log10(size + 1) / 3.0,
             recency,
             1.0 if visit_count > 0 else 0.0,
             min(size / 200.0, 1.0)
         ])
-            
 
         expanded = features.unsqueeze(0).repeat(1, 256 // 5)
         return expanded.view(-1)[:256]
     
     def forward(self, query_emb, candidate_embs, candidate_communities, 
-            current_community, community_history, community_sizes):
+                current_community, community_history, community_sizes):
     
         num_candidates = len(candidate_embs)
         if num_candidates == 0:
             return torch.tensor([])
         
+        # FIX: Validate candidate embeddings
+        normalized_candidates = []
+        for i, emb in enumerate(candidate_embs):
+            if isinstance(emb, torch.Tensor):
+                emb = emb.cpu().numpy()
+            emb = np.array(emb).flatten()
+            if emb.shape[0] != self.embed_dim:
+                if emb.shape[0] < self.embed_dim:
+                    emb = np.pad(emb, (0, self.embed_dim - emb.shape[0]))
+                else:
+                    emb = emb[:self.embed_dim]
+            normalized_candidates.append(emb)
+        
         query_tensor = torch.FloatTensor(query_emb)
-        candidate_tensor = torch.FloatTensor(np.array(candidate_embs))
+        candidate_tensor = torch.FloatTensor(np.stack(normalized_candidates, axis=0))
         
         query_repr = self.query_net(query_tensor).unsqueeze(0).expand(num_candidates, -1)
         candidate_repr = self.candidate_net(candidate_tensor)
