@@ -98,7 +98,7 @@ class AdvancedGraphTraversalEnv:
     """
     
     def __init__(self, store, embedding_model_name="all-MiniLM-L6-v2", 
-                use_communities=True , use_feedback = True , use_llm_parser = True , parser_type: str = 'dspy' , 
+                use_communities=True , use_feedback = True , use_query_parser = True , parser_type: str = 'rule' , 
                 use_manager_policy:bool = True , precomputed_embeddings: Dict = None , **kwargs):
         self.store = store
         self.encoder = SentenceTransformer(embedding_model_name)
@@ -197,16 +197,19 @@ class AdvancedGraphTraversalEnv:
             'dspy': ParserType.DSPY,
             'llm': ParserType.LLM_MANUAL,
             'rule': ParserType.RULE_BASED
-        }.get(parser_type, ParserType.DSPY)
+        }.get(parser_type, ParserType.LLM_MANUAL)
         
+        self.use_query_parser = use_query_parser
         self.query_parser = UnifiedQueryParser(
             primary_parser=parser_type_enum,
             model="llama3.2",
             fallback_on_error=True 
         )
         
-        self.query_reward_calc = QueryRewardCalculator(self.config)
+        self.reward_mapper = QueryRewardCalculator(self.config)
         self.current_query_facets = None
+        self.query_facets = {}
+        self.current_query_mode = 'semantic' # 'semantic', 'author', 'paper', 'community'
 
         
         if use_manager_policy: 
@@ -516,9 +519,197 @@ class AdvancedGraphTraversalEnv:
         div_reward = max(0 , div*20)
         return div_reward 
          
+    def _determine_query_mode(self , force_mode: Optional[str] = None) -> str: 
+        if force_mode: 
+            return force_mode
+        
+        if self.query_facets.get('author_search_mode') and self.query_facets.get('author'):
+            return 'author'
+        
+        if self.query_facets.get('paper_search_mode') and self.query_facets.get('paper_title'):
+            return 'paper'
+        
+        if self.query_facets.get('relation_focus') == 'SAME_COMMUNITY':
+            return 'community'
+
+        return 'semantic'
+    
+    async def _initialize_author_query(self) -> Optional[Dict]:
+        author_name = self.query_facets.get('author')
+        if not author_name:
+            return None
+        
+        print(f"  [INIT] Searching for author: {author_name}")
+        
+        # Search for author in Neo4j
+        query = """
+        MATCH (a:Author)
+        WHERE toLower(a.name) CONTAINS toLower($1)
+        RETURN a.authorId as author_id,
+               a.name as name,
+               a.paperCount as paper_count,
+               a.citationCount as citation_count,
+               a.hIndex as h_index
+        ORDER BY a.citationCount DESC
+        LIMIT 1
+        """
+        
+        try:
+            result = await self.store._run_query_method(query, [author_name])
+            if result and len(result) > 0:
+                author = result[0]
+                print(f"  [FOUND] Author: {author['name']} (papers: {author.get('paper_count', 'N/A')})")
+                return {
+                    'author_id': author['author_id'],
+                    'name': author['name'],
+                    'paperCount': author.get('paper_count', 0),
+                    'citationCount': author.get('citation_count', 0),
+                    'hIndex': author.get('h_index', 0)
+                }
+        except Exception as e:
+            print(f"  [ERROR] Author search failed: {e}")
+        
+        return None
+    
+    async def _initialize_paper_query(self) -> Optional[Dict]:
+        paper_title = self.query_facets.get('paper_title')
+        if not paper_title:
+            return None
+        
+        print(f"  [INIT] Searching for paper: {paper_title}")
+        
+        # Search for paper in Neo4j
+        query = """
+        MATCH (p:Paper)
+        WHERE toLower(p.title) CONTAINS toLower($1)
+        RETURN p.paperId as paper_id,
+               p.title as title,
+               p.abstract as abstract,
+               p.year as year,
+               p.citationCount as citation_count
+        ORDER BY p.citationCount DESC
+        LIMIT 1
+        """
+        
+        try:
+            result = await self.store._run_query_method(query, [paper_title])
+            if result and len(result) > 0:
+                paper = result[0]
+                print(f"  [FOUND] Paper: {paper['title'][:60]}... (year: {paper.get('year', 'N/A')})")
+                return {
+                    'paper_id': paper['paper_id'],
+                    'title': paper['title'],
+                    'abstract': paper.get('abstract', ''),
+                    'year': paper.get('year'),
+                    'citationCount': paper.get('citation_count', 0)
+                }
+        except Exception as e:
+            print(f"  [ERROR] Paper search failed: {e}")
+        
+        return None
+    
+
+    async def _initialize_community_query(self): 
+        if not self.community_detector:
+            return None 
+        print(f"  [INIT] Community-based initialization")
+
+        target_communities= [
+                comm_id  for comm_id , size in self.community_detector.paper_communities.sizes.items()
+                if 10 <= size <= 100
+        ]
+
+        if not target_communities: 
+            return None 
+        
+        target_community = random.choice(target_communities)
+
+        papers_in_community = [
+            paper_id for paper_id , comm_id in self.community_detector.paper_communities.items()
+            if comm_id == target_communities
+        ]
+
+        if not papers_in_community:
+            return None
+        
+        paper_id = random.choice(papers_in_community)
+
+        query = """
+                MATCH (p:Paper {paperId : $1})
+                RETURN p.paperId as paper_id,
+                       p.title as title,
+                       p.abstract as abstract,
+                       p.year as year
+                """
+        
+        try:
+            result = await self.store._run_query_method(query, [paper_id])
+            if result and len(result) > 0:
+                paper = result[0]
+                print(f"  [COMMUNITY] {target_community} | Paper: {paper['title'][:50]}...")
+                return paper
+        except:
+            pass
+        
+        return None
+    
+
+    def _format_facets(self, facets: Dict[str, Any]) -> str:
+        """Format facets for logging."""
+        parts = []
+        if facets.get('author'):
+            parts.append(f"author={facets['author']}")
+        if facets.get('temporal'):
+            parts.append(f"year={facets['temporal']}")
+        if facets.get('venue'):
+            parts.append(f"venue={facets['venue']}")
+        if facets.get('intent'):
+            parts.append(f"intent={facets['intent']}")
+        if facets.get('paper_title'):
+            parts.append(f"paper={facets['paper_title'][:30]}")
+        
+        return " | ".join(parts) if parts else "semantic_only"
+
         
 
-    async def reset(self, query: str, intent: int, start_node_id: str = None):
+
+    async def reset(self, query: str, intent: int, start_node_id: str = None , force_mode: Optional[str] = None) -> Tuple[np.ndarray , Dict]:
+        if query is None: 
+            query_pool = [
+                "reinforcement learning policy gradient",
+                "transformer architecture attention mechanism",
+                "graph neural networks",
+                "Large Language Models",
+                "Graphic Processing Units Clusters",
+                "Convolutional Neural Networks",
+            ]
+            query = random.choice(query_pool)
+        print(f"\n[RESET] Query: {query}")
+        
+        if self.use_query_parser: 
+            
+            self.query_facets = self.query_parser.parse(query)
+            print(f"[PARSER] Facets: {self._format_facets(self.query_facets)}")
+        else: 
+            self.query_facets = {'semantic' : query , 'original' : query}
+            
+        self.current_query_mode = self._determine_query_mode(force_mode)
+        print(f"[MODE] Query mode : {self.current_query_mode}")
+
+        if self.current_query_mode == 'author':
+            start_node = await self._initialize_author_query()
+        elif self.current_query_mode == 'paper':
+            start_node = await self._initialize_paper_query()
+        elif self.current_query_mode == 'community':
+            start_node  = await self._initialize_community_query()
+        else:  # 'semantic'
+            start_node = await self._initialize_semantic_query()
+        
+        if start_node is None:
+            print("[ERROR] Failed to initialize query, falling back to semantic mode")
+            self.current_query_mode = 'semantic'
+            start_node = await self._initialize_semantic_query()
+
         self.query_embedding = self.encoder.encode(query)
         self.current_intent = intent
         self.visited = set()
@@ -548,8 +739,7 @@ class AdvancedGraphTraversalEnv:
             'max_steps_in_community': 0,
             'community_loops': 0
         }
-        
-        self.current_query_facets = self.query_parser.parse(query)
+
         
         if start_node_id:
             node = await self.store.get_paper_by_id(start_node_id)
@@ -961,10 +1151,21 @@ class AdvancedGraphTraversalEnv:
             return True, 0.0
         
         print(f"  [MANAGER] Relation {relation_type}: fetched {len(raw_nodes)} raw nodes")
+
+        if self.query_facets:
+            query_reward, reason = self.reward_mapper.get_manager_reward(
+                relation_type=relation_type,
+                query_facet=self.query_facets,
+                current_node=self.current_node
+            )
+            manager_reward += query_reward
+            
+            if query_reward != 0:
+                print(f"  [MANAGER] Query-driven reward: {query_reward:+.1f} ({reason})")
+    
         
         normalized_nodes = [self._normalize_node_keys(node) for node in raw_nodes]
 
-        
         valid_unvisited = []
         valid_embeddings = []
 
@@ -1017,8 +1218,7 @@ class AdvancedGraphTraversalEnv:
                 
                 top_k = int(MAX_WORKER_ACTIONS * 0.6)
                 top_indices = np.argsort(sims)[-top_k:]
-                
-                # Random 40% for exploration
+
                 remaining = [i for i in range(len(valid_unvisited)) if i not in top_indices]
                 random_k = MAX_WORKER_ACTIONS - top_k
                 if remaining and random_k > 0:
@@ -1227,6 +1427,18 @@ class AdvancedGraphTraversalEnv:
             elif progress < -0.05:
                 worker_reward -= 15.0
 
+        if self.query_facets:
+            query_reward, reason = self.reward_mapper.get_worker_reward(
+                node=self.current_node,
+                query_facet= self.query_facets,
+                semantic_sim=semantic_sim
+            )
+            worker_reward += query_reward
+        
+        if query_reward != 0 and self.current_step <= 3:
+            print(f"  [WORKER] Query-driven reward: {query_reward:+.1f} ({reason})")
+
+
         if is_revisit:
             worker_reward -= 50.0
         
@@ -1362,13 +1574,10 @@ class AdvancedGraphTraversalEnv:
 
         worker_reward = np.clip(worker_reward, -100.0, 250.0)
         
-        # Update previous state
         self.previous_node_embedding = node_emb
-        
-        # Check if episode done
+    
         done = self.current_step >= self.max_steps
         if done:
-            # ADD TRAJECTORY DIVERSITY BONUS AT END
             diversity_reward = self._calculate_trajectory_rewards()
             worker_reward += diversity_reward
             
@@ -1390,33 +1599,55 @@ class AdvancedGraphTraversalEnv:
         
         return next_state, worker_reward, done
 
+    def _is_target_paper(self, current_title: str, target_title: str) -> bool:
+        current = current_title.lower().strip()
+        target = target_title.lower().strip()
+        
+        if current == target:
+            return True
+        
+        # Contains match (for partial titles like "BERT" matching "BERT: Pre-training...")
+        if target in current or current in target:
+            if len(target) > 3:
+                return True
+        
+        # Fuzzy match (Levenshtein distance)
+        from difflib import SequenceMatcher
+        similarity = SequenceMatcher(None, current, target).ratio()
+        return similarity > 0.85
 
 
-
+    async def _check_citation_relationship(
+        self, 
+        source_paper_id: str, 
+        target_paper_id: str, 
+        direction: str = 'cites'
+    ) -> bool:
+        """Check if source paper cites target paper (or vice versa)."""
+        
+        # First check cache (fast)
+        if hasattr(self, 'training_edge_cache'):
+            edges = self.training_edge_cache.get(source_paper_id, [])
+            for edge_type, dest_id in edges:
+                if edge_type == direction and dest_id == target_paper_id:
+                    return True
+        
+        # Fallback to Neo4j query (slower but accurate)
+        query = """
+        MATCH (p1:Paper {paperId: $1})-[:CITES]->(p2:Paper {paperId: $2})
+        RETURN count(*) > 0 as exists
+        """
+        
+        try:
+            result = await self.store._run_query_method(query, [source_paper_id, target_paper_id])
+            if result and len(result) > 0:
+                return result[0].get('exists', False)
+        except:
+            pass
+        
+        return False
 
     
-    def get_diverse_results(self , trajectory: List[Dict]) -> List[Dict]: 
-        if not self.use_feedback: 
-            return trajectory
-        
-        papers_with_emb = []
-        for step in trajectory:
-            node = step['node']
-            if node.get('paper_id'):
-                papers_with_emb.append({
-                    **node,
-                    'embedding': step.get('node_embedding')  
-                })
-        
-        diverse_papers = self.diversity_selector.select_diverse_papers(
-            papers_with_emb,
-            self.query_embedding,
-            k=10
-        )
-        
-        return diverse_papers
-    
-
     def get_episode_summary(self) -> Dict[str, Any]:
         """Get detailed episode summary with community stats."""
         return {

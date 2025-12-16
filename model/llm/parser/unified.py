@@ -1,6 +1,23 @@
-from typing import Dict, Any, Optional
-from enum import Enum
+from typing import Dict, Any, Optional , Tuple
+from enum import Enum , IntEnum
 import logging
+import numpy as np
+
+class RelationType(IntEnum):
+    """Copy from your env.py"""
+    CITES = 0
+    CITED_BY = 1
+    WROTE = 2
+    AUTHORED = 3
+    SELF = 4
+    COLLAB = 5
+    KEYWORD_JUMP = 6
+    VENUE_JUMP = 7
+    OLDER_REF = 8
+    NEWER_CITED_BY = 9
+    SECOND_COLLAB = 10
+    STOP = 11
+    INFLUENCE_PATH = 12
 
 
 class ParserType(Enum):
@@ -203,14 +220,40 @@ class UnifiedQueryParser:
                 print(f"{parser_name:12s}: {counts['success']:3d} success, {counts['failure']:3d} failure ({success_rate:.1f}%)")
         
         print("="*50 + "\n")
-
+    
 
 class QueryRewardCalculator:
     """Calculate rewards based on query facet matching."""
     
     def __init__(self, config):
         self.config = config
+        self.relation_intent_map = {
+            # Citation network exploration
+            'citations': [RelationType.CITED_BY, RelationType.NEWER_CITED_BY],
+            'references': [RelationType.CITES, RelationType.OLDER_REF],
+            'citation_network': [RelationType.CITES, RelationType.CITED_BY],
+            
+            # Author exploration
+            'author_works': [RelationType.WROTE, RelationType.AUTHORED],
+            'collaborations': [RelationType.COLLAB, RelationType.SECOND_COLLAB],
+            'author_influence': [RelationType.INFLUENCE_PATH],
+            
+            # Topic/field exploration
+            'topic_exploration': [RelationType.KEYWORD_JUMP],
+            'venue_exploration': [RelationType.VENUE_JUMP],
+            
+            # Temporal
+            'recent_work': [RelationType.NEWER_CITED_BY],
+            'foundational_work': [RelationType.OLDER_REF],
+        }
     
+        self.relation_purpose = {}
+        for intent, relations in self.relation_intent_map.items():
+            for rel in relations:
+                if rel not in self.relation_purpose:
+                    self.relation_purpose[rel] = []
+                self.relation_purpose[rel].append(intent)
+
     @staticmethod
     def _safe_str(value: Any) -> str:
         """Safely convert value to string, return empty string if None."""
@@ -218,58 +261,208 @@ class QueryRewardCalculator:
             return ''
         return str(value)
     
-    def calculate_facet_rewards(
-        self, 
-        paper: Dict[str, Any],
-        query_facets: Dict[str, Any],
-        semantic_sim: float
-    ) -> Dict[str, float]:
-        """Calculate rewards for each query facet with robust None handling."""
-        rewards = {
-            'semantic': semantic_sim * 1.0,
-            'temporal': 0.0,
-            'institutional': 0.0,
-            'intent': 0.0,
-            'venue': 0.0,
-        }
-        
-        # Temporal match
-        if query_facets.get('temporal'):
-            year = paper.get('year')
-            if year:
-                try:
-                    temporal = query_facets['temporal']
-                    if isinstance(temporal, (tuple, list)) and len(temporal) == 2:
-                        start, end = temporal
-                        if start is not None and end is not None and start <= year <= end:
-                            rewards['temporal'] = 0.5
-                except (TypeError, ValueError, AttributeError):
-                    pass
-        
-        # Venue match
-        if query_facets.get('venue'):
-            venue = self._safe_str(paper.get('publication_name') or paper.get('venue'))
-            query_venue = self._safe_str(query_facets['venue'])
-            
-            if venue and query_venue and query_venue.lower() in venue.lower():
-                rewards['venue'] = 0.8
-        
-        # Intent match
-        if query_facets.get('intent'):
-            title = self._safe_str(paper.get('title')).lower()
-            intent = self._safe_str(query_facets['intent'])
-            
-            if title and intent:
-                if intent == 'survey' and ('survey' in title or 'review' in title):
-                    rewards['intent'] = 0.7
-                elif intent == 'methodology' and ('method' in title or 'algorithm' in title):
-                    rewards['intent'] = 0.6
-                elif intent == 'application' and ('application' in title or 'applied' in title):
-                    rewards['intent'] = 0.5
-                elif intent == 'theory' and ('theory' in title or 'theoretical' in title):
-                    rewards['intent'] = 0.6
-                elif intent == 'empirical' and ('experiment' in title or 'empirical' in title):
-                    rewards['intent'] = 0.6
-        
-        return rewards
+    def get_manager_reward(self , relation_type: int , query_facet: Dict[str , Any] , current_node: Dict[str , Any]) -> Tuple[float , str ]:
+        reward = 0.0 
+        reasons = []
 
+        paper_op = query_facet.get('paper_operation')
+        if paper_op: 
+            if paper_op == 'citations' and relation_type == RelationType.CITED_BY: 
+                reward += 20.0
+                reasons.append("correct_operations:citations")
+            elif paper_op == 'references' and relation_type == RelationType.CITES: 
+                reward += 20.0
+                reasons.append("correct_operation: references")
+            elif paper_op == 'coauthors' and relation_type == RelationType.WROTE:
+                reward += 20.0
+                reasons.append("correct_operation:coauthors")
+            elif paper_op == 'related' and relation_type in [RelationType.KEYWORD_JUMP, RelationType.VENUE_JUMP]:
+                reward += 15.0
+                reasons.append("correct_operation:related")
+            elif paper_op in ['citations', 'references'] and relation_type not in [RelationType.CITES, RelationType.CITED_BY]:
+                reward -= 10.0
+                reasons.append("wrong_operation")
+    
+        relation_focus = query_facet.get('relation_focus')
+        if relation_focus:
+            focus_map = {
+                'CITES': RelationType.CITES,
+                'CITED_BY': RelationType.CITED_BY,
+                'WROTE': RelationType.WROTE,
+                'COLLAB': [RelationType.COLLAB, RelationType.SECOND_COLLAB],
+                'PUBLISHED_IN': [RelationType.VENUE_JUMP],
+                'SAME_COMMUNITY': [RelationType.KEYWORD_JUMP, RelationType.VENUE_JUMP],
+            }
+
+
+        target_relations = focus_map.get('relation_focus' , [])
+        if not isinstance(target_relations , list):
+            target_relations = [target_relations]
+
+        if relation_type in target_relations:
+            reward += 15.0
+            reasons.append(f"relation_focus{relation_focus}")
+        else:
+            reward -= 8.0 
+            reasons.append(f"wrong_focus{relation_focus}")
+
+
+        intent = query_facet.get('intent')
+        if intent and intent in self.relation_intent_map:
+            target_relations = self.relation_intent_map[intent]
+            if relation_type in target_relations:
+                reward += 10.0
+                reasons.append(f"intent_match:{intent}")
+
+
+        if query_facet.get('author_search_mode'):
+            if relation_type in [RelationType.WROTE, RelationType.AUTHORED, RelationType.COLLAB]:
+                reward += 12.0
+                reasons.append("author_search_mode")
+            elif relation_type in [RelationType.CITES, RelationType.CITED_BY]:
+                reward += 5.0 
+                reasons.append("author_search_indirect")
+
+            elif relation_type in [RelationType.COLLAB , RelationType.SECOND_COLLAB]:
+                reward += 5.0 
+                reasons.append("author search indirect")
+                
+
+        temporal = query_facet.get('temporal')
+        if temporal:
+            start_year, end_year = temporal
+            current_year = 2024 
+            
+            if end_year >= current_year - 3:  
+                if relation_type == RelationType.NEWER_CITED_BY:
+                    reward += 8.0
+                    reasons.append("temporal_recent")
+                elif relation_type == RelationType.OLDER_REF:
+                    reward -= 5.0
+                    reasons.append("temporal_mismatch")
+            
+            elif end_year < 2010:
+                if relation_type == RelationType.OLDER_REF:
+                    reward += 8.0
+                    reasons.append("temporal_classic")
+                elif relation_type == RelationType.NEWER_CITED_BY:
+                    reward -= 5.0
+                    reasons.append("temporal_mismatch")
+
+
+
+        venue = query_facet.get('venue')
+        if venue and relation_type == RelationType.VENUE_JUMP:
+            reward += 10.0
+            reasons.append(f"venue_constraint:{venue}")
+
+
+        hop_depth = query_facet.get('hop_depth')
+        if hop_depth and hop_depth > 1:
+            if relation_type in [RelationType.CITES, RelationType.CITED_BY]:
+                reward += 5.0 * hop_depth
+                reasons.append(f"multi_hop:{hop_depth}")
+        
+        reason_str = " | ".join(reasons) if reasons else "no_alignment"
+        return reward, reason_str
+    
+    def get_worker_reward(self , node: Dict[str , Any] , query_facet: Dict[str , Any], semantic_sim: float) -> Tuple[Dict, str]: 
+        reward = 0.0 
+        reasons = []
+
+        paper_id = node.get('paper_id') or node.get('paperId')
+        author_id = node.get('author_id') or node.get('authorId')
+
+
+        target_author = query_facet.get('author')
+        if target_author and author_id:
+            node_name = node.get('name', '').lower()
+            if target_author.lower() in node_name or node_name in target_author.lower():
+                reward += 80.0
+                reasons.append("target_author_found")
+        
+        # Paper matching
+        target_paper = query_facet.get('paper_title')
+        if target_paper and paper_id:
+            node_title = node.get('title', '').lower()
+            if self._fuzzy_match(node_title, target_paper.lower()):
+                reward += 80.0
+                reasons.append("target_paper_found")
+
+
+        temporal = query_facet.get('temporal')
+        if temporal and paper_id:
+            start_year, end_year = temporal
+            paper_year = node.get('year')
+            
+            if paper_year:
+                if start_year <= paper_year <= end_year:
+                    reward += 15.0
+                    reasons.append(f"temporal_match:{paper_year}")
+                else:
+                    reward -= 10.0
+                    reasons.append(f"temporal_mismatch:{paper_year}")
+
+        venue = query_facet.get('venue')
+        if venue and paper_id:
+            node_venue = node.get('venue', '') or node.get('publicationName', '')
+            if venue.lower() in node_venue.lower():
+                reward += 20.0
+                reasons.append(f"venue_match:{venue}")
+
+
+        min_citations = query_facet.get('citation_count_min')
+        if min_citations and paper_id:
+            citation_count = node.get('citationCount', 0)
+            if citation_count >= min_citations:
+                reward += 10.0
+                reasons.append(f"citation_threshold:{citation_count}")
+            else:
+                reward -= 15.0
+                reasons.append(f"low_citations:{citation_count}")
+        
+        # Author count constraint
+        min_authors = query_facet.get('author_count_min')
+        if min_authors and paper_id:
+            # You'd need to fetch this from graph
+            author_count = node.get('author_count', 0)
+            if author_count >= min_authors:
+                reward += 10.0
+                reasons.append(f"author_threshold:{author_count}")
+
+
+        entities = query_facet.get('entities', [])
+        if entities and paper_id:
+            node_fields = node.get('fieldsOfStudy', []) or node.get('fields', [])
+            if isinstance(node_fields, list):
+                for entity in entities:
+                    for field in node_fields:
+                        if entity.lower() in field.lower():
+                            reward += 5.0
+                            reasons.append(f"field_match:{entity}")
+                            break
+        
+        author_operation = query_facet.get('author_operation')
+        if author_operation == 'collaborations' and author_id:
+            # Check if this is a collaborator (not the target author)
+            if target_author and node.get('name', '').lower() != target_author.lower():
+                reward += 20.0
+                reasons.append("collaborator_found")
+        
+        reason_str = " | ".join(reasons) if reasons else "semantic_only"
+        return reward, reason_str
+    
+    def _fuzzy_match(self, str1: str, str2: str, threshold: float = 0.8) -> bool:
+        str1 = str1.lower().strip()
+        str2 = str2.lower().strip()
+    
+        if str1 == str2:
+            return True
+        
+        if len(str2) > 3 and (str2 in str1 or str1 in str2):
+            return True
+        
+        # Levenshtein similarity
+        from difflib import SequenceMatcher
+        similarity = SequenceMatcher(None, str1, str2).ratio()
+        return similarity >= threshold
