@@ -1526,7 +1526,7 @@ class AdvancedGraphTraversalEnv:
         total_reward = (0.6 * struct_reward) + (0.4 * sem_reward)
         done = self.current_step >= self.max_steps
         return await self._get_state(), total_reward, done
-
+    
     
 class MetaPathReward: 
     def _init__(self): 

@@ -7,7 +7,7 @@ from sentence_transformers import SentenceTransformer
 from RL.ddqn import DDQLAgent
 from RL.env import AdvancedGraphTraversalEnv, RelationType
 from graph.database.store import EnhancedStore
-from RL.dspy_hierarchical_parser import DSPyHierarchicalParser, HierarchicalRewardMapper
+from model.llm.parser.dspy_parser import DSPyHierarchicalParser, HierarchicalRewardMapper
 import math
 
 COMPLEX_QUERIES = [
@@ -49,6 +49,36 @@ async def load_training_cache():
     print(f"✓ Loaded paper ID index with {len(paper_id_set):,} IDs")
     
     return papers, edge_cache, paper_id_set
+
+async def get_k_nearest_semantic_neighbors(self, k=10):
+    """Get k semantically similar papers from full dataset."""
+    if not self.query_embedding or not self.precomputed_embeddings:
+        return []
+    
+    current_emb = await self._get_node_embedding(self.current_node)
+    
+    # Score ALL papers in dataset
+    candidates = []
+    for paper_id, paper_emb in self.precomputed_embeddings.items():
+        if paper_id in self.visited:
+            continue
+        
+        sim = np.dot(current_emb, paper_emb) / (
+            np.linalg.norm(current_emb) * np.linalg.norm(paper_emb) + 1e-9
+        )
+        candidates.append((sim, paper_id))
+    
+    # Return top-k
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    
+    neighbors = []
+    for sim, paper_id in candidates[:k]:
+        paper = await self.store.get_paper_by_id(paper_id)
+        if paper:
+            neighbors.append((self._normalize_node_keys(paper), RelationType.SELF))
+    
+    return neighbors
+
 
 async def build_embeddings():
     papers, edge_cache, paper_id_set = await load_training_cache()
@@ -121,11 +151,13 @@ async def train():
         use_feedback=False,
         use_query_parser=True,
         parser_type='dspy', 
-        require_precomputed_embeddings=True
+        require_precomputed_embeddings=False
     )
     
+    
     embedded_ids = set(embeddings.keys())
-    env.training_paper_ids = embedded_ids  
+    env.training_paper_ids = paper_id_set
+
     
     pruned_edge_cache = {}
     for src, edges in edge_cache.items():
@@ -135,52 +167,18 @@ async def train():
         if kept:
             pruned_edge_cache[src] = kept
 
-    env.training_edge_cache = pruned_edge_cache
+    env.training_edge_cache = edge_cache
+    env.precomputed_embeddings = embeddings
 
     print(f"\n✓ Graph statistics:")
     print(f"  Papers: {len(env.training_paper_ids):,}")
     print(f"  Edges: {sum(len(v) for v in env.training_edge_cache.values()):,}")
+    
+    avg_degree = sum(len(v) for v in env.training_edge_cache.values()) / len(env.training_paper_ids)
+    print(f"  Avg degree: {avg_degree:.1f}")
 
     query_pools = await prepare_query_pools(encoder, papers, paper_id_set)
     
-    print("\n" + "="*80)
-    print(" MAXIMUM POSSIBLE SIMILARITY DIAGNOSTIC")
-    print("="*80)
-
-    paper_titles = {}
-    for p in papers:
-        pid = str(p.get('paperId') or p.get('paper_id'))
-        title = p.get('title') or 'Unknown Title' 
-        paper_titles[pid] = title
-
-    for query in COMPLEX_QUERIES[:3]:
-        print(f"\n📊 Query: '{query}'")
-        print("-" * 80)
-        
-        query_emb = encoder.encode([query])[0]
-
-        all_sims = []
-        for pid, paper_emb in embeddings.items():
-            sim = np.dot(query_emb, paper_emb) / (
-                np.linalg.norm(query_emb) * np.linalg.norm(paper_emb) + 1e-9
-            )
-            all_sims.append((sim, pid))
-
-        all_sims.sort(key=lambda x: x[0], reverse=True)
-        
-        print(f"  Top 5 papers:")
-        for rank, (sim, pid) in enumerate(all_sims[:5], 1):
-            title = paper_titles.get(pid, 'Unknown')[:60]
-            in_graph = "✓" if pid in paper_id_set else "✗"
-            print(f"    {rank}. [{sim:.3f}] {in_graph} {title}")
-        
-        max_sim = all_sims[0][0]
-        top_5_in_graph = sum(1 for _, pid in all_sims[:5] if pid in paper_id_set)
-        
-        print(f"  Max possible: {max_sim:.3f} | Top-5 in graph: {top_5_in_graph}/5")
-
-    print("\n" + "="*80 + "\n")
-
     agent = DDQLAgent(
         state_dim=773, 
         text_dim=384, 
@@ -191,13 +189,9 @@ async def train():
     print("\n" + "="*80)
     print("STARTING TRAINING")
     print("="*80)
-    print(f"Training papers: {len(papers):,}")
-    print(f"Embeddings: {len(embeddings):,}")
-    print(f"Dense subgraph: {len(env.training_paper_ids):,} papers")
-    print(f"Edge cache: {sum(len(e) for e in env.training_edge_cache.values()):,} edges")
     print(f"Queries: {len(COMPLEX_QUERIES)}")
-    print(f"Max steps per episode: 8")
-    print(f"Target episodes: 500")
+    print(f"Max steps per episode: 12")
+    print(f"Allow revisits: True (max 3x per node)")
     print("="*80 + "\n")
     
     episode_rewards = []
@@ -206,12 +200,11 @@ async def train():
     dead_end_count = 0
     success_count = 0
     
-    for episode in range(500):
+    for episode in range(100):
         query = np.random.choice(COMPLEX_QUERIES)
         paper_pool = query_pools[query]
         
         if not paper_pool:
-            print(f"[SKIP] No papers for query: {query}")
             continue
         
         start_idx = np.random.choice(min(10, len(paper_pool)))
@@ -223,78 +216,72 @@ async def train():
             continue
         
         try:
-            if hasattr(env, 'reset_with_cache_validation'):
-                state = await env.reset_with_cache_validation(
-                    query, 
-                    intent=1, 
-                    start_node_id=start_paper_id
-                )
-            else:
-                state = await env.reset(
-                    query, 
-                    intent=1, 
-                    start_node_id=start_paper_id
-                )
-        except Exception as e:
-            print(f"[ERROR] Reset failed: {e}")
+            state = await env.reset(query, intent=1, start_node_id=start_paper_id)
+        except:
             continue
         
         episode_reward = 0
         steps = 0
-        max_steps = 8
+        max_steps = 12
         hit_dead_end = False
+        visit_counts = {}
         
-        try:
-            for step in range(max_steps):
-                done = False
+        for step in range(max_steps):
+            try:
+                pid = str(env.current_node.get("paperId") or 
+                         env.current_node.get("paperid") or 
+                         env.current_node.get("paper_id"))
+                
+                visit_counts[pid] = visit_counts.get(pid, 0) + 1
+                env.visited.clear() 
+                
+                edges = env.training_edge_cache.get(pid, [])
+                has_cites = any(et == "cites" for et, _ in edges)
+                has_cited_by = any(et in ("cited_by", "citedby") for et, _ in edges)
 
-                for _attempt in range(3):
-                    pid = str(env.current_node.get("paperId") or 
-                             env.current_node.get("paperid") or 
-                             env.current_node.get("paper_id"))
-                    edges = env.training_edge_cache.get(pid, [])
+                manager_actions = []
+                if has_cites: 
+                    manager_actions.append(RelationType.CITES)
+                if has_cited_by: 
+                    manager_actions.append(RelationType.CITED_BY)
 
-                    has_cites = any(et == "cites" for et, _ in edges)
-                    has_cited_by = any(et in ("cited_by", "citedby") for et, _ in edges)
+                if not manager_actions:
+                    break
 
-                    manager_actions = []
-                    if has_cites: 
-                        manager_actions.append(RelationType.CITES)
-                    if has_cited_by: 
-                        manager_actions.append(RelationType.CITED_BY)
+                relation_type = int(np.random.choice(manager_actions))
+                is_terminal, manager_reward = await env.manager_step(relation_type)
+                episode_reward += manager_reward
+                
+                if is_terminal:
+                    break
 
-                    if not manager_actions:
-                        done = True
-                        break
-
-                    relation_type = int(np.random.choice(manager_actions))
-                    is_terminal, manager_reward = await env.manager_step(relation_type)
-                    episode_reward += manager_reward
-                    
-                    if is_terminal:
-                        done = True
-                        break
-
-                    worker_actions = await env.get_worker_actions()
-                    
-                    worker_actions = [
-                        (n, r) for (n, r) in worker_actions
-                        if str(n.get("paperid") or n.get("paperId") or n.get("paper_id")) in embedded_ids
-                    ]
-                    
-                    if worker_actions:
-                        break
-
-                if done or not worker_actions:
+                worker_actions = await env.get_worker_actions()
+                
+                worker_actions = [
+                    (n, r) for (n, r) in worker_actions
+                    if str(n.get("paperid") or n.get("paperId") or n.get("paper_id")) in embedded_ids
+                ]
+                
+                worker_actions = [
+                    (n, r) for (n, r) in worker_actions
+                    if visit_counts.get(str(n.get("paperid") or n.get("paperId") or n.get("paper_id")), 0) < 3
+                ]
+                
+                if not worker_actions:
                     break
 
                 worker_actions = worker_actions[:5]
                 
                 best_action = agent.act(state, worker_actions, max_actions=5)
-                if not best_action:
+                
+                if best_action is None or not isinstance(best_action, tuple):
                     break
 
                 chosen_node, _ = best_action
+                
+                if chosen_node is None or not isinstance(chosen_node, dict):
+                    break
+                
                 next_state, worker_reward, done = await env.worker_step(chosen_node)
                 episode_reward += worker_reward
                 steps += 1
@@ -317,10 +304,13 @@ async def train():
                 state = next_state
                 if done:
                     break
-                
-        except Exception as e:
-            print(f"  [ERROR] Step {step} failed: {e}")
-            hit_dead_end = True
+                    
+            except Exception as e:
+                hit_dead_end = True
+                break
+        
+        if steps < 2:
+            dead_end_count += 1
         
         loss = 0.0
         if len(agent.memory) >= agent.batch_size:
@@ -333,9 +323,6 @@ async def train():
         episode_lengths.append(steps)
         final_sim = env.best_similarity_so_far
         episode_similarities.append(final_sim if final_sim > -0.5 else np.nan)
-        
-        if hit_dead_end:
-            dead_end_count += 1
         
         if final_sim > 0.5:
             success_count += 1
@@ -395,6 +382,7 @@ async def train():
     print("="*80)
     
     await store.pool.close()
+
 
 if __name__ == '__main__':
     asyncio.run(train())

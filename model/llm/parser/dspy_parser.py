@@ -387,20 +387,20 @@ class HierarchicalRewardMapper:
         
         return reward, " | ".join(reasons) if reasons else "none"
     
-
-
     def get_worker_reward(
-        self,
-        node: Dict[str, Any],
-        query_intent: QueryIntent,
-        semantic_sim: float
-    ) -> Tuple[float, str]:
+    self,
+    node: Dict[str, Any],
+    query_intent: QueryIntent,
+    semantic_sim: float
+) -> Tuple[float, str]:
         """Calculate worker reward checking constraints."""
         reward = 0.0
         reasons = []
         
         paper_id = node.get('paper_id') or node.get('paperId')
         author_id = node.get('author_id') or node.get('authorId')
+        
+        apply_penalties = semantic_sim > 0.4
         
         for constraint in query_intent.constraints:
             if constraint.field == 'venue':
@@ -411,8 +411,8 @@ class HierarchicalRewardMapper:
                     if constraint_value in node_venue:
                         reward += 20.0
                         reasons.append(f"✓venue")
-                    else:
-                        reward -= 15.0
+                    elif apply_penalties:  
+                        reward -= 5.0  
                         reasons.append(f"✗venue")
             
             elif constraint.field == 'field_of_study':
@@ -422,8 +422,8 @@ class HierarchicalRewardMapper:
                     if match:
                         reward += 18.0
                         reasons.append(f"✓field")
-                    else:
-                        reward -= 12.0
+                    elif apply_penalties:
+                        reward -= 4.0
                         reasons.append(f"✗field")
             
             elif constraint.field == 'citation_count':
@@ -432,8 +432,8 @@ class HierarchicalRewardMapper:
                     if cit_count > constraint.value:
                         reward += 15.0
                         reasons.append(f"✓cit:{cit_count}")
-                    else:
-                        reward -= 20.0
+                    elif apply_penalties:
+                        reward -= 5.0  
                         reasons.append(f"✗cit:{cit_count}")
             
             elif constraint.field == 'year':
@@ -443,8 +443,8 @@ class HierarchicalRewardMapper:
                     if start <= paper_year <= end:
                         reward += 12.0
                         reasons.append(f"✓year:{paper_year}")
-                    else:
-                        reward -= 15.0
+                    elif apply_penalties:
+                        reward -= 4.0  
                         reasons.append(f"✗year:{paper_year}")
         
         if query_intent.constraints:
@@ -455,3 +455,4 @@ class HierarchicalRewardMapper:
                 reasons.append(f"✓✓ALL({passed})")
         
         return reward, " | ".join(reasons) if reasons else "none"
+
