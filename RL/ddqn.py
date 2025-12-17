@@ -72,10 +72,9 @@ class DDQLAgent:
         self.batch_size = 32
         self.gamma = 0.99 
 
-        # ✅ FIXED: Proper epsilon initialization and decay
-        self.epsilon = 0.95           # Start at 95% exploration
-        self.epsilon_min = 0.10       # End at 10% exploration
-        self.epsilon_decay = 0.0017   # Linear decay: (0.95-0.10)/500 = 0.0017
+        self.epsilon = 0.95        
+        self.epsilon_min = 0.10      
+        self.epsilon_decay = 0.0017   
         
         self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
         self.precomputed_embeddings = precomputed_embeddings or {}
@@ -121,63 +120,101 @@ class DDQLAgent:
                 return np.zeros(self.text_dim)
 
         return self.encoder.encode(text, convert_to_numpy=True)
-
-    def act(self, state: np.ndarray, valid_actions: List[Tuple[Dict, int]], max_actions: int = 10) -> Optional[Tuple[Dict, int]]:
-        """Select action with epsilon-greedy and decay."""
-        if not valid_actions:
+    
+    def act(self, state, actions, max_actions=5):
+        if not actions:
+            print("    [AGENT] No actions provided")
             return None
         
-        print(f"    [AGENT] act() called with {len(valid_actions)} actions, max={max_actions}")
+        # Validate all actions
+        valid_actions = []
+        for i, action in enumerate(actions):
+            if not isinstance(action, tuple) or len(action) != 2:
+                print(f"    [AGENT] Skipping invalid action at index {i}: {type(action)}")
+                continue
+            node, relation_type = action
+            if not isinstance(node, dict):
+                print(f"    [AGENT] Skipping action with invalid node at index {i}: {type(node)}")
+                continue
+            valid_actions.append(action)
         
-        # Limit actions
-        if len(valid_actions) > max_actions:
-            scored = []
-            for node, rtype in valid_actions:
-                title = node.get('title', '') or ''
-                abstract = node.get('abstract', '') or ''
-                score = len(title) + len(abstract[:100])
-                scored.append((score, (node, rtype)))
-            
-            scored.sort(key=lambda x: x[0], reverse=True)
-            valid_actions = [action for _, action in scored[:max_actions]]
-            print(f"    [AGENT] Limited to {len(valid_actions)} actions")
+        if not valid_actions:
+            print("    [AGENT] No valid actions after filtering")
+            return None
         
-        self.policy_net.reset_noise()
+        actions = valid_actions[:max_actions]
         
-        # Epsilon-greedy
-        if np.random.rand() < self.epsilon:
-            action = random.choice(valid_actions)
+        print(f"    [AGENT] act() called with {len(actions)} actions, max={max_actions}")
+        
+        if np.random.random() < self.epsilon:
+            chosen_idx = random.randint(0, len(actions) - 1)
+            chosen_action = actions[chosen_idx]
             print(f"    [AGENT] Random action (ε={self.epsilon:.3f})")
-            self.epsilon = max(self.epsilon_min, self.epsilon - self.epsilon_decay)
-            return action
+            
+            if not isinstance(chosen_action, tuple) or len(chosen_action) != 2:
+                print(f"    [AGENT] ERROR: Random selection returned malformed action: {type(chosen_action)}")
+                return actions[0]
+            
+            return chosen_action
         
-        # Q-value computation
-        state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         
-        best_q = -float('inf')
-        best_action = None
+        q_values = []
+        valid_action_indices = []
         
-        self.policy_net.eval()
-        with torch.no_grad():
-            for i, (node, r_type) in enumerate(valid_actions):
-                node_emb = self._encode_node(node)
-                node_emb_t = torch.FloatTensor(node_emb).unsqueeze(0).to(self.device)
-                relation_onehot_t = self._get_relation_onehot(r_type).to(self.device)
+        for idx, action_tuple in enumerate(actions):
+            try:
+                node, relation_type = action_tuple
                 
-                q_value = self.policy_net(state_t, node_emb_t, relation_onehot_t)
+                # Get node embedding
+                node_id = str(node.get('paperId') or node.get('paper_id') or '')
                 
-                if q_value.item() > best_q:
-                    best_q = q_value.item()
-                    best_action = (node, r_type)
+                if node_id and node_id in self.precomputed_embeddings:
+                    node_emb = self.precomputed_embeddings[node_id]
+                else:
+                    node_emb = self._encode_node(node)
                 
-                if (i + 1) % 5 == 0:
-                    print(f"    [AGENT] Processed {i+1}/{len(valid_actions)} actions")
+                if not isinstance(node_emb, np.ndarray):
+                    node_emb = np.array(node_emb, dtype=np.float32)
+                
+                if node_emb.shape[0] != self.text_dim:
+                    print(f"    [AGENT] Warning: node embedding has wrong shape {node_emb.shape}, expected ({self.text_dim},)")
+                    node_emb = np.zeros(self.text_dim, dtype=np.float32)
+                
+                node_emb_tensor = torch.FloatTensor(node_emb).unsqueeze(0).to(self.device)
+                relation_onehot = self._get_relation_onehot(relation_type).to(self.device)
+                
+                with torch.no_grad():
+                    q_val = self.policy_net(state_tensor, node_emb_tensor, relation_onehot).item()
+                
+                q_values.append(q_val)
+                valid_action_indices.append(idx)
+                
+            except Exception as e:
+                print(f"    [AGENT] Error processing action {idx}: {e}")
+                continue
         
-        self.policy_net.train()
+        if not q_values:
+            print("    [AGENT] No valid Q-values computed, selecting random action")
+            chosen_idx = random.randint(0, len(actions) - 1)
+            return actions[chosen_idx]
+        
+        print(f"    [AGENT] Processed {len(q_values)}/{len(actions)} actions")
+        
+        best_idx = valid_action_indices[np.argmax(q_values)]
+        best_q = max(q_values)
         
         print(f"    [AGENT] Best Q={best_q:.3f}")
-        self.epsilon = max(self.epsilon_min, self.epsilon - self.epsilon_decay)
-        return best_action
+        
+        chosen_action = actions[best_idx]
+        
+        if not isinstance(chosen_action, tuple) or len(chosen_action) != 2:
+            print(f"    [AGENT] ERROR: chosen_action is malformed: {type(chosen_action)}")
+            return actions[0] 
+        
+        return chosen_action
+
+
 
     def remember(self, state, action_tuple, reward, next_state, done, next_actions):
         node, r_type = action_tuple
