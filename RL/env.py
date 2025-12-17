@@ -570,6 +570,7 @@ class AdvancedGraphTraversalEnv:
         self.query_embedding = self.encoder.encode(query)
         self.current_intent = intent
         self.visited = set()
+        self.node_visit_count = {}
         self.current_step = 0
         self.pending_manager_action = None
         self.available_worker_nodes = []
@@ -662,6 +663,7 @@ class AdvancedGraphTraversalEnv:
         self.query_embedding = self.encoder.encode(query)
         self.current_intent = intent
         self.visited = set()
+        self.node_visit_count = {}
         self.current_step = 0
         self.pending_manager_action = None
         self.available_worker_nodes = []

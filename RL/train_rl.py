@@ -194,7 +194,6 @@ async def train():
     avg_degree = sum(len(v) for v in env.training_edge_cache.values()) / len(env.training_paper_ids) if env.training_paper_ids else 0
     print(f"  Avg degree: {avg_degree:.1f}")
 
-    # Diagnostic: Check ID overlap
     print("\n" + "="*80)
     print("CACHE ALIGNMENT CHECK")
     print("="*80)
@@ -248,7 +247,7 @@ async def train():
     dead_end_count = 0
     success_count = 0
     
-    for episode in range(100):
+    for episode in range(1000):
         if episode < 50:
             env.max_revisits = 5
         else:
@@ -282,6 +281,11 @@ async def train():
         
         try:
             state = await env.reset(query, intent=1, start_node_id=start_paper_id)
+            if len(env.visited) > 0:
+                print(f"[ERROR] env.visited not cleared! Size: {len(env.visited)}")
+            if len(env.node_visit_count) > 0:
+                print(f"[ERROR] env.node_visit_count not cleared! Size: {len(env.node_visit_count)}")
+    
         except Exception as e:
             print(f"[ERROR] Reset failed: {e}")
             continue
@@ -379,7 +383,6 @@ async def train():
                     hit_dead_end = True
                     break
                 
-                # Proceed with worker step
                 next_state, worker_reward, done = await env.worker_step(chosen_node)
                 episode_reward += worker_reward
                 steps += 1
