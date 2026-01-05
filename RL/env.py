@@ -55,8 +55,8 @@ class CommunityAwareRewardConfig:
     GOAL_REACHED_BONUS = 5.0
     
     COMMUNITY_SWITCH_BONUS = 5.0       # Bonus for jumping to different community
-    COMMUNITY_STUCK_PENALTY = -2.5    # Penalty per step stuck in same community
-    COMMUNITY_LOOP_PENALTY = -1.0      # Severe penalty for returning to previous community
+    COMMUNITY_STUCK_PENALTY = -1.0    # Penalty per step stuck in same community
+    COMMUNITY_LOOP_PENALTY = -0.5      # Severe penalty for returning to previous community
     DIVERSE_COMMUNITY_BONUS = 3.0    # Bonus for visiting many unique communities
     TEMPORAL_JUMP_BONUS = 0.7        # Bonus for moving to a community which is recent 
     TEMPORAL_JUMP_PENALTY = -0.1        # Bonus for doing the opposite 
@@ -71,8 +71,8 @@ class CommunityAwareRewardConfig:
     INSTITUTION_QUALITY_BONUS = 0.25    # Bonus for top institutions 
     CITATION_VELOCITY_BONUS = 0.3
     
-    STUCK_THRESHOLD = 2               # Steps in same community = "stuck"
-    SEVERE_STUCK_THRESHOLD = 4         # Very stuck threshold
+    STUCK_THRESHOLD = 3               # Steps in same community = "stuck"
+    SEVERE_STUCK_THRESHOLD = 5         # Very stuck threshold
     SEVERE_STUCK_MULTIPLIER = 2.0      # Multiply penalty when severely stuck
     MAX_NOVELTY_BONUS = 10.0 
 
@@ -142,10 +142,10 @@ class AdvancedGraphTraversalEnv:
         if self.use_communities and self.use_authors:
             self.current_comm_node = None
             self.prev_comm_node = None
-            self.community_detector = CommunityDetector(store)
+            self.community_detector = CommunityDetector(cache_file= 'community_cache_1M.pkl')
             if not self.community_detector.load_cache():
-                print("No community cache found. Run: python -m RL.community_detection")
-                print("Continuing without community rewards...")
+                print("No community cache found")
+                print("Continuing without community rewards")
                 self.use_communities = False
             else:
                 num_papers = len(self.community_detector.paper_communities)
@@ -332,198 +332,106 @@ class AdvancedGraphTraversalEnv:
         """Normalize paper ID to consistent format."""
         if not paper_id:
             return ""
-        # Convert to string and strip whitespace
+
         paper_id = str(paper_id).strip()
-        # Remove leading zeros
         paper_id = paper_id.lstrip('0')
-        # If removing zeros made it empty, it was "0000..." so return "0"
         return paper_id if paper_id else "0"
+    
 
-
-
-    def _calculate_community_reward(self) -> Tuple[Tuple[float , str] , str]:
-        """
-        Calculate reward/penalty based on community exploration patterns.
-        Returns: (node_type_reward, node_type) , reason
-        """
+    def calculate_community_reward(self) -> Tuple[float, str, str]:
         if not self.use_communities or self.current_community is None:
-            return (0.0, "None") , "no_community"
+            return (0.0, None, 'no_community')
         
-        if self.current_community is None:
-            if self.previous_community is not None:
-                return (-0.1, "None") ,  "left_cache"
-            return (0.0, "None") ,  "no_community"
-        
-        if len(self.community_history) < 2:
-            return (0.0 , "Papers") ,  "no temporal history recorded for papers"
-        
-        if len(self.author_hist) < 2: 
-            return (0.0 , "Authors") , "no temporal history recorded for authors"
-    
         paper_reward = 0.0
-        author_reward = 0.0
         reasons = []
-
-        paper_id = self.current_comm_node.get('paper_id')
-        author_id = self.current_comm_node.get('author_id')
-
-        if self.steps_in_current_community == 1 and self.previous_community: 
-            if self.previous_community != self.current_community: 
-                if paper_id : 
-                    paper_reward += self.config.COMMUNITY_SWITCH_BONUS
-                
-                else: 
-                    author_reward += self.config.COMMUNITY_SWITCH_BONUS
-
-
-        if self.steps_in_current_community == 1 and self.previous_community is not None:
-            if self.current_community != self.previous_community:
-                if paper_id:
-                    paper_reward += self.config.COMMUNITY_SWITCH_BONUS
-                    reasons.append(f"switch_bonus:+{self.config.COMMUNITY_SWITCH_BONUS:.2f}")
-
-                elif author_id: 
-                    author_reward += self.config.COMMUNITY_SWITCH_BONUS
-                    reasons.append(f"switch_bonus:+{self.config.COMMUNITY_SWITCH_BONUS}")
-                    
-    
-        if self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
-            paper_penalty = self.config.COMMUNITY_STUCK_PENALTY
-            author_penalty = self.config.COMMUNITY_STUCK_PENALTY
-
-            if paper_id: 
-                if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
-                    paper_penalty *= self.config.SEVERE_STUCK_MULTIPLIER
-                    reasons.append(f"severe_stuck:{paper_penalty:.2f}")
-                else: 
-                    reasons.append(f"stuck: {paper_penalty}")
-
-            elif author_id: 
-                if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
-                    paper_penalty *= self.config.SEVERE_STUCK_MULTIPLIER
-                    reasons.append(f"severe_stuck:{paper_penalty:.2f}")        
-                else:
-                    reasons.append(f"stuck:{author_penalty:.2f}")
-            
-            paper_reward += paper_penalty
-            author_reward += author_penalty
         
-        if len(self.community_history) and len(self.author_hist)> 1:
-            if paper_id:
-                previous_communities = [c for _, c in self.community_history[:-1]]
-                if self.current_community in previous_communities:
-                    paper_reward += self.config.COMMUNITY_LOOP_PENALTY
-                    reasons.append(f"loop:{self.config.COMMUNITY_LOOP_PENALTY:.2f}")
+        paper_id = self.current_comm_node.get('paperId')
 
-            if author_id:
-                previous_communities = [c for _, c in self.community_history[:-1]]
-                if self.current_community in previous_communities:
-                    paper_reward += self.config.COMMUNITY_LOOP_PENALTY
-                    reasons.append(f"loop:{self.config.COMMUNITY_LOOP_PENALTY:.2f}")
+        if not self.use_communities: 
+            return 0.0 , None , 'no_community'
+        
+        if self.previous_community and self.previous_community.startswith('MISC_P'):
+            if self.current_community and not self.current_community.startswith('MISC_P'):
+                paper_reward += 3.0  # Big bonus for escaping!
+                reasons.append("escaped_MISC:+3.0")
+        # 1. Community switch bonus (exploration)
+        if (self.steps_in_current_community == 1 and 
+            self.previous_community and 
+            self.current_community != self.previous_community):
+            
+            paper_reward += self.config.COMMUNITY_SWITCH_BONUS
+            reasons.append(f'switch:+{self.config.COMMUNITY_SWITCH_BONUS:.1f}')
+            
+            # Extra bonus for NEW community
+            if self.current_community not in self.visited_communities:
+                discovery_bonus = 3.0
+                paper_reward += discovery_bonus
+                reasons.append(f'discovery:+{discovery_bonus:.1f}')
+        
+        # 2. Stuck penalty (escalating)
+        if self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
+            base_penalty = self.config.COMMUNITY_STUCK_PENALTY
+            
+            if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
+                # Escalate penalty exponentially
+                multiplier = 1.5 ** (self.steps_in_current_community - self.config.SEVERE_STUCK_THRESHOLD)
+                penalty = base_penalty * min(multiplier, 5.0)  
+                paper_reward += penalty
+                reasons.append(f'severe_stuck:{penalty:.1f}')
+            else:
+                paper_reward += base_penalty
+                reasons.append(f'stuck:{base_penalty:.1f}')
+        
+        # 3. Loop penalty (returning to old community)
+        if len(self.community_history) > 2:
+            previous_communities = [c for c in self.community_history[:-1]]
+            if self.current_community in previous_communities:
+                loop_penalty = self.config.COMMUNITY_LOOP_PENALTY
                 
-            if self.current_community and self.current_author: 
-                visit_count_paper = self.community_visit_count[self.current_community]
-
-            if self.current_author: 
-                visit_count_author = self.author_visit_count[self.current_author]
+                recency = len(self.community_history) - previous_communities.index(self.current_community) - 1
+                if recency <= 2:  
+                    loop_penalty *= 2.0
                 
-                if visit_count_paper and visit_count_author > 2: 
-                    if paper_id:
-                        paper_reward += self.config.REVISIT_PENALTY*(visit_count_paper - 2)
-                        reasons.append(f"revisit penalty{self.config.REVISIT_PENALTY:.2f}")
-                    if author_id:
-                        author_reward += self.config.REVISIT_PENALTY*(visit_count_author -2)
-                        reasons.append(f"revisit penalty{self.config.REVISIT_PENALTY}")
-                    
-        unique_paper_communities = len(self.community_visit_count)
-        unique_author_communities = len(self.author_visit_count)
-        if unique_paper_communities and unique_author_communities >= 3:
-            if paper_id: 
-                diversity_bonus = self.config.DIVERSE_COMMUNITY_BONUS * (unique_paper_communities - 2)
-                paper_reward += diversity_bonus
-                reasons.append(f"diversity:+{diversity_bonus:.2f}")
-            if author_id: 
-                diversity_bonus = self.config.DIVERSE_COMMUNITY_BONUS*(unique_paper_communities-2)
-                author_reward += diversity_bonus
-                reasons.append(f"diversity+{self.config.DIVERSE_COMMUNITY_BONUS}")
-
+                paper_reward += loop_penalty
+                reasons.append(f'loop:{loop_penalty:.1f}')
+        
+        # 4. Diversity bonus
+        unique_communities = len(self.visited_communities)
+        if unique_communities >= 5:
+            diversity_bonus = min((unique_communities - 4) * 1.0, 10.0)
+            paper_reward += diversity_bonus
+            reasons.append(f'diversity:+{diversity_bonus:.1f}')
+        
+        # 5. Community size bonus
         if paper_id:
             size = self.community_detector.get_community_size(self.current_community)
+            if 10 <= size <= 100:  # Sweet spot
+                size_bonus = self.config.COMMUNITY_SIZE_BONUS
+                paper_reward += size_bonus
+                reasons.append(f'size:+{size_bonus:.1f}')
+            elif size < 5:  # Too small
+                paper_reward -= 0.5
+                reasons.append('tiny:-0.5')
         
-            if 5 <= size <= 50: 
-                paper_reward += self.config.COMMUNITY_SIZE_BONUS
-                reasons.append(f"size:{self.config.COMMUNITY_SIZE_BONUS:.2f}")
-
-            elif 50 <= size <= 200: 
-                paper_reward += 0.1 
-
-        elif author_id:
-            size = self.community_detector.get_community_size(self.current_community)
-        
-            if 5 <= size <= 50: 
-                author_reward += self.config.COMMUNITY_SIZE_BONUS
-                reasons.append(f"size:{self.config.COMMUNITY_SIZE_BONUS:.2f}")
-
-            elif 50 <= size <= 200: 
-                author_reward += 0.1 
-        
-        if paper_id: 
-
-            prev_comm = self.community_history[-2][1]
-            
-            try: 
-                prev_year = int(prev_comm.split('_')[0])
-                curr_year = int(self.current_community.split('_')[0])
-
-                if prev_year < curr_year: 
-                    paper_reward += self.config.TEMPORAL_JUMP_BONUS
-                else: 
-                    paper_reward += self.config.TEMPORAL_JUMP_PENALTY
-            
-            except: 
-                pass 
-
-        elif author_id:
-            prev_comm = self.community_history[-2][1]
-            
-            try: 
-                prev_year = int(prev_comm.split('_')[0])
-                curr_year = int(self.current_community.split('_')[0])
-
-                if prev_year < curr_year: 
-                    paper_reward += self.config.TEMPORAL_JUMP_BONUS
-                else: 
-                    paper_reward += self.config.TEMPORAL_JUMP_PENALTY
-            
-            except: 
-                pass 
-
-        if self.use_communities:
-            current_comm = self.community_detector.get_community(self.current_paper_id)
-            
-            new_communities_available = 0
-            for node_dict, _ in self.available_worker_nodes:
-                node_id = node_dict.get('paper_id')
-                if node_id:
-                    node_comm = self.community_detector.get_community(node_id)
-                    if node_comm and node_comm != current_comm:
-                        if node_comm not in self.visited:
-                            new_communities_available += 1
-            
-            if new_communities_available > 0:
-                if paper_id:
-                    paper_reward += 1.0 * min(new_communities_available, 3)  
-                else:
-                    author_reward += 1.0 * min(new_communities_available, 3)  
+        # 6. Temporal coherence 
+        if len(self.community_history) > 1:
+            try:
+                prev_comm = self.community_history[-2]
+                prev_year = int(prev_comm.split('_')[-1])
+                curr_year = int(self.current_community.split('_')[-1])
                 
-            elif current_comm and len(self.visited) < 5:
-                if paper_id:
-                    paper_reward += 0.3 
-                else: 
-                    author_reward += 0.3
+                if curr_year > prev_year:  # Moving forward in time
+                    paper_reward += self.config.TEMPORAL_JUMP_BONUS
+                    reasons.append(f'temporal:+{self.config.TEMPORAL_JUMP_BONUS:.1f}')
+                elif curr_year < prev_year - 3:  # Jumping too far back
+                    paper_reward += self.config.TEMPORAL_JUMP_PENALTY
+                    reasons.append(f'old_jump:{self.config.TEMPORAL_JUMP_PENALTY:.1f}')
+            except:
+                pass
+        
+        reason_str = ', '.join(reasons) if reasons else 'none'
+        return (paper_reward, 'Paper', reason_str)
 
-        reason_str = ", ".join(reasons) if reasons else "none"
-        return ((paper_reward , "Paper") , reason_str) if paper_id else ((author_reward , "Author") , reason_str)
     
 
     def _calculate_trajectory_rewards(self) -> float:
@@ -878,7 +786,59 @@ class AdvancedGraphTraversalEnv:
         """Constructs state vector."""
         node_emb = await self._get_node_embedding(self.current_node)
         intent_vec = self._get_intent_vector(self.current_intent)
-        return np.concatenate([self.query_embedding, node_emb, intent_vec])
+        community_features = self._get_community_features()
+    
+        return np.concatenate([
+            self.query_embedding,      # 384-dim
+            node_emb,                  # 384-dim
+            intent_vec,                # 5-dim
+            community_features         # NEW: 10-dim
+        ]) 
+
+
+    def _get_community_features(self) -> np.ndarray:
+        """Extract community-aware features for agent state."""
+        features = np.zeros(10, dtype=np.float32)
+        
+        if not self.use_communities or self.current_community is None:
+            return features
+        
+        features[0] = min(self.steps_in_current_community / 10.0, 1.0)
+    
+        features[1] = min(len(self.visited_communities) / 20.0, 1.0)
+        
+        comm_size = self.community_detector.get_community_size(self.current_community)
+        features[2] = min(np.log1p(comm_size) / 5.0, 1.0)  
+        features[3] = 1.0 if (self.previous_community and 
+                            self.current_community != self.previous_community) else 0.0
+    
+        if len(self.community_history) > 1:
+            previous_comms = [c for c in self.community_history[:-1]]
+            features[4] = 1.0 if self.current_community in previous_comms else 0.0
+
+        features[5] = 1.0 if self.steps_in_current_community >= self.config.STUCK_THRESHOLD else 0.0
+        
+        if self.available_worker_nodes:
+            target_communities = set()
+            for node, _ in self.available_worker_nodes:
+                node_id = node.get('paperId')
+                if node_id:
+                    comm = self.community_detector.get_community(node_id)
+                    if comm:
+                        target_communities.add(comm)
+            features[6] = min(len(target_communities) / 5.0, 1.0)
+        
+        
+        visit_count = self.community_visit_count.get(self.current_community, 0)
+        features[8] = min(visit_count / 5.0, 1.0)
+        
+        # Feature 9: Exploration pressure (stuck + loop combined)
+        if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
+            features[9] = 1.0  # Strong signal to leave
+        elif self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
+            features[9] = 0.5
+        
+        return features 
 
 
     async def get_manager_actions(self) -> List[int]:
@@ -1177,14 +1137,46 @@ class AdvancedGraphTraversalEnv:
         
         visit_count = self.node_visit_count.get(node_id, 0)
         return visit_count >= self.max_revisits
-
-
-
+    
     async def get_worker_actions(self) -> List[Tuple[Dict, int]]:
         if not self.available_worker_nodes:
             return []
         
-        return self.available_worker_nodes
+        actions = self.available_worker_nodes
+        
+        if not self.use_communities:
+            return actions
+        
+        annotated_actions = []
+        for node, relation_type in actions:
+            paper_id = node.get('paperId')
+            if not paper_id:
+                annotated_actions.append((node, relation_type, None, False))
+                continue
+            
+            target_comm = self.community_detector.get_community(paper_id)
+            is_new_comm = (target_comm != self.current_community and 
+                        target_comm not in self.visited_communities)
+            
+            annotated_actions.append((node, relation_type, target_comm, is_new_comm))
+        
+        if self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
+            new_comm_actions = [(n, r) for n, r, c, is_new in annotated_actions if is_new]
+            diff_comm_actions = [(n, r) for n, r, c, is_new in annotated_actions 
+                                if not is_new and c != self.current_community]
+            same_comm_actions = [(n, r) for n, r, c, is_new in annotated_actions 
+                                if c == self.current_community]
+            
+            prioritized = new_comm_actions + diff_comm_actions + same_comm_actions
+            
+            print(f"  [COMM-FILTER] Stuck! Prioritizing: " +
+                f"{len(new_comm_actions)} new, " +
+                f"{len(diff_comm_actions)} different, " +
+                f"{len(same_comm_actions)} same")
+            
+            return prioritized 
+        
+        return actions 
 
 
 
@@ -1193,8 +1185,10 @@ class AdvancedGraphTraversalEnv:
         """Enhanced worker step with balanced rewards."""
         self.current_step += 1
         self.episode_stats['total_nodes_explored'] += 1
+        worker_reward = 0.0
         
         self.current_node = self._normalize_node_keys(chosen_node)
+        self.current_comm_node = self.current_node
         paper_id = self.current_node.get('paper_id')
         author_id = self.current_node.get('author_id')
 
@@ -1241,6 +1235,7 @@ class AdvancedGraphTraversalEnv:
             print(f"  [DEBUG] Step {self.current_step}: sim={semantic_sim:.3f}, {'paper' if paper_id else 'author'}={display}")
 
         if semantic_sim > self.best_similarity_so_far:
+            worker_reward += 100.0
             self.best_similarity_so_far = semantic_sim
             self.episode_stats['max_similarity_achieved'] = semantic_sim
 
@@ -1414,9 +1409,15 @@ class AdvancedGraphTraversalEnv:
         
         if semantic_sim > 0.65 and self.current_step <= 10:
             worker_reward += 30.0
-        if self.use_communities:
-            community_reward = self._calculate_community_reward()
-            worker_reward += community_reward
+
+        if self.use_communities and (self.current_step <= 5 or self.current_step % 5 == 0):
+
+            comm_reward , node_type , comm_reason = self.calculate_community_reward()
+            print(f"[COMM] Step {self.current_step} : {self.current_community}")
+            print(f"    Visited: {len(self.visited_communities)} unique | " +
+              f"Steps here: {self.steps_in_current_community} | " +
+              f"Reward: {comm_reward:.1f} ({comm_reason})")
+            worker_reward += comm_reward
 
 
         worker_reward = np.clip(worker_reward, -100.0, 250.0)
@@ -1453,7 +1454,6 @@ class AdvancedGraphTraversalEnv:
         if current == target:
             return True
         
-        # Contains match (for partial titles like "BERT" matching "BERT: Pre-training...")
         if target in current or current in target:
             if len(target) > 3:
                 return True
@@ -1493,11 +1493,9 @@ class AdvancedGraphTraversalEnv:
             pass
         
         return False
-
     
     def get_episode_summary(self) -> Dict[str, Any]:
-        """Get detailed episode summary with community stats."""
-        return {
+        summary = {
             **self.episode_stats,
             'path_length': len(self.trajectory_history),
             'relation_diversity': len(self.relation_types_used),
@@ -1505,8 +1503,20 @@ class AdvancedGraphTraversalEnv:
                 self.episode_stats['unique_communities_visited'] / 
                 max(1, self.episode_stats['total_nodes_explored'])
             ),
-            'query_facets': self.current_query_facets 
         }
+        
+        if hasattr(self, 'current_query_facets') and self.current_query_facets:
+            summary['query_facets'] = self.current_query_facets
+        elif hasattr(self, 'query_intent') and self.query_intent:
+            summary['query_intent'] = {
+                'target_entity': self.query_intent.target_entity if hasattr(self.query_intent, 'target_entity') else 'N/A',
+                'operation': self.query_intent.operation if hasattr(self.query_intent, 'operation') else 'N/A',
+            }
+        else:
+            summary['query_facets'] = None
+        
+        return summary
+
 
     async def get_valid_actions(self) -> List[Tuple[Dict, int]]:
         paper_id = self.current_node.get('paper_id')

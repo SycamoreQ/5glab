@@ -47,7 +47,7 @@ class QNetwork(nn.Module):
 
 
 class DDQLAgent:
-    def __init__(self, state_dim=773, text_dim=384, use_prioritized=True, precomputed_embeddings=None):
+    def __init__(self, state_dim=783, text_dim=384, use_prioritized=True, precomputed_embeddings=None):
         self.state_dim = state_dim
         self.text_dim = text_dim
         self.relation_dim = 13

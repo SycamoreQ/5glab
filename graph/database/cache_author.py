@@ -1,195 +1,123 @@
-import asyncio
 import pickle
 import os
-from collections import Counter
-from graph.database.store import EnhancedStore
+from collections import defaultdict
 
 
-async def build_author_cache_small_batches(max_authors: int = 10000, batch_size: int = 1000):
-    print("Building high-quality author cache (MEMORY-EFFICIENT VERSION)\n")
-    store = EnhancedStore(pool_size=5)
-    
-    print(f"Target: {max_authors:,} high-quality authors")
-    print(f"Criteria: Papers >= 5\n")
-    print("Step 1: Finding qualifying authors...")
-    
-    id_query = """
-    MATCH (a:Author)-[:WROTE]->(p:Paper)
-    WHERE a.authorId IS NOT NULL
-      AND a.name IS NOT NULL
-    WITH a, COUNT(DISTINCT p) as paper_count
-    WHERE paper_count >= 5
-    RETURN a.authorId as author_id, a.name as name, paper_count
-    ORDER BY paper_count DESC
-    LIMIT $1
-    """
-    
-    try:
-        author_ids = await store._run_query_method(id_query, [max_authors])
-        print(f"✓ Found {len(author_ids):,} qualifying authors\n")
-    except Exception as e:
-        print(f"Error: {e}")
-        await store.pool.close()
-        return
-    
-    if not author_ids:
-        print("No authors found!")
-        await store.pool.close()
-        return
-    
-    print(f"Step 2: Enriching authors in batches of {batch_size:,}...")
-    all_authors = []
-    
-    total_batches = (len(author_ids) + batch_size - 1) // batch_size
-    
-    for batch_num in range(0, len(author_ids), batch_size):
-        batch = [a['author_id'] for a in author_ids[batch_num:batch_num+batch_size]]
-        
-        query1 = """
-        MATCH (a:Author)-[:WROTE]->(p:Paper)
-        WHERE a.authorId IN $1
-          AND p.year IS NOT NULL
-        
-        WITH a, 
-             COUNT(DISTINCT p) as paper_count,
-             SUM(COALESCE(p.citationCount, 0)) as total_citations,
-             SIZE([year IN COLLECT(DISTINCT p.year) WHERE year >= 2020]) as recent_papers
-        
-        RETURN 
-          a.authorId as author_id,
-          a.name as name,
-          paper_count,
-          total_citations,
-          recent_papers
-        """
-    
-        query2 = """
-        MATCH (a:Author)-[:WROTE]->(:Paper)<-[:WROTE]-(collab:Author)
-        WHERE a.authorId IN $1
-          AND a <> collab
-        
-        WITH a, COUNT(DISTINCT collab) as collab_count
-        
-        RETURN a.authorId as author_id, collab_count
-        """
-        
-        try:
-            results1 = await store._run_query_method(query1, [batch])
-            results2 = await store._run_query_method(query2, [batch])
-        
-            collab_map = {r['author_id']: r['collab_count'] for r in results2}
-            
-            for r in results1:
-                author_id = r['author_id']
-                paper_count = r['paper_count']
-                total_citations = r['total_citations']
-                collab_count = collab_map.get(author_id, 0)
-                
-                h_index = min(paper_count, int((total_citations / max(paper_count, 1)) ** 0.5))
-                
-                impact_score = (
-                    paper_count * 2.0 + 
-                    total_citations / 10.0 + 
-                    collab_count + 
-                    h_index * 5.0
-                )
-                
-                all_authors.append({
-                    'author_id': author_id,
-                    'name': r['name'],
-                    'paper_count': paper_count,
-                    'total_citations': total_citations,
-                    'collaborator_count': collab_count,
-                    'recent_papers': r['recent_papers'],
-                    'impact_score': impact_score,
-                    'h_index': h_index,
-                    'citation_velocity': 0,  #skip for speed (will add later)
-                    'pub_diversity': 0       #skip for speed (will add later)
-                })
-            
-            processed = min(batch_num + batch_size, len(author_ids))
-            current_batch = (batch_num // batch_size) + 1
-            print(f"  Batch {current_batch}/{total_batches}: Processed {processed:,}/{len(author_ids):,} authors")
-            
-        except Exception as e:
-            print(f"Error processing batch {current_batch}: {e}")
-            print(f"  Trying to continue...")
-            continue
-    
-    await store.pool.close()
-    
-    if not all_authors:
-        print("\nNo authors could be processed!")
-        return
-    
-    all_authors.sort(key=lambda x: x['impact_score'], reverse=True)
-    
-    print(f"AUTHOR CACHE STATISTICS")
-    
-    print(f"Total authors: {len(all_authors):,}")
-    
-    if all_authors:
-        avg_papers = sum(a['paper_count'] for a in all_authors) / len(all_authors)
-        avg_citations = sum(a['total_citations'] for a in all_authors) / len(all_authors)
-        avg_collabs = sum(a['collaborator_count'] for a in all_authors) / len(all_authors)
-        avg_hindex = sum(a['h_index'] for a in all_authors) / len(all_authors)
-        
-        print(f"Avg papers: {avg_papers:.1f}")
-        print(f"Avg citations: {avg_citations:.1f}")
-        print(f"Avg collaborators: {avg_collabs:.1f}")
-        print(f"Avg h-index: {avg_hindex:.1f}")
-    
-    if len(all_authors) >= 10:
-        print(f"\nTop 10 Authors by Impact:")
-        for i, author in enumerate(all_authors[:10]):
-            print(f"  {i+1}. {author['name'][:50]}")
-            print(f"      h-index: {author['h_index']}, papers: {author['paper_count']}, citations: {author['total_citations']}")
-    
-    paper_bins = Counter()
-    for a in all_authors:
-        count = a['paper_count']
-        if count < 10:
-            paper_bins['5-9'] += 1
-        elif count < 20:
-            paper_bins['10-19'] += 1
-        elif count < 50:
-            paper_bins['20-49'] += 1
-        else:
-            paper_bins['50+'] += 1
-    
-    print(f"\nPaper Count Distribution:")
-    for bin_name in ['5-9', '10-19', '20-49', '50+']:
-        if bin_name in paper_bins:
-            print(f"  {bin_name} papers: {paper_bins[bin_name]:,} authors")
-    
-    cache_file = 'training_authors.pkl'
-    with open(cache_file, 'wb') as f:
-        pickle.dump(all_authors, f)
-    
-    file_size_mb = os.path.getsize(cache_file) / 1024 / 1024
-    
-    print(f"\n{'='*70}")
-    print(f"AUTHOR CACHE SAVED")
-    print(f"{'='*70}")
-    print(f"File: {cache_file}")
-    print(f"Authors: {len(all_authors):,}")
-    print(f"Size: {file_size_mb:.1f} MB")
-    print(f"Estimated time: {total_batches * 3} seconds ({total_batches} batches × 3 sec/batch)")
-    
-    return all_authors
+def normalize_id(id_str: str) -> str:
+    """Normalize ID to consistent format."""
+    if not id_str:
+        return ""
+    id_str = str(id_str).strip()
+    id_str = id_str.lstrip('0')
+    return id_str if id_str else "0"
 
 
-if __name__ == "__main__":
-    import argparse
+def main():
+    print("EXTRACTING TO TRAINING CACHE FORMAT")
+    input_file = 'pruned_graph_1M.pkl'
+    print(f"\nLoading {input_file}...")
     
-    parser = argparse.ArgumentParser(description='Build author cache (memory-efficient)')
-    parser.add_argument('--max-authors', type=int, default=50000, 
-                       help='Maximum number of authors to cache (default: 50000)')
-    parser.add_argument('--batch-size', type=int, default=1000,
-                       help='Batch size (smaller = slower but safer, default: 1000)')
-    args = parser.parse_args()
+    with open(input_file, 'rb') as f:
+        graph_data = pickle.load(f)
     
-    asyncio.run(build_author_cache_small_batches(
-        max_authors=args.max_authors,
-        batch_size=args.batch_size
+    papers = graph_data['papers']
+    citations = graph_data['citations']
+    
+    print(f"✓ Loaded {len(papers):,} papers")
+    print(f"✓ Loaded {len(citations):,} citations")
+    
+    cache_dir = 'training_cache'
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    print(f"\nSaving papers...")
+    papers_file = os.path.join(cache_dir, 'training_papers_1M.pkl')
+    with open(papers_file, 'wb') as f:
+        pickle.dump(papers, f)
+    
+    file_size = os.path.getsize(papers_file) / 1024 / 1024
+    print(f"Saved {papers_file} ({file_size:.1f} MB)")
+    
+    papers_with_authors = sum(1 for p in papers if p.get('authors'))
+    avg_authors = sum(len(p.get('authors', [])) for p in papers) / len(papers)
+    print(f"  Papers with authors: {papers_with_authors:,} ({100*papers_with_authors/len(papers):.1f}%)")
+    print(f"  Avg authors per paper: {avg_authors:.1f}")
+    
+    print(f"\nBuilding edge cache...")
+    edge_cache = defaultdict(list)
+    
+    for edge in citations:
+        source = normalize_id(str(edge['source']))
+        target = normalize_id(str(edge['target']))
+        
+        edge_cache[source].append(('cites', target))
+        edge_cache[target].append(('citedby', source))
+    
+    edge_cache = dict(edge_cache)
+    
+    print(f"✓ Built edge cache with {len(edge_cache):,} nodes")
+    print(f"  Total directed edges: {sum(len(v) for v in edge_cache.values()):,}")
+    
+    edges_file = os.path.join(cache_dir, 'edge_cache_1M.pkl')
+    with open(edges_file, 'wb') as f:
+        pickle.dump(edge_cache, f)
+    
+    file_size = os.path.getsize(edges_file) / 1024 / 1024
+    print(f"✓ Saved {edges_file} ({file_size:.1f} MB)")
+    
+    # 3. Build paper ID set
+    print(f"\nBuilding paper ID set...")
+    paper_id_set = {normalize_id(str(p['paperId'])) for p in papers}
+    
+    paper_ids_file = os.path.join(cache_dir, 'paper_id_set_1M.pkl')
+    with open(paper_ids_file, 'wb') as f:
+        pickle.dump(paper_id_set, f)
+    
+    file_size = os.path.getsize(paper_ids_file) / 1024 / 1024
+    print(f"✓ Saved {paper_ids_file} ({file_size:.1f} MB)")
+    print(f"  Paper IDs: {len(paper_id_set):,}")
+    
+    print("TRAINING CACHE STATISTICS")
+
+    degrees = [len(edges) for edges in edge_cache.values()]
+    print(f"Papers: {len(papers):,}")
+    print(f"Citations: {len(citations):,}")
+    print(f"Avg degree: {sum(degrees)/len(degrees):.1f}")
+    print(f"Max degree: {max(degrees)}")
+    print(f"Min degree: {min(degrees)}")
+    
+    # Author statistics
+    total_authors = sum(len(p.get('authors', [])) for p in papers)
+    unique_authors = len(set(
+        a['authorId'] 
+        for p in papers 
+        for a in p.get('authors', []) 
+        if a.get('authorId')
     ))
+    
+    print(f"\nAuthor Statistics:")
+    print(f"  Total author entries: {total_authors:,}")
+    print(f"  Unique authors: {unique_authors:,}")
+    print(f"  Avg authors per paper: {total_authors/len(papers):.1f}")
+    
+    field_counter = defaultdict(int)
+    for p in papers:
+        fields = p.get('fieldsOfStudy') or p.get('fields') or []
+        if isinstance(fields, list):
+            for field in fields[:1]:
+                if field:
+                    field_counter[str(field)] += 1
+    
+    print(f"\nTop 10 Fields:")
+    for i, (field, count) in enumerate(sorted(field_counter.items(), key=lambda x: x[1], reverse=True)[:10], 1):
+        print(f"  {i:2d}. {field[:30]:30s} {count:6,d} papers")
+    
+    print("✓ TRAINING CACHE READY")
+    print(f"Location: {cache_dir}/")
+    print(f"Files:")
+    print(f"  - training_papers_1M.pkl")
+    print(f"  - edge_cache_1M.pkl")
+    print(f"  - paper_id_set_1M.pkl")
+
+
+if __name__ == '__main__':
+    main()

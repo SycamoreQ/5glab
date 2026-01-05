@@ -1,4 +1,3 @@
-
 import asyncio
 import pickle
 import numpy as np
@@ -19,10 +18,9 @@ async def extract_query_critical_papers(
     """Get papers highly relevant to queries, reusing existing embeddings."""
     
     print(f"\n{'='*70}")
-    print("EXTRACTING QUERY-CRITICAL PAPERS (REUSING EMBEDDINGS)")
+    print("EXTRACTING QUERY-CRITICAL PAPERS (WITH AUTHORS)")
     print(f"{'='*70}")
     
-    # Fetch candidates from Neo4j
     query = """
     MATCH (p:Paper)
     WHERE p.year >= $1
@@ -30,18 +28,27 @@ async def extract_query_critical_papers(
     AND p.title IS NOT NULL
     AND p.abstract IS NOT NULL
     AND size(p.abstract) >= 20
+    
+    OPTIONAL MATCH (p)<-[:WROTE]-(a:Author)
+    
+    WITH p, COLLECT({
+        authorId: a.authorId,
+        name: a.name
+    }) as authors
+    
     RETURN p.paperId as paperId,
            p.title as title,
            p.year as year,
            p.abstract as abstract,
            p.fieldsOfStudy as fields,
            p.citationCount as citationCount,
-           p.venue as venue
+           p.venue as venue,
+           authors
     LIMIT 500000
     """
     
     candidates = await store._run_query_method(query, [min_year])
-    print(f" Found {len(candidates):,} candidates from Neo4j")
+    print(f"  ✓ Found {len(candidates):,} candidates from Neo4j")
 
     candidates_with_embeddings = [
         p for p in candidates 
@@ -49,7 +56,10 @@ async def extract_query_critical_papers(
     ]
     
     print(f"  ✓ {len(candidates_with_embeddings):,} already have embeddings")
-    print(f"  ⚠ {len(candidates) - len(candidates_with_embeddings):,} would need embedding (skipping)")
+    
+    # Check author data
+    papers_with_authors = sum(1 for p in candidates_with_embeddings if p.get('authors'))
+    print(f"  ✓ {papers_with_authors:,} have author data ({100*papers_with_authors/len(candidates_with_embeddings):.1f}%)")
     
     candidate_embeddings = {
         p['paperId']: existing_embeddings[str(p['paperId'])]
@@ -81,13 +91,17 @@ async def extract_query_critical_papers(
     return query_paper_list
 
 
-
-async def extract_year_bucket(store, year_min: int, year_max: int,
-                               min_abstract_len=50, min_degree=1,
-                               target_count=50_000) -> List[Dict]:
-    """Extract high-quality papers from a year bucket (UNCHANGED)."""
+async def extract_year_bucket(
+    store, 
+    year_min: int, 
+    year_max: int,
+    min_abstract_len=50, 
+    min_degree=1,
+    target_count=50_000
+) -> List[Dict]:
+    """Extract high-quality papers from a year bucket WITH AUTHORS."""
     print(f"\n{'='*70}")
-    print(f"EXTRACTING BUCKET: {year_min}-{year_max}")
+    print(f"EXTRACTING BUCKET: {year_min}-{year_max} (WITH AUTHORS)")
     print(f"{'='*70}")
     
     query = """
@@ -97,12 +111,27 @@ async def extract_year_bucket(store, year_min: int, year_max: int,
     AND p.title IS NOT NULL
     AND p.abstract IS NOT NULL
     AND size(p.abstract) >= $3
+    
     WITH p
     OPTIONAL MATCH (p)-[:CITES]->(ref:Paper)
     WITH p, count(ref) as out_degree
+    
     OPTIONAL MATCH (citing:Paper)-[:CITES]->(p)
     WITH p, out_degree, count(citing) as in_degree
+    
     WHERE (in_degree + out_degree) >= $4
+    
+    WITH p, in_degree, out_degree
+    ORDER BY (in_degree + out_degree) DESC
+    LIMIT $5
+    
+    OPTIONAL MATCH (p)<-[:WROTE]-(a:Author)
+    
+    WITH p, in_degree, out_degree, COLLECT({
+        authorId: a.authorId,
+        name: a.name
+    }) as authors
+    
     RETURN p.paperId as paperId,
            p.title as title,
            p.year as year,
@@ -111,9 +140,8 @@ async def extract_year_bucket(store, year_min: int, year_max: int,
            p.citationCount as citationCount,
            p.venue as venue,
            in_degree,
-           out_degree
-    ORDER BY (in_degree + out_degree) DESC
-    LIMIT $5
+           out_degree,
+           authors
     """
     
     papers = await store._run_query_method(
@@ -122,21 +150,28 @@ async def extract_year_bucket(store, year_min: int, year_max: int,
     )
     
     if not papers:
-        print(f"No papers found")
+        print(f"  ⚠ No papers found")
         return []
     
-    print(f" ✓ Found {len(papers):,} papers")
+    print(f"  ✓ Found {len(papers):,} papers")
     if papers:
-        print(f" Avg degree: {np.mean([p['in_degree'] + p['out_degree'] for p in papers]):.1f}")
+        avg_degree = np.mean([p['in_degree'] + p['out_degree'] for p in papers])
+        papers_with_authors = sum(1 for p in papers if p.get('authors'))
+        print(f"  ✓ Avg degree: {avg_degree:.1f}")
+        print(f"  ✓ Papers with authors: {papers_with_authors:,} ({100*papers_with_authors/len(papers):.1f}%)")
+    
     return papers
 
 
-async def expand_with_cited_papers(store, core_papers: List[Dict],
-                                   max_refs_per_paper=20,
-                                   include_citing_papers=True , max_citing_per_paper=10) -> Tuple[List[Dict], List[Dict]]:
-    """Get citations (KEEP YOUR EXISTING CODE)."""
+async def expand_with_cited_papers(
+    store, 
+    core_papers: List[Dict],
+    max_refs_per_paper=20,
+    max_citing_per_paper=10
+) -> Tuple[List[Dict], List[Dict]]:
+    """Get citations WITH AUTHOR DATA for bridge papers."""
     print(f"\n{'='*70}")
-    print("EXPANDING WITH CITED PAPERS")
+    print("EXPANDING WITH CITED PAPERS (WITH AUTHORS)")
     print(f"{'='*70}")
     
     core_ids = [p['paperId'] for p in core_papers]
@@ -150,16 +185,25 @@ async def expand_with_cited_papers(store, core_papers: List[Dict],
     batch_size = 5000
     total_batches = (len(core_ids) + batch_size - 1) // batch_size
     
-    print(f" Fetching outgoing citations in {total_batches} batches...")
-    print(f" Target: {max_refs_per_paper} citations per paper")
+    print(f"  Fetching outgoing citations in {total_batches} batches...")
+    print(f"  Target: {max_refs_per_paper} citations per paper")
     
     for batch_idx, i in enumerate(range(0, len(core_ids), batch_size)):
         batch = core_ids[i:i+batch_size]
         
+        # UPDATED: Include authors for target papers
         citation_query = """
         UNWIND $1 AS pid
         MATCH (source:Paper {paperId: pid})-[:CITES]->(target:Paper)
         WHERE target.paperId IS NOT NULL
+        
+        OPTIONAL MATCH (target)<-[:WROTE]-(a:Author)
+        
+        WITH source, target, COLLECT({
+            authorId: a.authorId,
+            name: a.name
+        }) as target_authors
+        
         RETURN source.paperId as source,
                target.paperId as target,
                target.title as target_title,
@@ -167,7 +211,8 @@ async def expand_with_cited_papers(store, core_papers: List[Dict],
                target.abstract as target_abstract,
                target.fieldsOfStudy as target_fields,
                target.citationCount as target_citationCount,
-               target.venue as target_venue
+               target.venue as target_venue,
+               target_authors
         """
         
         batch_citations = await store._run_query_method(citation_query, [batch])
@@ -195,24 +240,35 @@ async def expand_with_cited_papers(store, core_papers: List[Dict],
                             'abstract': cit.get('target_abstract'),
                             'fieldsOfStudy': cit.get('target_fields'),
                             'citationCount': cit.get('target_citationCount', 0),
-                            'venue': cit.get('target_venue')
+                            'venue': cit.get('target_venue'),
+                            'authors': cit.get('target_authors', [])  # ✅ ADDED
                         }
         
         if (batch_idx + 1) % 5 == 0:
-            avg_so_far = len(all_edges) / len([s for s in citations_per_source if citations_per_source[s] > 0])
-            print(f" Batch {batch_idx+1}/{total_batches}: {len(all_edges):,} total edges, avg {avg_so_far:.1f} per paper")
+            avg_so_far = len(all_edges) / max(len([s for s in citations_per_source if citations_per_source[s] > 0]), 1)
+            print(f"    Batch {batch_idx+1}/{total_batches}: {len(all_edges):,} edges, avg {avg_so_far:.1f} per paper")
     
-    print(f" ✓ Found {len(all_edges):,} outgoing citations")
+    print(f"  ✓ Found {len(all_edges):,} outgoing citations")
     outgoing_count = len(all_edges)
-    print(f"\n Fetching incoming citations...")
+    
+    print(f"\n  Fetching incoming citations...")
     
     for batch_idx, i in enumerate(range(0, len(core_ids), batch_size)):
         batch = core_ids[i:i+batch_size]
         
+        # UPDATED: Include authors for citing papers
         citing_query = """
         UNWIND $1 AS pid
         MATCH (citing:Paper)-[:CITES]->(target:Paper {paperId: pid})
         WHERE citing.paperId IS NOT NULL
+        
+        OPTIONAL MATCH (citing)<-[:WROTE]-(a:Author)
+        
+        WITH citing, target, COLLECT({
+            authorId: a.authorId,
+            name: a.name
+        }) as source_authors
+        
         RETURN citing.paperId as source,
                target.paperId as target,
                citing.title as source_title,
@@ -220,7 +276,8 @@ async def expand_with_cited_papers(store, core_papers: List[Dict],
                citing.abstract as source_abstract,
                citing.fieldsOfStudy as source_fields,
                citing.citationCount as source_citationCount,
-               citing.venue as source_venue
+               citing.venue as source_venue,
+               source_authors
         """
         
         batch_citing = await store._run_query_method(citing_query, [batch])
@@ -235,7 +292,6 @@ async def expand_with_cited_papers(store, core_papers: List[Dict],
                 for cit in cits[:remaining]:
                     source_id = cit['source']
                     
-                    # Add edge
                     all_edges.append({
                         'source': source_id,
                         'target': target_id
@@ -250,17 +306,21 @@ async def expand_with_cited_papers(store, core_papers: List[Dict],
                             'abstract': cit.get('source_abstract'),
                             'fieldsOfStudy': cit.get('source_fields'),
                             'citationCount': cit.get('source_citationCount', 0),
-                            'venue': cit.get('source_venue')
+                            'venue': cit.get('source_venue'),
+                            'authors': cit.get('source_authors', []) 
                         }
         
         if (batch_idx + 1) % 5 == 0:
             incoming = len(all_edges) - outgoing_count
-            print(f" Batch {batch_idx+1}/{total_batches}: +{incoming:,} incoming edges")
+            print(f"    Batch {batch_idx+1}/{total_batches}: +{incoming:,} incoming edges")
     
     incoming_total = len(all_edges) - outgoing_count
-    print(f" ✓ Added {incoming_total:,} incoming citations")
-    print(f" ✓ Total edges: {len(all_edges):,}")
-    print(f" ✓ Bridge papers: {len(cited_papers):,}")
+    print(f"Added {incoming_total:,} incoming citations")
+    print(f"Total edges: {len(all_edges):,}")
+    print(f"Bridge papers: {len(cited_papers):,}")
+    
+    bridge_with_authors = sum(1 for p in cited_papers.values() if p.get('authors'))
+    print(f"Bridge papers with authors: {bridge_with_authors:,} ({100*bridge_with_authors/len(cited_papers):.1f}%)")
     
     return list(cited_papers.values()), all_edges
 
@@ -268,13 +328,17 @@ async def expand_with_cited_papers(store, core_papers: List[Dict],
 async def main():
     store = EnhancedStore(pool_size=20)
     
-    print("Loading encoder...")
+    print("="*80)
+    print("ENHANCED GRAPH PRUNING WITH AUTHOR DATA")
+    print("="*80)
+    
+    print("\nLoading encoder...")
     encoder = SentenceTransformer('all-MiniLM-L6-v2')
     
     print("Loading existing embeddings...")
     with open('training_cache/embeddings_1M.pkl', 'rb') as f:
         embeddings = pickle.load(f)
-    print(f"Loaded {len(embeddings):,} existing embeddings\n")
+    print(f"✓ Loaded {len(embeddings):,} existing embeddings\n")
     
     queries = [
         "deep learning convolutional neural networks",
@@ -285,9 +349,13 @@ async def main():
         "proximal policy optimization PPO reinforcement learning",
         "attention is all you need vaswani transformer",
         "deep double Q-network DDQN prioritized replay",
-        "AlexNet ImageNet convolutional neural network"
+        "AlexNet ImageNet convolutional neural network",
+        "generative adversarial networks GANs",
+        "variational autoencoder VAE",
+        "graph neural networks GNN message passing"
     ]
 
+    # 1. Extract query-critical papers
     query_critical = await extract_query_critical_papers(
         store, 
         queries, 
@@ -297,6 +365,7 @@ async def main():
         min_year=2010
     )
     
+    # 2. Extract year buckets
     buckets = [
         (2018, 2019, 50_000),
         (2020, 2021, 50_000),
@@ -314,6 +383,7 @@ async def main():
         )
         bucket_papers.extend(papers)
     
+    # 3. Deduplicate
     seen_ids = set()
     core_papers = []
     for p in query_critical + bucket_papers:
@@ -323,20 +393,40 @@ async def main():
             seen_ids.add(pid)
     
     print(f"\n{'='*70}")
-    print(f"CORE PAPERS: {len(core_papers):,}")
+    print(f"CORE PAPERS SUMMARY")
+    print(f"{'='*70}")
     print(f"  Query-critical: {len(query_critical):,}")
     print(f"  Bucket papers: {len(bucket_papers):,}")
     print(f"  After dedup: {len(core_papers):,}")
+    
+    # Check author data in core
+    core_with_authors = sum(1 for p in core_papers if p.get('authors'))
+    print(f"  With author data: {core_with_authors:,} ({100*core_with_authors/len(core_papers):.1f}%)")
     print(f"{'='*70}")
     
-    # 3. Expand with citations
+    # 4. Expand with citations
     bridge_papers, citations = await expand_with_cited_papers(
-        store, core_papers, max_refs_per_paper=20
+        store, core_papers, 
+        max_refs_per_paper=20,
+        max_citing_per_paper=10
     )
     
+    # 5. Combine all papers
     all_papers = core_papers + bridge_papers
-    paper_ids = [p['paperId'] for p in all_papers]
     
+    # Final author data check
+    total_with_authors = sum(1 for p in all_papers if p.get('authors'))
+    print(f"\n{'='*70}")
+    print(f"FINAL DATASET SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Total papers: {len(all_papers):,}")
+    print(f"  Core papers: {len(core_papers):,}")
+    print(f"  Bridge papers: {len(bridge_papers):,}")
+    print(f"  Total citations: {len(citations):,}")
+    print(f"  Papers with authors: {total_with_authors:,} ({100*total_with_authors/len(all_papers):.1f}%)")
+    print(f"{'='*70}")
+    
+    # 6. Save
     graph_data = {
         'papers': all_papers,
         'citations': citations,
@@ -345,26 +435,23 @@ async def main():
             'num_core_papers': len(core_papers),
             'num_bridge_papers': len(bridge_papers),
             'num_citations': len(citations),
-            'query_critical_papers': len(query_critical)
+            'query_critical_papers': len(query_critical),
+            'papers_with_authors': total_with_authors,
+            'author_coverage': total_with_authors / len(all_papers) if all_papers else 0
         }
     }
     
-    with open('pruned_graph_enhanced_1M.pkl', 'wb') as f:
+    output_file = 'pruned_graph_1M.pkl'
+    with open(output_file, 'wb') as f:
         pickle.dump(graph_data, f)
     
-    print(f"\n{'='*70}")
-    print("✓ SAVED: pruned_graph_enhanced_1M.pkl")
-    print(f"{'='*70}")
-    print(f"Core papers: {len(core_papers):,}")
-    print(f"Bridge papers: {len(bridge_papers):,}")
-    print(f"Total papers: {len(all_papers):,}")
-    print(f"Citations: {len(citations):,}")
-    print(f"Query-critical: {len(query_critical):,}")
+    print(f"\n✓ SAVED: {output_file}")
+    print(f"  Size: {os.path.getsize(output_file) / 1024 / 1024:.1f} MB")
     
     await store.pool.close()
     return graph_data
 
 
-
 if __name__ == '__main__':
+    import os
     asyncio.run(main())

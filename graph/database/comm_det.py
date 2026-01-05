@@ -1,518 +1,400 @@
 import asyncio
 import pickle
 import os
-from typing import Dict, Set, List, Tuple, Optional
+import hashlib
+from typing import Dict, List, Optional
 from collections import defaultdict, Counter
 import numpy as np
-from graph.database.store import EnhancedStore
+from tqdm import tqdm
+
 
 class CommunityDetector:
-
-    def __init__(self, store: EnhancedStore, cache_file: str = "communities_unified.pkl", use_leiden: bool = True):
-        self.store = store
-        self.cache_file = cache_file
-        self.paper_communities = {}
-        self.author_communities = {}
-        self.paper_community_sizes = {}
-        self.author_community_sizes = {}
-        self.is_loaded = False
-        self.use_leiden = use_leiden
-
-    async def build_communities(self, max_papers: int = None, max_authors: int = 20000):
-        print(f"Building unified communities (Papers + Authors)")
-        print(f"Method: {'Leiden (Graph-based)' if self.use_leiden else 'Tier-based (Metadata)'}")
-        
-        if self.use_leiden:
-            await self._build_paper_communities_leiden(max_papers)
+    def __init__(self, store=None, cache_file: str = None):
+        if cache_file:
+            self.cache_file = cache_file
         else:
-            await self._build_paper_communities_tier_based(max_papers)
+            self.cache_file = 'community_cache_1M.pkl'
+        self.store = store
+        self.paper_communities: Dict[str, str] = {}
+        self.paper_community_sizes: Dict[str, int] = {}
+        self.author_communities: Dict[str, str] = {}
+        self.author_community_sizes: Dict[str, int] = {}
+        self.is_loaded = False
+
+    def normalize_paper_id(self, paper_id: str) -> str:
+        if not paper_id:
+            return ""
+        paper_id = str(paper_id).strip().lstrip('0')
+        return paper_id if paper_id else "0"
+
+    def normalize_author_id(self, author_id: str) -> str:
+        if not author_id:
+            return ""
+        author_id = str(author_id).strip().lstrip('0')
+        return author_id if author_id else "0"
+
+    async def build_communities_from_cache(
+        self,
+        target_communities: int = 500,
+        min_author_papers: int = 5
+    ):
+        print(f"BUILDING HASH-BASED COMMUNITIES (TARGET: {target_communities})")
         
-        await self._build_author_communities(max_authors)
-        self._save_cache()
+        cache_dir = 'training_cache'
+        papers_file = os.path.join(cache_dir, 'training_papers_1M.pkl')
+        
+        print(f"Loading papers from {papers_file}...")
+        with open(papers_file, 'rb') as f:
+            papers = pickle.load(f)
+        
+        paper_ids = [
+            self.normalize_paper_id(str(p.get('paperId') or p.get('paper_id')))
+            for p in papers
+        ]
+        paper_ids = [pid for pid in paper_ids if pid]
+        
+        print(f"Loaded {len(paper_ids):,} papers")
+        
+        await self.detect_paper_communities_hash_based(paper_ids, target_communities)
+        await self._build_author_communities(papers, min_author_papers)
+        
+        self.save_cache()
         self.is_loaded = True
         
-        print("\nCOMMUNITY DETECTION COMPLETE")
-        print(f"Paper communities: {len(set(self.paper_communities.values()))}")
-        print(f"Author communities: {len(set(self.author_communities.values()))}")
-        print(f"Total papers covered: {len(self.paper_communities)}")
-        print(f"Total authors covered: {len(self.author_communities)}")
+        print(f"All communities cached to {self.cache_file}")
 
-
-    async def _build_paper_communities_leiden(self, max_papers: Optional[int]):
-        print("\nPAPER communities using Leiden")
-
-        training_file = "training_papers.pkl"
-        if not os.path.exists(training_file):
-            print(f"{training_file} not found! Run cache_once.py first.")
-            await self._build_paper_communities_tier_based(max_papers)
-            return
+    async def detect_paper_communities_hash_based(
+        self,
+        paper_ids: List[str],
+        target_communities: int
+    ):
+        print("\nPAPER COMMUNITIES (HASH-BASED SHARDING)")
         
-        print(f" Loading cached paper IDs from {training_file}...")
-        with open(training_file, 'rb') as f:
-            cached_papers = pickle.load(f)
+        print("Fetching metadata for enrichment...")
+        metadata_map = await self._fetch_metadata_batch(paper_ids)
         
-        paper_ids = [p['paper_id'] for p in cached_papers]
-        print(f" Loaded {len(paper_ids):,} paper IDs from cache")
+        print(f"\nAssigning papers to {target_communities} balanced communities...")
         
-        print("\n  Dropping existing graph projection...")
-        drop_query = "CALL gds.graph.drop('paperCitationGraph', false)"
-        try:
-            await self.store._run_query_method(drop_query, [])
-            print(" Dropped existing projection")
-        except:
-            print("  No existing projection")
-
-        print(f"\n  Creating graph projection (CACHED PAPERS ONLY)...")
-        print(f"  Projecting {len(paper_ids):,} papers and their citations...")
-
-
-        project_query = f"""
-            CALL gds.graph.project.cypher(
-            'paperCitationGraph',
-            'MATCH (p:Paper) WHERE p.paperId IN $paper_ids RETURN id(p) AS id',
-            'MATCH (p1:Paper)-[:CITES]->(p2:Paper) 
-            WHERE p1.paperId IN $paper_ids AND p2.paperId IN $paper_ids 
-            RETURN id(p1) AS source, id(p2) AS target
-            UNION ALL
-            MATCH (p1:Paper)-[:CITES]->(p2:Paper) 
-            WHERE p1.paperId IN $paper_ids AND p2.paperId IN $paper_ids 
-            RETURN id(p2) AS source, id(p1) AS target',
-            {{parameters: {{paper_ids: $1}}}}
-            )
-            YIELD graphName, nodeCount, relationshipCount
-            RETURN graphName, nodeCount, relationshipCount
-            """
+        paper_communities: Dict[str, str] = {}
+        field_counter = defaultdict(lambda: defaultdict(int))
         
-        node_count = 0
-        rel_count = 0
-        
-        try:
-            result = await self.store._run_query_method(project_query, [paper_ids])
-            if result:
-                node_count = result[0]['nodeCount']
-                rel_count = result[0]['relationshipCount']
-                print(f" Graph projected: {node_count:,} nodes, {rel_count:,} edges (undirected)")
-                
-                if node_count != len(paper_ids):
-                    print(f" WARNING: Expected {len(paper_ids):,} nodes, got {node_count:,}")
-                
-                if rel_count < 10000:
-                    print(f" WARNING: Very sparse graph ({rel_count} edges). Falling back to tier-based.")
-                    await self.store._run_query_method(drop_query, [])
-                    await self._build_paper_communities_tier_based(max_papers)
-                    return
-        except Exception as e:
-            print(f" ERROR: Graph projection failed: {e}")
-            print(" Falling back to tier-based method...")
-            await self._build_paper_communities_tier_based(max_papers)
-            return
-        
-        print(f"\n  Running Leiden algorithm (may take 3-5 minutes for {node_count:,} nodes)...")
-        leiden_query = """
-        CALL gds.louvain.stream('paperCitationGraph', {
-        maxLevels: 10,
-        concurrency: 4
-        })
-        YIELD nodeId, communityId
-        RETURN gds.util.asNode(nodeId).paperId AS paperId, communityId
-        """
-        
-        try:
-            leiden_results = await self.store._run_query_method(leiden_query, [])
-            print(f" Leiden completed: {len(leiden_results):,} node assignments")
+        for pid in tqdm(paper_ids, desc="Assignment"):
+            meta = metadata_map.get(pid, {})
             
-            if not leiden_results:
-                print(" WARNING: Leiden returned no results. Falling back to tier-based.")
-                await self.store._run_query_method(drop_query, [])
-                await self._build_paper_communities_tier_based(max_papers)
-                return
-        except Exception as e:
-            print(f" ERROR: Leiden failed: {e}")
-            await self.store._run_query_method(drop_query, [])
-            await self._build_paper_communities_tier_based(max_papers)
-            return
+            field = self._extract_field_simple(meta)
+            cite_tier = self._get_citation_tier(meta.get('cites', 0))
+            
+            hash_val = int(hashlib.md5(pid.encode()).hexdigest(), 16)
+            shard_id = hash_val % target_communities
+            
+            comm_id = f"C{shard_id:04d}_{field}_{cite_tier}"
+            paper_communities[pid] = comm_id
+            
+            field_counter[field][cite_tier] += 1
+        
+        self.paper_communities = paper_communities
+        self.paper_community_sizes = dict(Counter(self.paper_communities.values()))
+        
+        self._print_distribution(field_counter)
+        self._print_paper_distribution()
 
-        print("\n  Assigning base communities...")
-        for result in leiden_results:
-            paper_id = result.get('paperId')
-            comm_id = result.get('communityId')
-            if paper_id and comm_id is not None:
-                self.paper_communities[paper_id] = f"L_{comm_id}"
+    def _get_citation_tier(self, cites: int) -> str:
+        if cites >= 100:
+            return 'H'
+        elif cites >= 20:
+            return 'M'
+        elif cites >= 5:
+            return 'L'
+        else:
+            return 'VL'
+
+    def _extract_field_simple(self, meta: Dict) -> str:
+        fields = meta.get('fields', []) or []
+        venue = str(meta.get('venue', '')).lower()
+        title = str(meta.get('title', '')).lower()
         
-        base_communities = len(set(self.paper_communities.values()))
-        print(f" Assigned {len(self.paper_communities):,} papers to {base_communities} base communities")
+        if isinstance(fields, list) and fields:
+            first = fields[0]
+            if isinstance(first, dict):
+                field = str(first.get('category', ''))
+            elif isinstance(first, str):
+                field = str(first)
+            else:
+                field = ''
+            
+            if field and len(field) > 2:
+                return field[:6].upper().replace(' ', '')
         
-        print("\n  Enriching with metadata")
-        batch_size = 5000
+        text = (venue + ' ' + title).lower()
+        
+        keywords = {
+            'CS': ['comput', 'algorithm', 'software'],
+            'AI': ['machine learn', 'deep learn', 'neural', 'ai'],
+            'MED': ['medic', 'clinic', 'patient', 'health'],
+            'BIO': ['biolog', 'gene', 'protein', 'cell'],
+            'PHY': ['physic', 'quantum', 'particle'],
+            'CHEM': ['chemis', 'molecul', 'reaction'],
+            'ENG': ['engineer', 'material'],
+            'MATH': ['mathematic', 'theorem'],
+            'SOC': ['social', 'society'],
+            'ECO': ['econom', 'financ'],
+        }
+        
+        for field_name, kws in keywords.items():
+            if any(kw in text for kw in kws):
+                return field_name
+        
+        return 'GEN'
+
+    async def _fetch_metadata_batch(self, paper_ids: List[str]) -> Dict[str, Dict]:
         metadata_map = {}
+        batch_size = 5000
         
         for i in range(0, len(paper_ids), batch_size):
-            batch = paper_ids[i:i+batch_size]
+            batch = paper_ids[i:i + batch_size]
+            
             query = """
             MATCH (p:Paper)
             WHERE p.paperId IN $1
             RETURN p.paperId as paper_id,
-                p.year as year,
-                COALESCE(p.citationCount, 0) as cites,
-                p.fieldsOfStudy as fields
+                   p.year as year,
+                   COALESCE(p.citationCount, 0) as cites,
+                   p.fieldsOfStudy as fields,
+                   p.title as title,
+                   p.venue as venue
             """
-            results = await self.store._run_query_method(query, [batch])
-            for r in results:
-                pid = r['paper_id']
+            
+            batch_results = await self.store._run_query_method(query, [batch])
+            
+            for r in batch_results:
+                pid = self.normalize_paper_id(str(r['paper_id']))
                 metadata_map[pid] = r
             
             if (i + batch_size) % 20000 == 0:
-                print(f"  Fetched metadata for {len(metadata_map):,}/{len(paper_ids):,} papers...")
+                print(f"  Fetched {len(metadata_map):,}/{len(paper_ids):,} papers")
         
-        print(f" Metadata fetched for {len(metadata_map):,} papers")
-        
-        for paper_id, comm_id in list(self.paper_communities.items()):
-            meta = metadata_map.get(paper_id, {})
-            year = meta.get('year', 'UNK')
-            cites = meta.get('cites', 0) or 0
-            fields = meta.get('fields', []) or []
-            
-            field = fields[0][:3].upper() if isinstance(fields, list) and fields else "GEN"
-            cite_tier = 'H' if cites >= 100 else 'M' if cites >= 20 else 'L'
-            
-            enriched_id = f"{comm_id}_{year}_{cite_tier}_{field}"
-            self.paper_communities[paper_id] = enriched_id
-        
-        print("\n  Cleaning up graph projection...")
-        try:
-            await self.store._run_query_method(drop_query, [])
-            print("  Cleanup complete")
-        except:
-            pass
-        
-        paper_counter = Counter(self.paper_communities.values())
-        self.paper_community_sizes = dict(paper_counter)
-        
-        enriched_communities = len(set(self.paper_communities.values()))
-        print(f"\n✓ Created {enriched_communities:,} enriched paper communities (from {base_communities} base communities)")
-        print(f" Covered {len(self.paper_communities):,} papers")
-        
-        top_paper_comms = sorted(self.paper_community_sizes.items(), key=lambda x: x[1], reverse=True)[:10]
-        print(f"\n Top 10 paper communities:")
-        for i, (comm_id, size) in enumerate(top_paper_comms, 1):
-            print(f"  {i}. {comm_id}: {size:,} papers")
+        return metadata_map
 
+    def _print_distribution(self, field_counter):
+        print("\nFIELD AND CITATION DISTRIBUTION:")
+        
+        for field in sorted(field_counter.keys()):
+            total = sum(field_counter[field].values())
+            print(f"\n  {field}:")
+            for tier in ['H', 'M', 'L', 'VL']:
+                count = field_counter[field].get(tier, 0)
+                pct = 100 * count / total if total > 0 else 0
+                print(f"    {tier}: {count:>8,} ({pct:>5.1f}%)")
 
+    def _print_paper_distribution(self):
+        comm_counts = self.paper_community_sizes
+        total = len(self.paper_communities)
+        
+        print("\nCOMMUNITY SIZE DISTRIBUTION:")
+        
+        sizes = sorted(comm_counts.values())
+        print(f"  Min:     {sizes[0]:>8,}")
+        print(f"  Q1:      {sizes[len(sizes)//4]:>8,}")
+        print(f"  Median:  {sizes[len(sizes)//2]:>8,}")
+        print(f"  Q3:      {sizes[3*len(sizes)//4]:>8,}")
+        print(f"  Max:     {sizes[-1]:>8,}")
+        print(f"  Mean:    {np.mean(sizes):>8,.1f}")
+        print(f"  Std:     {np.std(sizes):>8,.1f}")
+        
+        print(f"\nTop 30 Communities:")
+        for comm, count in sorted(comm_counts.items(), key=lambda x: -x[1])[:30]:
+            pct = 100 * count / total
+            print(f"  {comm:<30} {count:>8,} ({pct:>5.1f}%)")
+        
+        print("\nSUMMARY:")
+        print(f"  Total papers:         {total:>10,}")
+        print(f"  Total communities:    {len(comm_counts):>10,}")
+        print(f"  Avg size:             {total/len(comm_counts):>10,.1f}")
+        print(f"  Balance ratio:        {sizes[-1]/sizes[0]:>10,.2f}x")
+        print(f"\nCreated {len(comm_counts):,} balanced communities")
 
-
-    async def _build_paper_communities_tier_based(self, max_papers: Optional[int]):
-        """Fallback: Tier-based community detection using metadata."""
-        print("\nPAPER COMMUNITIES (Tier-Based)")
-        print("-" * 80)
-        
-        training_file = "training_papers.pkl"
-        all_papers = []
-        
-        if os.path.exists(training_file):
-            print(f"  ✓ Loading from cache: {training_file}")
-            try:
-                with open(training_file, 'rb') as f:
-                    cached_papers = pickle.load(f)
-                
-                if max_papers:
-                    cached_papers = cached_papers[:max_papers]
-                
-                print(f"Found {len(cached_papers):,} cached papers")
-                print(f"Fetching metadata from Neo4j...")
-                
-                batch_size = 5000
-                for i in range(0, len(cached_papers), batch_size):
-                    batch_papers = cached_papers[i:i+batch_size]
-                    paper_ids = [p['paper_id'] for p in batch_papers]
-                    
-                    query = """
-                    MATCH (p:Paper)
-                    WHERE p.paperId IN $1
-                    RETURN p.paperId as node_id,
-                           COALESCE(p.citationCount, 0) as cites,
-                           p.year as year,
-                           p.fieldsOfStudy as fields
-                    """
-                    batch_result = await self.store._run_query_method(query, [paper_ids])
-                    all_papers.extend(batch_result)
-                    
-                    if (i + batch_size) % 20000 == 0:
-                        print(f"      Fetched {len(all_papers):,}/{len(cached_papers):,} papers...")
-                    await asyncio.sleep(0.1)
-                
-                print(f"Fetched {len(all_papers):,} papers from Neo4j")
-                
-            except Exception as e:
-                print(f"    Cache load failed: {e}")
-                all_papers = []
-        
-        if not all_papers:
-            print(f"Scanning database in batches...")
-            batch_size = 10000
-            skip = 0
-            
-            while True:
-                print(f"    Fetching batch at offset {skip:,}...")
-                query = """
-                MATCH (p:Paper)
-                WHERE p.title IS NOT NULL AND p.year IS NOT NULL
-                WITH p ORDER BY p.paperId
-                SKIP $1
-                LIMIT $2
-                RETURN p.paperId as node_id,
-                       COALESCE(p.citationCount, 0) as cites,
-                       p.year as year,
-                       p.fieldsOfStudy as fields
-                """
-                try:
-                    batch = await self.store._run_query_method(query, [skip, batch_size])
-                except Exception as e:
-                    print(f"    Batch failed: {e}")
-                    break
-                
-                if not batch:
-                    break
-                
-                all_papers.extend(batch)
-                print(f"Total: {len(all_papers):,} papers")
-                skip += batch_size
-                
-                if max_papers and len(all_papers) >= max_papers:
-                    all_papers = all_papers[:max_papers]
-                    break
-                
-                await asyncio.sleep(0.2)
-        
-        if not all_papers:
-            print("    No papers found!")
-            return
-        
-        top_cited = max(all_papers, key=lambda p: p.get('cites', 0) or 0)
-        print(f"\n Sample paper (highest citations):")
-        print(f" Title: {top_cited.get('title', 'Unknown')[:60] if 'title' in top_cited else 'N/A'}")
-        print(f" ID: {top_cited.get('node_id', 'N/A')}")
-        print(f" Citations: {top_cited.get('cites', 0)}")
-        
-        print(f"\n  Assigning {len(all_papers):,} papers to communities...")
-        
-        for i, paper in enumerate(all_papers):
-            node_id = paper.get('node_id')
-            if not node_id:
-                continue
-            
-            cites = paper.get('cites', 0) or 0
-            year = paper.get('year')
-            fields = paper.get('fields', []) or []
-            
-            if cites >= 1000:
-                cite_tier = 5
-            elif cites >= 100:
-                cite_tier = 4
-            elif cites >= 20:
-                cite_tier = 3
-            elif cites >= 5:
-                cite_tier = 2
-            else:
-                cite_tier = 1
-            
-            if year and isinstance(year, int) and 1950 <= year <= 2030:
-                year_bucket = (year // 5) * 5
-            else:
-                year_bucket = "UNK"
-            
-            primary_field = "General"
-            if isinstance(fields, list) and fields:
-                primary_field = fields[0] if isinstance(fields[0], str) else "General"
-            elif isinstance(fields, str):
-                primary_field = fields
-            
-            field_short = primary_field[:3].upper() if primary_field != "General" else "GEN"
-            comm_id = f"P_{year_bucket}_{cite_tier}_{field_short}"
-            self.paper_communities[node_id] = comm_id
-            
-            if (i + 1) % 20000 == 0:
-                print(f"    Progress: {i+1}/{len(all_papers)} papers...")
-        
-        paper_counter = Counter(self.paper_communities.values())
-        self.paper_community_sizes = dict(paper_counter)
-        
-        print(f"\nCreated {len(set(self.paper_communities.values()))} paper communities")
-        print(f"Covered {len(self.paper_communities):,} papers")
-        
-        top_paper_comms = sorted(self.paper_community_sizes.items(), key=lambda x: x[1], reverse=True)[:10]
-        print(f"\n Top 10 paper communities:")
-        for i, (comm_id, size) in enumerate(top_paper_comms, 1):
-            print(f"    {i}. {comm_id}: {size:,} papers")
-
-    async def _build_author_communities(self, max_authors: int):
-        """Build author communities using collaboration patterns."""
+    async def _build_author_communities(
+        self,
+        papers: List[Dict],
+        min_author_papers: int
+    ):
         print("\nAUTHOR COMMUNITIES")
-        print("-" * 80)
         
-        all_authors = []
-        author_file = 'training_authors.pkl'
+        author_stats = defaultdict(lambda: {"paper_count": 0, "coauthors": set()})
         
-        if os.path.exists(author_file):
-            print(f" Loading from cache: {author_file}")
-            try:
-                with open(author_file, 'rb') as f:
-                    all_authors = pickle.load(f)
-                if max_authors:
-                    all_authors = all_authors[:max_authors]
-                print(f"    Found {len(all_authors):,} cached authors")
-            except Exception as e:
-                print(f"    Cache load failed: {e}")
-                all_authors = []
-        
-        if not all_authors:
-            print("  Fetching from database...")
-            query_prolific = """
-            MATCH (a:Author)-[:WROTE]->(p:Paper)
-            WITH a, count(p) as paper_count
-            WHERE paper_count >= 5
-            OPTIONAL MATCH (a)-[:WROTE]->(:Paper)<-[:WROTE]-(collab:Author)
-            WHERE a <> collab
-            WITH a.authorId as node_id,
-                 paper_count,
-                 count(DISTINCT collab) as collab_count,
-                 a.name as name
-            RETURN node_id, paper_count, collab_count, name
-            LIMIT $1
-            """
-            try:
-                prolific = await self.store._run_query_method(query_prolific, [max_authors])
-                all_authors.extend(prolific)
-                print(f"      Found {len(prolific)} authors")
-            except Exception as e:
-                print(f"      Failed: {e}")
-        
-        if not all_authors:
-            print("    No authors found!")
-            return
-        
-        for author in all_authors:
-            node_id = author.get('author_id') or author.get('node_id')
-            if not node_id:
+        for paper in tqdm(papers, desc="Extracting authors"):
+            paper_authors = paper.get('authors', [])
+            if not paper_authors:
                 continue
             
-            paper_count = author.get('paper_count', 0) or 0
-            collab_count = author.get('collab_count', 0) or 0
+            author_ids = []
+            for author in paper_authors:
+                author_id = author.get('authorId') or author.get('author_id')
+                if author_id:
+                    aid = self.normalize_author_id(str(author_id))
+                    author_stats[aid]["paper_count"] += 1
+                    author_ids.append(aid)
             
-            if paper_count >= 50:
-                prod_tier = 5
-            elif paper_count >= 20:
-                prod_tier = 4
-            elif paper_count >= 10:
-                prod_tier = 3
-            elif paper_count >= 5:
-                prod_tier = 2
-            else:
-                prod_tier = 1
+            for i, aid1 in enumerate(author_ids):
+                for aid2 in author_ids[i + 1:]:
+                    author_stats[aid1]["coauthors"].add(aid2)
+                    author_stats[aid2]["coauthors"].add(aid1)
+        
+        print(f"Found {len(author_stats):,} authors")
+        
+        filtered_authors = {
+            aid: stats
+            for aid, stats in author_stats.items()
+            if stats["paper_count"] >= min_author_papers
+        }
+        
+        print(f"Kept {len(filtered_authors):,} authors")
+        
+        for author_id, stats in filtered_authors.items():
+            paper_count = stats["paper_count"]
+            collab_count = len(stats["coauthors"])
             
-            if collab_count >= 100:
-                collab_tier = 5
-            elif collab_count >= 50:
-                collab_tier = 4
-            elif collab_count >= 20:
-                collab_tier = 3
-            elif collab_count >= 10:
-                collab_tier = 2
-            else:
-                collab_tier = 1
+            prod_tier = (
+                'P5' if paper_count >= 50 else
+                'P4' if paper_count >= 20 else
+                'P3' if paper_count >= 10 else
+                'P2'
+            )
+            collab_tier = (
+                'C5' if collab_count >= 100 else
+                'C4' if collab_count >= 50 else
+                'C3' if collab_count >= 20 else
+                'C2'
+            )
             
-            comm_id = f"A_{prod_tier}_{collab_tier}"
-            self.author_communities[node_id] = comm_id
+            self.author_communities[author_id] = f"A_{prod_tier}_{collab_tier}"
         
-        author_counter = Counter(self.author_communities.values())
-        self.author_community_sizes = dict(author_counter)
-        
-        print(f"\nCreated {len(set(self.author_communities.values()))} author communities")
-        print(f"Covered {len(self.author_communities):,} authors")
-        
-        top_author_comms = sorted(self.author_community_sizes.items(), key=lambda x: x[1], reverse=True)[:10]
-        print(f"\n  Top 10 author communities:")
-        for i, (comm_id, size) in enumerate(top_author_comms, 1):
-            print(f"    {i}. {comm_id}: {size:,} authors")
+        self.author_community_sizes = dict(Counter(self.author_communities.values()))
+        print(f"Created {len(set(self.author_communities.values()))} author communities")
 
-    def _save_cache(self):
+    def save_cache(self):
         cache_data = {
             'paper_communities': self.paper_communities,
-            'author_communities': self.author_communities,
             'paper_community_sizes': self.paper_community_sizes,
-            'author_community_sizes': self.author_community_sizes
+            'author_communities': self.author_communities,
+            'author_community_sizes': self.author_community_sizes,
         }
+        
         with open(self.cache_file, 'wb') as f:
             pickle.dump(cache_data, f)
-        print(f"\nUnified communities cached to {self.cache_file}")
+        
+        print(f"\nCache saved to {self.cache_file}")
 
     def load_cache(self) -> bool:
         if not os.path.exists(self.cache_file):
             return False
+        
         try:
             with open(self.cache_file, 'rb') as f:
                 cache_data = pickle.load(f)
-            self.paper_communities = cache_data['paper_communities']
-            self.author_communities = cache_data['author_communities']
-            self.paper_community_sizes = cache_data['paper_community_sizes']
-            self.author_community_sizes = cache_data['author_community_sizes']
+            
+            self.paper_communities = cache_data.get('paper_communities', {})
+            self.paper_community_sizes = cache_data.get('paper_community_sizes', {})
+            self.author_communities = cache_data.get('author_communities', {})
+            self.author_community_sizes = cache_data.get('author_community_sizes', {})
             self.is_loaded = True
-            print(f"Loaded unified communities from cache")
-            print(f"Papers: {len(self.paper_communities):,} in {len(set(self.paper_communities.values()))} communities")
-            print(f"Authors: {len(self.author_communities):,} in {len(set(self.author_communities.values()))} communities")
+            
+            print(f"Loaded communities from {self.cache_file}")
+            print(f"  Papers: {len(self.paper_communities):,} in {len(set(self.paper_communities.values())):,} communities")
+            print(f"  Authors: {len(self.author_communities):,} in {len(set(self.author_communities.values())):,} communities")
+            
             return True
+            
         except Exception as e:
             print(f"Failed to load cache: {e}")
             return False
 
     def get_community(self, node_id: str, node_type: str = None) -> Optional[str]:
-        if node_type == "paper" or node_id in self.paper_communities:
-            return self.paper_communities.get(node_id)
-        elif node_type == "author" or node_id in self.author_communities:
-            return self.author_communities.get(node_id)
-        else:
-            return self.paper_communities.get(node_id) or self.author_communities.get(node_id)
+        if node_type == 'paper' or not node_type:
+            node_id_norm = self.normalize_paper_id(node_id)
+            comm = self.paper_communities.get(node_id_norm)
+            if comm:
+                return comm
+        
+        if node_type == 'author' or not node_type:
+            node_id_norm = self.normalize_author_id(node_id)
+            return self.author_communities.get(node_id_norm)
+        
+        return None
 
     def get_community_size(self, community_id: str) -> int:
-        if community_id.startswith('P_') or community_id.startswith('L_'):
-            return self.paper_community_sizes.get(community_id, 0)
-        elif community_id.startswith('A_'):
-            return self.author_community_sizes.get(community_id, 0)
-        else:
-            return 0
+        if community_id in self.paper_community_sizes:
+            return self.paper_community_sizes[community_id]
+        if community_id in self.author_community_sizes:
+            return self.author_community_sizes[community_id]
+        return 0
 
     def get_statistics(self) -> Dict:
+        paper_sizes = list(self.paper_community_sizes.values())
+        author_sizes = list(self.author_community_sizes.values())
+        
         return {
-            'num_paper_communities': len(set(self.paper_communities.values())),
-            'num_author_communities': len(set(self.author_communities.values())),
+            'num_paper_communities': len(self.paper_community_sizes),
+            'num_author_communities': len(self.author_community_sizes),
             'num_papers': len(self.paper_communities),
             'num_authors': len(self.author_communities),
-            'avg_paper_community_size': np.mean(list(self.paper_community_sizes.values())) if self.paper_community_sizes else 0,
-            'avg_author_community_size': np.mean(list(self.author_community_sizes.values())) if self.author_community_sizes else 0,
+            'avg_paper_community_size': float(np.mean(paper_sizes)) if paper_sizes else 0.0,
+            'avg_author_community_size': float(np.mean(author_sizes)) if author_sizes else 0.0,
+            'balance_ratio': float(max(paper_sizes) / min(paper_sizes)) if paper_sizes else 0.0,
         }
 
-async def build_and_cache_unified_communities(use_leiden: bool = True):
-    print("Unified Community Detection")
+
+async def build_and_cache_communities(
+    target_communities: int = 500,
+    min_author_papers: int = 5
+):
+    from graph.database.store import EnhancedStore
+    
+    print("\nHASH-BASED COMMUNITY DETECTION")
+    
     store = EnhancedStore()
-    detector = CommunityDetector(store, use_leiden=use_leiden)
+    detector = CommunityDetector(store=store, cache_file='community_cache_1M.pkl')
     
     if detector.load_cache():
-        print("\n✓ Communities already cached!")
+        print("\nCommunities already cached")
         stats = detector.get_statistics()
-        print(f"\nStatistics:")
+        print("\nStatistics:")
         for key, value in stats.items():
-            print(f"  {key}: {value}")
-    else:
-        print("\nNo cache found, building communities...")
-        await detector.build_communities(max_papers=None, max_authors=20000)
-        stats = detector.get_statistics()
-        print(f"\nFinal Statistics:")
-        for key, value in stats.items():
-            print(f"  {key}: {value}")
+            if isinstance(value, float):
+                print(f"  {key}: {value:.1f}")
+            else:
+                print(f"  {key}: {value:,}")
+        print("\nTo rebuild, delete 'community_cache_1M.pkl' and run again.")
+        await store.pool.close()
+        return
+    
+    print("Cache not found. Building communities...")
+    await detector.build_communities_from_cache(
+        target_communities=target_communities,
+        min_author_papers=min_author_papers
+    )
     
     await store.pool.close()
-    print("\n✓ Done!")
+    print("\nDone")
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     import sys
-    use_leiden = "--leiden" in sys.argv or "-l" in sys.argv
-    asyncio.run(build_and_cache_unified_communities(use_leiden=use_leiden))
+    
+    target = 500
+    min_papers = 5
+    
+    for i, arg in enumerate(sys.argv):
+        if arg in ('--target', '-t') and i + 1 < len(sys.argv):
+            target = int(sys.argv[i + 1])
+        if arg in ('--min-papers', '-p') and i + 1 < len(sys.argv):
+            min_papers = int(sys.argv[i + 1])
+    
+    print("Parameters:")
+    print(f"  Target communities: {target}")
+    print(f"  Min author papers: {min_papers}")
+    
+    asyncio.run(build_and_cache_communities(
+        target_communities=target,
+        min_author_papers=min_papers
+    ))

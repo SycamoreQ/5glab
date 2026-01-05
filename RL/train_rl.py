@@ -33,11 +33,8 @@ def normalize_paper_id(paper_id: str) -> str:
     """Normalize paper ID to consistent format."""
     if not paper_id:
         return ""
-    # Convert to string and strip whitespace
     paper_id = str(paper_id).strip()
-    # Remove leading zeros
     paper_id = paper_id.lstrip('0')
-    # If removing zeros made it empty, it was "0000..." so return "0"
     return paper_id if paper_id else "0"
 
 def get_available_cache_relations(env, pid: str):
@@ -91,13 +88,11 @@ async def build_embeddings():
     embeddings_dict = encoder.precompute_paper_embeddings(papers, force=False)
     embeddings_raw = encoder.cache 
     
-    # Normalize all embedding keys
     embeddings = {}
     for k, v in embeddings_raw.items():
         normalized_k = normalize_paper_id(str(k))
         embeddings[normalized_k] = v
     
-    # Normalize all edge cache IDs
     edge_cache_str = {}
     for src, edges in edge_cache.items():
         src_normalized = normalize_paper_id(str(src))
@@ -108,7 +103,7 @@ async def build_embeddings():
         edge_cache_str[src_normalized] = normalized_edges
     edge_cache = edge_cache_str
 
-    print(f"✓ Loaded {len(embeddings):,} embeddings")
+    print(f"Loaded {len(embeddings):,} embeddings")
     
     return papers, edge_cache, paper_id_set, embeddings, encoder
 
@@ -151,10 +146,12 @@ async def train():
     
     store = EnhancedStore(pool_size=10)
 
+    USE_COMMUNITIES = True  
+    
     env = AdvancedGraphTraversalEnv(
         store, 
         precomputed_embeddings=embeddings,
-        use_communities=False,  
+        use_communities=USE_COMMUNITIES,  
         use_feedback=False,
         use_llm_parser=True,  
         parser_type='dspy', 
@@ -163,7 +160,6 @@ async def train():
     
     embedded_ids = set(embeddings.keys())
     
-    # Normalize paper_id_set
     normalized_paper_id_set = {normalize_paper_id(str(pid)) for pid in paper_id_set}
     env.training_paper_ids = normalized_paper_id_set
 
@@ -211,8 +207,10 @@ async def train():
 
     query_pools = await prepare_query_pools(encoder, papers, normalized_paper_id_set)
     
+    state_dim = 783 if USE_COMMUNITIES else 773
+    
     agent = DDQLAgent(
-        state_dim=773, 
+        state_dim=state_dim, 
         text_dim=384, 
         use_prioritized=True,
         precomputed_embeddings=embeddings
@@ -239,6 +237,7 @@ async def train():
     print(f"Queries: {len(COMPLEX_QUERIES)}")
     print(f"Max steps per episode: 12")
     print(f"Allow revisits: True (max 3x per node)")
+    print(f"Communities: {'ENABLED' if USE_COMMUNITIES else 'DISABLED'}") 
     print("="*80 + "\n")
     
     episode_rewards = []
@@ -247,7 +246,9 @@ async def train():
     dead_end_count = 0
     success_count = 0
     
-    for episode in range(1000):
+    TOTAL_EPISODES = 100
+    
+    for episode in range(TOTAL_EPISODES):
         if episode < 50:
             env.max_revisits = 5
         else:
@@ -281,11 +282,9 @@ async def train():
         
         try:
             state = await env.reset(query, intent=1, start_node_id=start_paper_id)
-            if len(env.visited) > 0:
+            if len(env.visited) > 1:
                 print(f"[ERROR] env.visited not cleared! Size: {len(env.visited)}")
-            if len(env.node_visit_count) > 0:
-                print(f"[ERROR] env.node_visit_count not cleared! Size: {len(env.node_visit_count)}")
-    
+            
         except Exception as e:
             print(f"[ERROR] Reset failed: {e}")
             continue
@@ -335,7 +334,6 @@ async def train():
                     hit_dead_end = True
                     break
                 
-                # Filter for embedded nodes
                 worker_actions = [
                     (n, r) for (n, r) in worker_actions
                     if normalize_paper_id(str(n.get("paperid") or n.get("paperId") or n.get("paper_id"))) in embedded_ids
@@ -364,7 +362,7 @@ async def train():
                     hit_dead_end = True
                     break
                 
-                best_action = agent.act(state, valid_worker_actions, max_actions=5)
+                best_action = agent.act(state, valid_worker_actions, max_actions=15)
                 
                 if best_action is None:
                     print(f"[DEBUG] agent.act() returned None")
@@ -391,7 +389,7 @@ async def train():
                 next_actions = [
                     (n, r) for n, r in next_actions 
                     if normalize_paper_id(str(n.get('paperId') or n.get('paper_id'))) in embedded_ids
-                ][:5]
+                ][:15]  # ✅ Increased from 5 to 15
                 
                 agent.remember(
                     state=state,
@@ -413,13 +411,15 @@ async def train():
                 hit_dead_end = True
                 break
 
-
         if steps < 2:
             dead_end_count += 1
         
         loss = 0.0
         if len(agent.memory) >= agent.batch_size:
             loss = agent.replay()
+        
+        if episode > 50:  
+            agent.epsilon = max(agent.epsilon_min, agent.epsilon * 0.999)
         
         if episode % 10 == 0 and episode > 0:
             agent.update_target()
@@ -431,7 +431,6 @@ async def train():
         
         if final_sim > 0.5:
             success_count += 1
-
         if (episode + 1) % 10 == 0:
             avg_reward = np.mean(episode_rewards[-50:]) if len(episode_rewards) >= 50 else np.mean(episode_rewards)
             avg_sim = float(np.nanmean(episode_similarities[-50:])) if len(episode_similarities) >= 50 else float(np.nanmean(episode_similarities))
@@ -441,7 +440,7 @@ async def train():
             dead_end_rate = 100 * dead_end_count / (episode + 1)
             
             print(f"\n{'='*70}")
-            print(f"Episode {episode+1}/100")
+            print(f"Episode {episode+1}/{TOTAL_EPISODES}") 
             print(f"{'='*70}")
             print(f"  Query:          {query[:50]}")
             print(f"  Reward:       {episode_reward:+7.2f} | Avg: {avg_reward:+7.2f}")
@@ -451,6 +450,13 @@ async def train():
             print(f"  Success rate:   {success_rate:.1f}% (sim > 0.5)")
             print(f"  Dead ends:      {dead_end_rate:.1f}%")
             print(f"  Loss: {loss:.4f} | ε: {agent.epsilon:.3f}")
+            
+            if USE_COMMUNITIES:
+                summary = env.get_episode_summary()
+                print(f"  Communities visited: {summary['unique_communities_visited']}")
+                print(f"  Community switches: {summary['community_switches']}")
+                print(f"  Max steps in comm: {summary['max_steps_in_community']}")
+                print(f"  Loops detected: {summary['community_loops']}")
             
             if hasattr(env, 'current_query_facets') and env.current_query_facets:
                 facets = env.current_query_facets
@@ -476,7 +482,7 @@ async def train():
         pickle.dump(stats, f)
     
     print("\n" + "="*80)
-    print("🎉 TRAINING COMPLETE")
+    print("TRAINING COMPLETE")
     print("="*80)
     print(f"Total episodes:     {len(episode_rewards)}")
     print(f"Avg episode length: {np.mean(episode_lengths):.1f} steps")
