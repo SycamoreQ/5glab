@@ -3,38 +3,107 @@ import numpy as np
 import pickle
 import os
 import time
+from collections import defaultdict
 from sentence_transformers import SentenceTransformer
 from RL.ddqn import DDQLAgent
 from RL.env import AdvancedGraphTraversalEnv, RelationType
 from graph.database.store import EnhancedStore
-from model.llm.parser.dspy_parser import DSPyHierarchicalParser, HierarchicalRewardMapper
-import math
-from collections import Counter
+from RL.curriculum import CurriculumManager  
 
-COMPLEX_QUERIES = [
-    "deep learning transformers",
-    "citations of Attention Is All You Need paper",
-    "papers that cite BERT",
-    "references of ResNet paper",
-    "who are the authors of ImageNet paper",
-    "recent papers by Geoffrey Hinton",
-    "collaborators of Yann LeCun",
-    "papers by Yoshua Bengio on deep learning",
-    "papers on computer vision with more than 100 citations",
-    "recent NLP papers published in ACL",
-    "deep learning papers from Stanford 2020-2023",
-    "second-order citations of GPT-3 paper",
-    "Get me authors who wrote papers in 'IEEJ Transactions' in the field of Physics",
-    "papers on transformers with more than 100 citations from 2020-2023",
-    "collaborators of Yann LeCun who published in NeurIPS"
-]
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("wandb not installed")
+
+class WandBLogger:
+    """Safe W&B wrapper with fallback."""
+    
+    def __init__(self, enabled=True):
+        self.enabled = enabled and WANDB_AVAILABLE
+        self.run = None
+        
+    def init(self, **kwargs):
+        if not self.enabled:
+            print("W&B disabled")
+            return self
+        
+        try:
+            self.run = wandb.init(**kwargs)
+            print(f"W&B Run: {self.run.url}")
+            return self.run
+        except Exception as e:
+            print(f"W&B init failed: {e}")
+            self.enabled = False
+            return self
+    
+    def log(self, metrics):
+        if self.enabled and self.run:
+            try:
+                wandb.log(metrics)
+            except Exception as e:
+                print(f"[WARN] W&B log failed: {e}")
+    
+    def watch(self, model, **kwargs):
+        if self.enabled and self.run:
+            try:
+                wandb.watch(model, **kwargs)
+            except Exception as e:
+                print(f"[WARN] W&B watch failed: {e}")
+    
+    def save(self, path):
+        if self.enabled and self.run:
+            try:
+                wandb.save(path)
+            except Exception as e:
+                print(f"[WARN] W&B save failed: {e}")
+    
+    def finish(self):
+        if self.enabled and self.run:
+            try:
+                wandb.finish()
+            except Exception as e:
+                print(f"[WARN] W&B finish failed: {e}")
+    
+    @property
+    def url(self):
+        if self.run:
+            return self.run.url
+        return "N/A (W&B disabled)"
+
+
+WANDB_PROJECT = "Enki"
+
+
+CONFIG = {
+    "total_episodes": 1000, 
+    "max_steps_per_episode": 12,  
+    "batch_size": 32,
+    "learning_rate": 1e-4,
+    "gamma": 0.95,
+    
+    "epsilon_start": 1.0,
+    "epsilon_min": 0.15,  
+    "epsilon_decay": 0.9995, 
+    "epsilon_warmup_episodes": 100,  
+    "epsilon_curriculum_boost": 0.1, 
+    
+    "target_update_freq": 10,
+    "use_communities": True,
+    "state_dim": 783,
+    "text_dim": 384,
+    "use_prioritized_replay": True,
+    
+    # CURRICULUM SETTINGS
+    "use_curriculum": True,
+}
 
 def normalize_paper_id(paper_id: str) -> str:
     """Normalize paper ID to consistent format."""
     if not paper_id:
         return ""
-    paper_id = str(paper_id).strip()
-    paper_id = paper_id.lstrip('0')
+    paper_id = str(paper_id).strip().lstrip('0')
     return paper_id if paper_id else "0"
 
 def get_available_cache_relations(env, pid: str):
@@ -49,34 +118,133 @@ def get_available_cache_relations(env, pid: str):
         actions.append(RelationType.CITED_BY)
     return actions
 
+def log_episode_metrics(logger, episode, episode_reward, steps, final_sim, loss, 
+                        agent, env, query, curriculum_manager):
+    """Log episode metrics to W&B with curriculum info."""
+    stage = curriculum_manager.get_current_stage(episode)
+    
+    metrics = {
+        "episode": episode,
+        "episode_reward": episode_reward,
+        "episode_steps": steps,
+        "episode_similarity": final_sim,
+        "episode_success": 1 if final_sim > 0.5 else 0,
+        "epsilon": agent.epsilon,
+        "loss": loss,
+        "memory_size": len(agent.memory),
+        "query_length": len(query.split()),
+        
+        # Curriculum tracking
+        "curriculum_stage": curriculum_manager.current_stage,
+        "curriculum_difficulty": stage['query_difficulty'],
+        "max_steps_allowed": stage['max_steps'],
+        "similarity_threshold": stage['start_similarity_threshold'],
+    }
+    
+    # Community tracking
+    if CONFIG['use_communities']:
+        try:
+            summary = env.get_episode_summary()
+            metrics.update({
+                "communities_visited": summary.get('unique_communities_visited', 0),
+                "community_switches": summary.get('community_switches', 0),
+                "max_steps_in_community": summary.get('max_steps_in_community', 0),
+                "community_loops": summary.get('community_loops', 0),
+            })
+        except:
+            pass
+    
+    logger.log(metrics)
+
+def log_aggregate_metrics(logger, episode, episode_rewards, episode_similarities, 
+                          episode_lengths, success_count, dead_end_count,
+                          difficulty_stats):
+    """Log aggregated metrics with per-difficulty breakdown."""
+    window = min(50, len(episode_rewards))
+    
+    metrics = {
+        "avg_reward_50": np.mean(episode_rewards[-window:]),
+        "avg_similarity_50": float(np.nanmean(episode_similarities[-window:])),
+        "avg_steps_50": np.mean(episode_lengths[-window:]),
+        "best_similarity_overall": float(np.nanmax(episode_similarities)),
+        "success_rate": 100 * success_count / (episode + 1),
+        "dead_end_rate": 100 * dead_end_count / (episode + 1),
+        "reward_std": np.std(episode_rewards[-window:]),
+        "similarity_std": float(np.nanstd(episode_similarities[-window:])),
+    }
+    
+    # Per-difficulty success rates
+    for difficulty in ['easy', 'medium', 'hard', 'expert']:
+        if difficulty in difficulty_stats and difficulty_stats[difficulty]['count'] > 0:
+            success_rate = (100 * difficulty_stats[difficulty]['successes'] / 
+                           difficulty_stats[difficulty]['count'])
+            avg_sim = difficulty_stats[difficulty]['avg_similarity']
+            metrics[f"success_rate_{difficulty}"] = success_rate
+            metrics[f"avg_similarity_{difficulty}"] = avg_sim
+    
+    logger.log(metrics)
+
+def log_trajectory(logger, env, episode):
+    """Log detailed trajectory information - SAFE VERSION."""
+    if not WANDB_AVAILABLE or not logger.enabled:
+        return
+    
+    try:
+        if not hasattr(env, 'trajectory_history') or len(env.trajectory_history) == 0:
+            return
+        
+        trajectory_data = []
+        for i, traj in enumerate(env.trajectory_history):
+            node = traj.get('node', {})
+            
+            title = node.get('title') or node.get('name')
+            if not title:
+                paper_id = node.get('paper_id') or node.get('paperId')
+                title = f"Paper {paper_id[-8:]}" if paper_id else "Unknown"
+            
+            title_str = str(title)[:50]
+            
+            trajectory_data.append([
+                i,
+                title_str,
+                traj.get('similarity', 0.0),
+                traj.get('reward', 0.0),
+                str(traj.get('community', 'N/A'))
+            ])
+        
+        table = wandb.Table(
+            columns=["Step", "Paper", "Similarity", "Reward", "Community"],
+            data=trajectory_data
+        )
+        logger.log({f"trajectory_ep{episode}": table})
+        
+    except Exception as e:
+        print(f"[WARN] Failed to log trajectory: {e}")
+
 
 async def load_training_cache():
+    """Load cached training data."""
     print("Loading training cache...")
-    
     cache_dir = 'training_cache'
     
-    papers_file = os.path.join(cache_dir, 'training_papers_1M.pkl')
-    with open(papers_file, 'rb') as f:
+    with open(os.path.join(cache_dir, 'training_papers_1M.pkl'), 'rb') as f:
         papers = pickle.load(f)
     print(f"✓ Loaded {len(papers):,} papers")
     
-    edges_file = os.path.join(cache_dir, 'edge_cache_1M.pkl')
-    with open(edges_file, 'rb') as f:
+    with open(os.path.join(cache_dir, 'edge_cache_1M.pkl'), 'rb') as f:
         edge_cache = pickle.load(f)
-    print(f"✓ Loaded edge cache with {sum(len(e) for e in edge_cache.values())//2:,} edges")
+    print(f"✓ Loaded edge cache")
     
-    index_file = os.path.join(cache_dir, 'paper_id_set_1M.pkl')
-    with open(index_file, 'rb') as f:
+    with open(os.path.join(cache_dir, 'paper_id_set_1M.pkl'), 'rb') as f:
         paper_id_set = pickle.load(f)
-    print(f"✓ Loaded paper ID index with {len(paper_id_set):,} IDs")
+    print(f"✓ Loaded paper ID index")
     
     return papers, edge_cache, paper_id_set
 
-
 async def build_embeddings():
+    """Build or load embeddings."""
     papers, edge_cache, paper_id_set = await load_training_cache()
-
-    print("Loading/building embeddings...")
+    print("Loading embeddings...")
     
     from utils.batchencoder import BatchEncoder
     encoder = BatchEncoder(
@@ -85,312 +253,222 @@ async def build_embeddings():
         cache_file='training_cache/embeddings_1M.pkl'
     )
     
-    embeddings_dict = encoder.precompute_paper_embeddings(papers, force=False)
-    embeddings_raw = encoder.cache 
+    encoder.precompute_paper_embeddings(papers, force=False)
+    embeddings_raw = encoder.cache
     
-    embeddings = {}
-    for k, v in embeddings_raw.items():
-        normalized_k = normalize_paper_id(str(k))
-        embeddings[normalized_k] = v
+    # Normalize IDs
+    embeddings = {normalize_paper_id(str(k)): v for k, v in embeddings_raw.items()}
     
+    # Normalize edge cache
     edge_cache_str = {}
     for src, edges in edge_cache.items():
         src_normalized = normalize_paper_id(str(src))
-        normalized_edges = []
-        for et, tid in edges:
-            tid_normalized = normalize_paper_id(str(tid))
-            normalized_edges.append((et, tid_normalized))
+        normalized_edges = [
+            (et, normalize_paper_id(str(tid)))
+            for et, tid in edges
+        ]
         edge_cache_str[src_normalized] = normalized_edges
-    edge_cache = edge_cache_str
-
+    
     print(f"Loaded {len(embeddings):,} embeddings")
-    
-    return papers, edge_cache, paper_id_set, embeddings, encoder
+    return papers, edge_cache_str, paper_id_set, embeddings, encoder
 
-
-async def prepare_query_pools(encoder, papers, paper_id_set):
-    print("\nPreparing query pools...")
-    
-    query_pools = {}
-    
-    for query in COMPLEX_QUERIES:
-        query_emb = encoder.encode([query])[0]
-        
-        scored_papers = []
-        for paper in papers:
-            pid = normalize_paper_id(str(paper.get('paperId') or paper.get('paper_id')))
-            
-            if pid not in paper_id_set:
-                continue
-            
-            if pid not in encoder.cache:
-                continue
-            
-            paper_emb = encoder.cache[pid]
-            sim = np.dot(query_emb, paper_emb) / (
-                np.linalg.norm(query_emb) * np.linalg.norm(paper_emb) + 1e-9
-            )
-            
-            scored_papers.append((sim, paper))
-        
-        scored_papers.sort(key=lambda x: x[0], reverse=True)
-        
-        query_pools[query] = [p for _, p in scored_papers[:100]] 
-        
-        print(f"  {query[:50]:50s} -> {len(query_pools[query]):3d} papers (max_sim: {scored_papers[0][0]:.3f})")
-    
-    return query_pools
 
 async def train():
+    """Main training loop with curriculum integration."""
+    
+    # Initialize W&B logger
+    logger = WandBLogger(enabled=True)
+    logger.init(
+        project=WANDB_PROJECT,
+        config=CONFIG,
+        name=f"curriculum_rl_{time.strftime('%Y%m%d_%H%M%S')}",
+        tags=["curriculum", "ddqn", "exploration-boost", "single-agent"],
+        notes="Curriculum learning with improved exploration schedule"
+    )
+    
+    # Load data
     papers, edge_cache, paper_id_set, embeddings, encoder = await build_embeddings()
-    
     store = EnhancedStore(pool_size=10)
-
-    USE_COMMUNITIES = True  
     
+    # Initialize environment
     env = AdvancedGraphTraversalEnv(
-        store, 
+        store,
         precomputed_embeddings=embeddings,
-        use_communities=USE_COMMUNITIES,  
+        use_communities=CONFIG['use_communities'],
         use_feedback=False,
-        use_llm_parser=True,  
-        parser_type='dspy', 
+        use_query_parser=True,
+        parser_type='dspy',
         require_precomputed_embeddings=False
     )
     
+    # Setup training cache
     embedded_ids = set(embeddings.keys())
-    
     normalized_paper_id_set = {normalize_paper_id(str(pid)) for pid in paper_id_set}
     env.training_paper_ids = normalized_paper_id_set
-
-    def norm_et(et: str) -> str:
-        return et.lower().replace("_", "")
     
+    # Prune edge cache
     pruned_edge_cache = {}
     for src, edges in edge_cache.items():
         src = normalize_paper_id(str(src))
         if src not in embedded_ids:
             continue
-        kept = []
-        for et, tid in edges:
-            etn = norm_et(et)
-            tid = normalize_paper_id(str(tid))
-            if etn in ("cites", "citedby") and tid in embedded_ids:
-                kept.append((etn, tid))
+        
+        kept = [
+            (et.lower().replace("_", ""), normalize_paper_id(str(tid)))
+            for et, tid in edges
+            if et.lower().replace("_", "") in ("cites", "citedby") and
+               normalize_paper_id(str(tid)) in embedded_ids
+        ]
+        
         if kept:
             pruned_edge_cache[src] = kept
-
+    
     env.training_edge_cache = pruned_edge_cache
     env.precomputed_embeddings = embeddings
-
+    
     print(f"\n✓ Graph statistics:")
     print(f"  Papers: {len(env.training_paper_ids):,}")
     print(f"  Edges: {sum(len(v) for v in env.training_edge_cache.values()):,}")
     
-    avg_degree = sum(len(v) for v in env.training_edge_cache.values()) / len(env.training_paper_ids) if env.training_paper_ids else 0
-    print(f"  Avg degree: {avg_degree:.1f}")
-
-    print("\n" + "="*80)
-    print("CACHE ALIGNMENT CHECK")
-    print("="*80)
-    sample_papers = list(env.training_edge_cache.keys())[:20]
-    for pid in sample_papers:
-        edges = env.training_edge_cache[pid]
-        has_embedding = pid in embeddings
-        target_ids = [tid for _, tid in edges]
-        targets_with_embeddings = sum(1 for tid in target_ids if tid in embeddings)
-        print(f"Paper {pid[-8:]:>8s}: "
-              f"edges={len(edges):2d} | "
-              f"has_emb={'✓' if has_embedding else '✗'} | "
-              f"targets_with_emb={targets_with_embeddings}/{len(target_ids)}")
-    print("="*80 + "\n")
-
-    query_pools = await prepare_query_pools(encoder, papers, normalized_paper_id_set)
+    # Initialize curriculum manager
+    curriculum = CurriculumManager(papers, encoder)
+    print("\n✓ Curriculum initialized:")
+    print(f"  Stages: {len(curriculum.stages)}")
+    print(f"  Total curriculum episodes: {sum(curriculum.stage_episodes)}")
     
-    state_dim = 783 if USE_COMMUNITIES else 773
-    
+    # Initialize agent
     agent = DDQLAgent(
-        state_dim=state_dim, 
-        text_dim=384, 
-        use_prioritized=True,
+        state_dim=CONFIG['state_dim'],
+        text_dim=CONFIG['text_dim'],
+        use_prioritized=CONFIG['use_prioritized_replay'],
         precomputed_embeddings=embeddings
     )
-
-    c = Counter(et for edges in env.training_edge_cache.values() for et, _ in edges)
-    print(f"Edge type distribution: {c}")
-
-    import random
-    if len(env.training_edge_cache) >= 100:
-        pids = random.sample(list(env.training_edge_cache.keys()), 100)
-    else:
-        pids = list(env.training_edge_cache.keys())
-
-    def has(pid, t): 
-        return any(et == t for et, _ in env.training_edge_cache[pid])
-
-    print(f"Papers with 'cites': {sum(has(pid,'cites') for pid in pids)}")
-    print(f"Papers with 'citedby': {sum(has(pid,'citedby') for pid in pids)}")
-
+    
+    # Watch model
+    logger.watch(agent.policy_net, log="gradients", log_freq=100)
+    
     print("\n" + "="*80)
-    print("STARTING TRAINING")
+    print("STARTING CURRICULUM TRAINING")
     print("="*80)
-    print(f"Queries: {len(COMPLEX_QUERIES)}")
-    print(f"Max steps per episode: 12")
-    print(f"Allow revisits: True (max 3x per node)")
-    print(f"Communities: {'ENABLED' if USE_COMMUNITIES else 'DISABLED'}") 
+    print(f"W&B: {logger.url}")
+    print(f"Total Episodes: {CONFIG['total_episodes']}")
+    print(f"Epsilon: {CONFIG['epsilon_start']} → {CONFIG['epsilon_min']} (decay: {CONFIG['epsilon_decay']})")
     print("="*80 + "\n")
     
+    # Training state
     episode_rewards = []
     episode_similarities = []
     episode_lengths = []
     dead_end_count = 0
     success_count = 0
     
-    TOTAL_EPISODES = 100
+    # Per-difficulty tracking
+    difficulty_stats = defaultdict(lambda: {
+        'count': 0, 
+        'successes': 0, 
+        'similarities': []
+    })
     
-    for episode in range(TOTAL_EPISODES):
-        if episode < 50:
-            env.max_revisits = 5
-        else:
-            env.max_revisits = 3
-
-        query = np.random.choice(COMPLEX_QUERIES)
-        paper_pool = query_pools[query]
-        
-        if not paper_pool:
-            continue
-        
-        start_idx = np.random.choice(min(10, len(paper_pool)))
-        start_paper_data = paper_pool[start_idx]
-        if isinstance(start_paper_data, tuple):
-            start_paper, start_paper_id, degree = start_paper_data
-        else:
-            start_paper = start_paper_data
-            start_paper_id = normalize_paper_id(str(start_paper.get('paperId') or start_paper.get('paper_id')))
-
-        start_pid = normalize_paper_id(str(start_paper.get('paperId') or start_paper.get('paper_id')))
-        if start_pid not in env.training_edge_cache:
-            continue
-
-        neighbor_ids = [tid for _, tid in env.training_edge_cache[start_pid]]
-        if not any(nid in embedded_ids for nid in neighbor_ids):
-            continue
-        
-        edges = env.training_edge_cache.get(start_paper_id)
-        if not edges:
-            continue
-        
+    last_stage = -1
+    
+    # Training loop
+    for episode in range(CONFIG['total_episodes']):
         try:
-            state = await env.reset(query, intent=1, start_node_id=start_paper_id)
-            if len(env.visited) > 1:
-                print(f"[ERROR] env.visited not cleared! Size: {len(env.visited)}")
+            stage = curriculum.get_current_stage(episode)
+            current_stage_idx = curriculum.current_stage
             
-        except Exception as e:
-            print(f"[ERROR] Reset failed: {e}")
-            continue
+            if current_stage_idx != last_stage:
+                agent.epsilon = min(1.0, agent.epsilon + CONFIG['epsilon_curriculum_boost'])
+                print(curriculum.get_stage_summary())
+                print(f"[CURRICULUM] Stage transition! Epsilon boosted to {agent.epsilon:.3f}\n")
+                last_stage = current_stage_idx
 
-        edges_count = len(env.training_edge_cache.get(start_paper_id, []))
-        print(f"[DEBUG] Starting paper {start_paper_id[-8:]}: {edges_count} edges in cache")
-        
-        episode_reward = 0
-        steps = 0
-        max_steps = 12
-        hit_dead_end = False
-
-        for step in range(max_steps):
-            try:
-                pid = normalize_paper_id(str(env.current_node.get("paperId") or 
-                        env.current_node.get("paperid") or 
-                        env.current_node.get("paper_id")))
-                
+            if stage['query_difficulty'] == 'easy':
+                env.max_revisits = 5
+            elif stage['query_difficulty'] == 'medium':
+                env.max_revisits = 4
+            else:
+                env.max_revisits = 3
+            
+            # Get query from curriculum
+            query = curriculum.get_query_for_stage(stage, episode)
+            difficulty = stage['query_difficulty']
+            
+            # Get starting paper from curriculum
+            start_paper = curriculum.get_starting_paper(query, stage)
+            start_paper_id = normalize_paper_id(
+                str(start_paper.get('paperId') or start_paper.get('paper_id'))
+            )
+            
+            # Validate starting paper
+            if start_paper_id not in env.training_edge_cache:
+                continue
+            
+            neighbor_ids = [tid for _, tid in env.training_edge_cache[start_paper_id]]
+            if not any(nid in embedded_ids for nid in neighbor_ids):
+                continue
+            
+            # Reset environment with stage-specific max steps
+            state = await env.reset(query, intent=1, start_node_id=start_paper_id)
+            max_steps = min(stage['max_steps'], CONFIG['max_steps_per_episode'])
+            
+            # Run episode
+            episode_reward = 0
+            steps = 0
+            
+            for step in range(max_steps):
+                # Manager step
+                pid = normalize_paper_id(
+                    str(env.current_node.get("paperId") or env.current_node.get("paper_id"))
+                )
                 available = get_available_cache_relations(env, pid)
+                
                 if not available:
-                    print(f"[DEBUG] No available relations at step {step}")
-                    hit_dead_end = True
                     break
-
+                
                 relation_type = int(np.random.choice(available))
                 is_terminal, manager_reward = await env.manager_step(relation_type)
-                print(f"[DEBUG] Manager returned {len(env.available_worker_nodes)} worker actions")
                 episode_reward += manager_reward
                 
                 if is_terminal:
                     break
-
-                worker_actions = await env.get_worker_actions()
-                print(f"[DEBUG] Sample action structure:")
-                if worker_actions:
-                    sample = worker_actions[0]
-                    print(f"  Type: {type(sample)}")
-                    print(f"  Length: {len(sample) if isinstance(sample, tuple) else 'N/A'}")
-                    if isinstance(sample, tuple) and len(sample) == 2:
-                        node, rel = sample
-                        print(f"  Node type: {type(node)}")
-                        print(f"  Node keys: {list(node.keys())[:5] if isinstance(node, dict) else 'N/A'}")
-                        print(f"  Relation: {rel}")
                 
+                # Worker step
+                worker_actions = await env.get_worker_actions()
                 if not worker_actions:
-                    print(f"[DEBUG] No worker actions available")
-                    hit_dead_end = True
                     break
                 
+                # Filter valid actions
                 worker_actions = [
                     (n, r) for (n, r) in worker_actions
-                    if normalize_paper_id(str(n.get("paperid") or n.get("paperId") or n.get("paper_id"))) in embedded_ids
-                ]
+                    if normalize_paper_id(
+                        str(n.get("paperid") or n.get("paperId") or n.get("paper_id"))
+                    ) in embedded_ids
+                ][:15]
                 
                 if not worker_actions:
-                    print(f"[DEBUG] No valid worker actions after filtering")
-                    hit_dead_end = True
-                    break
-
-                worker_actions = worker_actions[:5]
-                
-                valid_worker_actions = []
-                for action in worker_actions:
-                    if isinstance(action, tuple) and len(action) == 2:
-                        node, rel = action
-                        if isinstance(node, dict) and node:
-                            valid_worker_actions.append(action)
-                        else:
-                            print(f"[DEBUG] Skipping action with invalid node: {type(node)}")
-                    else:
-                        print(f"[DEBUG] Skipping malformed action: {type(action)}")
-                
-                if not valid_worker_actions:
-                    print(f"[DEBUG] No valid actions after validation")
-                    hit_dead_end = True
                     break
                 
-                best_action = agent.act(state, valid_worker_actions, max_actions=15)
-                
-                if best_action is None:
-                    print(f"[DEBUG] agent.act() returned None")
-                    hit_dead_end = True
+                # Agent selects action
+                best_action = agent.act(state, worker_actions, max_actions=15)
+                if not best_action or not isinstance(best_action, tuple):
                     break
                 
-                if not isinstance(best_action, tuple) or len(best_action) != 2:
-                    print(f"[DEBUG] agent.act() returned malformed action: {type(best_action)}")
-                    hit_dead_end = True
-                    break
-
                 chosen_node, chosen_relation = best_action
                 
-                if chosen_node is None or not isinstance(chosen_node, dict):
-                    print(f"[DEBUG] Chosen node is invalid: {type(chosen_node)}")
-                    hit_dead_end = True
-                    break
-                
+                # Execute action
                 next_state, worker_reward, done = await env.worker_step(chosen_node)
                 episode_reward += worker_reward
                 steps += 1
                 
+                # Get next actions
                 next_actions = await env.get_worker_actions() if not done else []
                 next_actions = [
-                    (n, r) for n, r in next_actions 
+                    (n, r) for n, r in next_actions
                     if normalize_paper_id(str(n.get('paperId') or n.get('paper_id'))) in embedded_ids
-                ][:15]  # ✅ Increased from 5 to 15
+                ][:15]
                 
+                # Store transition
                 agent.remember(
                     state=state,
                     action_tuple=best_action,
@@ -401,100 +479,129 @@ async def train():
                 )
                 
                 state = next_state
+                
                 if done:
                     break
-                    
-            except Exception as e:
-                import traceback
-                print(f"[ERROR] Step {step} failed: {e}")
-                print(traceback.format_exc())
-                hit_dead_end = True
-                break
+            
+            # Training
+            loss = 0.0
+            if len(agent.memory) >= agent.batch_size:
+                loss = agent.replay()
 
-        if steps < 2:
-            dead_end_count += 1
-        
-        loss = 0.0
-        if len(agent.memory) >= agent.batch_size:
-            loss = agent.replay()
-        
-        if episode > 50:  
-            agent.epsilon = max(agent.epsilon_min, agent.epsilon * 0.999)
-        
-        if episode % 10 == 0 and episode > 0:
-            agent.update_target()
-        
-        episode_rewards.append(episode_reward)
-        episode_lengths.append(steps)
-        final_sim = env.best_similarity_so_far
-        episode_similarities.append(final_sim if final_sim > -0.5 else np.nan)
-        
-        if final_sim > 0.5:
-            success_count += 1
-        if (episode + 1) % 10 == 0:
-            avg_reward = np.mean(episode_rewards[-50:]) if len(episode_rewards) >= 50 else np.mean(episode_rewards)
-            avg_sim = float(np.nanmean(episode_similarities[-50:])) if len(episode_similarities) >= 50 else float(np.nanmean(episode_similarities))
-            best_sim_overall = float(np.nanmax(episode_similarities)) if len(episode_similarities) else float("nan")
-            avg_length = np.mean(episode_lengths[-50:]) if len(episode_lengths) >= 50 else np.mean(episode_lengths)
-            success_rate = 100 * success_count / (episode + 1)
-            dead_end_rate = 100 * dead_end_count / (episode + 1)
+                if episode >= CONFIG['epsilon_warmup_episodes']:
+                    agent.epsilon = max(
+                        CONFIG['epsilon_min'], 
+                        agent.epsilon * CONFIG['epsilon_decay']
+                    )   
+
             
-            print(f"\n{'='*70}")
-            print(f"Episode {episode+1}/{TOTAL_EPISODES}") 
-            print(f"{'='*70}")
-            print(f"  Query:          {query[:50]}")
-            print(f"  Reward:       {episode_reward:+7.2f} | Avg: {avg_reward:+7.2f}")
-            print(f"  Similarity:     {final_sim:.3f} | Avg: {avg_sim:.3f}")
-            print(f"  Best Sim:       {best_sim_overall:.3f}")
-            print(f"  Steps:          {steps:2d} | Avg: {avg_length:.1f}")
-            print(f"  Success rate:   {success_rate:.1f}% (sim > 0.5)")
-            print(f"  Dead ends:      {dead_end_rate:.1f}%")
-            print(f"  Loss: {loss:.4f} | ε: {agent.epsilon:.3f}")
+            # Target network update
+            if episode % CONFIG['target_update_freq'] == 0 and episode > 0:
+                agent.update_target()
             
-            if USE_COMMUNITIES:
-                summary = env.get_episode_summary()
-                print(f"  Communities visited: {summary['unique_communities_visited']}")
-                print(f"  Community switches: {summary['community_switches']}")
-                print(f"  Max steps in comm: {summary['max_steps_in_community']}")
-                print(f"  Loops detected: {summary['community_loops']}")
+            # Track stats
+            if steps < 2:
+                dead_end_count += 1
             
-            if hasattr(env, 'current_query_facets') and env.current_query_facets:
-                facets = env.current_query_facets
-                print(f"  Parsed: {facets.get('target_entity', 'N/A')}/{facets.get('operation', 'N/A')} | {len(facets.get('constraints', []))} constraints")
+            final_sim = env.best_similarity_so_far
+            if final_sim > 0.5:
+                success_count += 1
+                difficulty_stats[difficulty]['successes'] += 1
             
-            print(f"{'='*70}\n")
-        
-        if (episode + 1) % 100 == 0:
-            os.makedirs('checkpoints', exist_ok=True)
-            agent.save(f'checkpoints/agent_1M_ep{episode+1}.pt')
-            print(f"[CHECKPOINT] Saved at episode {episode+1}")
+            difficulty_stats[difficulty]['count'] += 1
+            difficulty_stats[difficulty]['similarities'].append(final_sim)
+            
+            episode_rewards.append(episode_reward)
+            episode_lengths.append(steps)
+            episode_similarities.append(final_sim if final_sim > -0.5 else np.nan)
+            
+            # Update curriculum performance tracker
+            curriculum.update_performance(episode_reward, final_sim)
+            
+            # Log to W&B
+            log_episode_metrics(logger, episode, episode_reward, steps, final_sim, 
+                                loss, agent, env, query, curriculum)
+            
+            # Aggregate logging every 10 episodes
+            if (episode + 1) % 10 == 0:
+                # Calculate per-difficulty stats
+                for diff in difficulty_stats:
+                    if difficulty_stats[diff]['count'] > 0:
+                        difficulty_stats[diff]['avg_similarity'] = float(
+                            np.nanmean(difficulty_stats[diff]['similarities'])
+                        )
+                
+                log_aggregate_metrics(
+                    logger, episode, episode_rewards, episode_similarities, 
+                    episode_lengths, success_count, dead_end_count,
+                    difficulty_stats
+                )
+                
+                # Console output
+                avg_reward = np.mean(episode_rewards[-50:]) if len(episode_rewards) >= 50 else np.mean(episode_rewards)
+                avg_sim = float(np.nanmean(episode_similarities[-50:])) if len(episode_similarities) >= 50 else float(np.nanmean(episode_similarities))
+                
+                print(f"\n{'='*70}")
+                print(f"Episode {episode+1}/{CONFIG['total_episodes']} | {stage['name']}")
+                print(f"{'='*70}")
+                print(f"  Reward: {episode_reward:+7.2f} | Avg: {avg_reward:+7.2f}")
+                print(f"  Similarity: {final_sim:.3f} | Avg: {avg_sim:.3f}")
+                print(f"  Steps: {steps:2d}/{max_steps} | ε: {agent.epsilon:.3f}")
+                print(f"  Success rate: {100*success_count/(episode+1):.1f}%")
+                print(f"  Per-difficulty success:")
+                for diff in ['easy', 'medium', 'hard', 'expert']:
+                    if diff in difficulty_stats and difficulty_stats[diff]['count'] > 0:
+                        rate = 100 * difficulty_stats[diff]['successes'] / difficulty_stats[diff]['count']
+                        avg = difficulty_stats[diff].get('avg_similarity', 0.0)
+                        print(f"    {diff:8s}: {rate:5.1f}% (avg sim: {avg:.3f})")
+                print(f"{'='*70}\n")
+            
+            # Log trajectory every 50 episodes
+            if (episode + 1) % 50 == 0:
+                log_trajectory(logger, env, episode + 1)
+            
+            # Checkpoint every 200 episodes
+            if (episode + 1) % 200 == 0:
+                os.makedirs('checkpoints', exist_ok=True)
+                checkpoint_path = f'checkpoints/curriculum_agent_ep{episode+1}.pt'
+                agent.save(checkpoint_path)
+                logger.save(checkpoint_path)
+                print(f"[CHECKPOINT] Saved at episode {episode+1}")
+                
+        except Exception as e:
+            print(f"[ERROR] Episode {episode} failed: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
     
-    agent.save('final_agent_1M.pt')
+    # Final save
+    agent.save('final_curriculum_agent.pt')
+    logger.save('final_curriculum_agent.pt')
     
-    stats = {
-        'episode_rewards': episode_rewards,
-        'episode_similarities': episode_similarities,
-        'episode_lengths': episode_lengths,
-        'success_rate': 100 * success_count / len(episode_rewards) if episode_rewards else 0,
-        'dead_end_rate': 100 * dead_end_count / len(episode_rewards) if episode_rewards else 0
-    }
-    with open('training_stats_1M.pkl', 'wb') as f:
-        pickle.dump(stats, f)
-    
+    # Final statistics 
     print("\n" + "="*80)
-    print("TRAINING COMPLETE")
+    print("CURRICULUM TRAINING COMPLETE")
     print("="*80)
-    print(f"Total episodes:     {len(episode_rewards)}")
-    print(f"Avg episode length: {np.mean(episode_lengths):.1f} steps")
-    print(f"Success rate:       {stats['success_rate']:.1f}%")
-    print(f"Dead end rate:      {stats['dead_end_rate']:.1f}%")
-    if episode_similarities:
-        print(f"Best similarity:    {float(np.nanmax(episode_similarities)):.3f}")
-        print(f"Avg similarity:     {float(np.nanmean(episode_similarities)):.3f}")
+    print(f"W&B: {logger.url}")
+    
+    if len(episode_rewards) > 0:
+        print(f"Overall success rate: {100*success_count/len(episode_rewards):.1f}%")
+        print(f"Best similarity: {float(np.nanmax(episode_similarities)):.3f}")
+        print(f"\nFinal per-difficulty performance:")
+        for diff in ['easy', 'medium', 'hard', 'expert']:
+            if diff in difficulty_stats and difficulty_stats[diff]['count'] > 0:
+                rate = 100 * difficulty_stats[diff]['successes'] / difficulty_stats[diff]['count']
+                avg = difficulty_stats[diff].get('avg_similarity', 0.0)
+                print(f"  {diff:8s}: {rate:5.1f}% success | {avg:.3f} avg similarity")
+    else:
+        print("WARNING: No episodes completed successfully")
+        print(f"Total episodes attempted: {CONFIG['total_episodes']}")
+        print(f"All episodes failed - check paper ID field names and data format")
+    
     print("="*80)
     
     await store.pool.close()
-
+    logger.finish()
 
 if __name__ == '__main__':
     asyncio.run(train())

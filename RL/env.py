@@ -39,57 +39,56 @@ class RelationType:
 
 
 class CommunityAwareRewardConfig:
-    INTENT_MATCH_REWARD = 2.0
-    INTENT_MISMATCH_PENALTY = -0.5
-    DIVERSITY_BONUS = 0.5
+    SEMANTIC_WEIGHT = 10.0  
+    GOAL_REACHED_BONUS = 50.0  
+    PROGRESS_REWARD = 5.0 
+    STAGNATION_PENALTY = -1.5  
     
-    SEMANTIC_WEIGHT = 5.0
-    NOVELTY_BONUS = 5.0
-    DEAD_END_PENALTY = -0.5
-    REVISIT_PENALTY = -0.3
-    HIGH_DEGREE_BONUS = 1.0
-    CITATION_COUNT_BONUS = 0.1
-    RECENCY_BONUS = 0.2
-    PROGRESS_REWARD = 2.0
-    STAGNATION_PENALTY = -3.0
-    GOAL_REACHED_BONUS = 5.0
+    INTENT_MATCH_REWARD = 1.0  
+    INTENT_MISMATCH_PENALTY = -0.2 
     
-    COMMUNITY_SWITCH_BONUS = 5.0       # Bonus for jumping to different community
-    COMMUNITY_STUCK_PENALTY = -1.0    # Penalty per step stuck in same community
-    COMMUNITY_LOOP_PENALTY = -0.5      # Severe penalty for returning to previous community
-    DIVERSE_COMMUNITY_BONUS = 3.0    # Bonus for visiting many unique communities
-    TEMPORAL_JUMP_BONUS = 0.7        # Bonus for moving to a community which is recent 
-    TEMPORAL_JUMP_PENALTY = -0.1        # Bonus for doing the opposite 
-    COMMUNITY_SIZE_BONUS = 0.3         # Bonus for not being in small communities
-    NODE_TYPE_SWITCH = 0.1
-
-    PROLIFIC_AUTHOR_BONUS = 0.4         # Bonus for authors with many papers
-    PROLIFIC_THRESHOLD = 20             # Min papers for "prolific"
-    COLLABORATION_BONUS = 0.3           # Bonus for well-connected authors
-    COLLABORATION_THRESHOLD = 10        # Min collaborators
-    AUTHOR_H_INDEX_BONUS = 0.35         # Bonus for high h-index (if available)
-    INSTITUTION_QUALITY_BONUS = 0.25    # Bonus for top institutions 
-    CITATION_VELOCITY_BONUS = 0.3
+    DIVERSITY_BONUS = 1.0  
+    NOVELTY_BONUS = 3.0  
+    MAX_NOVELTY_BONUS = 8.0  
+    HIGH_DEGREE_BONUS = 0.5 
     
-    STUCK_THRESHOLD = 3               # Steps in same community = "stuck"
-    SEVERE_STUCK_THRESHOLD = 5         # Very stuck threshold
-    SEVERE_STUCK_MULTIPLIER = 2.0      # Multiply penalty when severely stuck
-    MAX_NOVELTY_BONUS = 10.0 
+    DEAD_END_PENALTY = -0.3 
+    REVISIT_PENALTY = -0.2 
+    
+    COMMUNITY_SWITCH_BONUS = 2.0 
+    COMMUNITY_STUCK_PENALTY = -0.5  
+    COMMUNITY_LOOP_PENALTY = -0.3 
+    DIVERSE_COMMUNITY_BONUS = 2.0 
+    COMMUNITY_SIZE_BONUS = 0.2  
+    
+    TEMPORAL_JUMP_BONUS = 0.4 
+    TEMPORAL_JUMP_PENALTY = -0.05 
+    
+    STUCK_THRESHOLD = 4 
+    SEVERE_STUCK_THRESHOLD = 7  
+    SEVERE_STUCK_MULTIPLIER = 1.5  
 
+    AUTHOR_MATCH_BONUS = 15.0  
+    AUTHOR_COLLAB_BONUS = 5.0 
+    PROLIFIC_AUTHOR_BONUS = 2.0  
+    PROLIFIC_THRESHOLD = 20  
+    COLLABORATION_BONUS = 1.5 
+    COLLABORATION_THRESHOLD = 10
+    AUTHOR_H_INDEX_BONUS = 2.0  
+    H_INDEX_THRESHOLD = 20 
+    
+    CITATION_COUNT_BONUS = 0.05  
+    RECENCY_BONUS = 0.3  
+    CITATION_VELOCITY_BONUS = 0.2  
+    INSTITUTION_QUALITY_BONUS = 1.0  
+    
+    NODE_TYPE_SWITCH = 0.5
+    
+    TOP_VENUES = {"Nature", "Science", "Cell", "PNAS", "CVPR", "ICCV", 
+                  "ECCV", "NeurIPS", "ICML", "ICLR", "ACL", "EMNLP"}
+    TOP_INSTITUTIONS = {"MIT", "Stanford", "Berkeley", "CMU", "Harvard",
+                        "Oxford", "Cambridge", "ETH", "Google", "DeepMind"}
 
-    TOP_VENUES = {
-    'Nature', 'Science', 'Cell', 'PNAS',
-    'CVPR', 'ICCV', 'ECCV', 'NeurIPS', 'ICML', 'ICLR',
-    'ACL', 'EMNLP', 'NAACL', 'TACL',
-    'SIGIR', 'WWW', 'KDD', 'ICDE',
-    'AAAI', 'IJCAI', 'AAMAS'
-    }
-
-    TOP_INSTITUTIONS = {
-    'MIT', 'Stanford', 'Berkeley', 'CMU', 'Harvard',
-    'Oxford', 'Cambridge', 'ETH', 'Imperial',
-    'Google', 'Microsoft', 'Meta', 'DeepMind', 'OpenAI'
-    }
 
 
 class AdvancedGraphTraversalEnv:
@@ -250,7 +249,14 @@ class AdvancedGraphTraversalEnv:
         )
         self.use_attention = True
 
-        self.curiosity_module = CuriosityModule()
+        community_feature_dim = 10 if self.use_communities else 0
+        actual_state_dim = self.text_dim * 2 + self.intent_dim + community_feature_dim
+        print(f"[ENV] State dimension: {actual_state_dim} (query:{self.text_dim} + node:{self.text_dim} + intent:{self.intent_dim} + community:{community_feature_dim})")
+
+        self.curiosity_module = CuriosityModule(
+            state_dim=actual_state_dim, 
+            embedding_dim=self.text_dim 
+        )
 
     def _normalize_node_keys(self, node: Dict[str, Any]) -> Dict[str, Any]:
         """Normalizes Neo4j query results to consistent format."""
@@ -352,9 +358,8 @@ class AdvancedGraphTraversalEnv:
         
         if self.previous_community and self.previous_community.startswith('MISC_P'):
             if self.current_community and not self.current_community.startswith('MISC_P'):
-                paper_reward += 3.0  # Big bonus for escaping!
+                paper_reward += 3.0  
                 reasons.append("escaped_MISC:+3.0")
-        # 1. Community switch bonus (exploration)
         if (self.steps_in_current_community == 1 and 
             self.previous_community and 
             self.current_community != self.previous_community):
@@ -362,18 +367,16 @@ class AdvancedGraphTraversalEnv:
             paper_reward += self.config.COMMUNITY_SWITCH_BONUS
             reasons.append(f'switch:+{self.config.COMMUNITY_SWITCH_BONUS:.1f}')
             
-            # Extra bonus for NEW community
             if self.current_community not in self.visited_communities:
                 discovery_bonus = 3.0
                 paper_reward += discovery_bonus
                 reasons.append(f'discovery:+{discovery_bonus:.1f}')
         
-        # 2. Stuck penalty (escalating)
+
         if self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
             base_penalty = self.config.COMMUNITY_STUCK_PENALTY
             
             if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
-                # Escalate penalty exponentially
                 multiplier = 1.5 ** (self.steps_in_current_community - self.config.SEVERE_STUCK_THRESHOLD)
                 penalty = base_penalty * min(multiplier, 5.0)  
                 paper_reward += penalty
@@ -381,8 +384,7 @@ class AdvancedGraphTraversalEnv:
             else:
                 paper_reward += base_penalty
                 reasons.append(f'stuck:{base_penalty:.1f}')
-        
-        # 3. Loop penalty (returning to old community)
+
         if len(self.community_history) > 2:
             previous_communities = [c for c in self.community_history[:-1]]
             if self.current_community in previous_communities:
@@ -395,35 +397,32 @@ class AdvancedGraphTraversalEnv:
                 paper_reward += loop_penalty
                 reasons.append(f'loop:{loop_penalty:.1f}')
         
-        # 4. Diversity bonus
         unique_communities = len(self.visited_communities)
         if unique_communities >= 5:
             diversity_bonus = min((unique_communities - 4) * 1.0, 10.0)
             paper_reward += diversity_bonus
             reasons.append(f'diversity:+{diversity_bonus:.1f}')
         
-        # 5. Community size bonus
         if paper_id:
             size = self.community_detector.get_community_size(self.current_community)
-            if 10 <= size <= 100:  # Sweet spot
+            if 10 <= size <= 100: 
                 size_bonus = self.config.COMMUNITY_SIZE_BONUS
                 paper_reward += size_bonus
                 reasons.append(f'size:+{size_bonus:.1f}')
-            elif size < 5:  # Too small
+            elif size < 5:  
                 paper_reward -= 0.5
                 reasons.append('tiny:-0.5')
         
-        # 6. Temporal coherence 
         if len(self.community_history) > 1:
             try:
                 prev_comm = self.community_history[-2]
                 prev_year = int(prev_comm.split('_')[-1])
                 curr_year = int(self.current_community.split('_')[-1])
                 
-                if curr_year > prev_year:  # Moving forward in time
+                if curr_year > prev_year:  
                     paper_reward += self.config.TEMPORAL_JUMP_BONUS
                     reasons.append(f'temporal:+{self.config.TEMPORAL_JUMP_BONUS:.1f}')
-                elif curr_year < prev_year - 3:  # Jumping too far back
+                elif curr_year < prev_year - 3: 
                     paper_reward += self.config.TEMPORAL_JUMP_PENALTY
                     reasons.append(f'old_jump:{self.config.TEMPORAL_JUMP_PENALTY:.1f}')
             except:
@@ -431,8 +430,69 @@ class AdvancedGraphTraversalEnv:
         
         reason_str = ', '.join(reasons) if reasons else 'none'
         return (paper_reward, 'Paper', reason_str)
-
     
+
+    async def calculate_author_reward(self) -> Tuple[float , str , str]: 
+        if not self.current_node: 
+            return 0.0 , None , 'no_node'
+        
+        reward = 0.0
+        author_id = self.current_node.get('authorId') or self.current_node.get('authorId')
+
+        if not author_id or not self.use_authors: 
+            return 0.0 , None , 'no_author' 
+        
+        reasons = []
+
+        if self.query_intent and hasattr(self.query_intent , "target_entity"):
+            target = self.query_intent.target_entity.lower()
+            author_name = self.current_node.get(('name' , '') or '').lower()
+
+            if target in author_name or author_name in target:
+                reward += self.config.AUTHOR_MATCH_BONUS
+                reasons.append(f"target_match+{self.config.AUTHOR_MATCH_BONUS:.1f}")
+            elif len(self.trajectory_history) > 0:
+                for traj in self.trajectory_history[-3:]: 
+                    prev_node = traj['node']
+                    if prev_node.get('authorId'):
+                        reward += self.config.AUTHOR_COLLAB_BONUS
+                        reasons.append(f"collab+{self.config.AUTHOR_COLLAB_BONUS:.1f}")
+                        break
+
+
+        paper_count = await self.store.get_paper_by_author_id(author_id)
+        if paper_count >= self.config.PROLIFIC_THRESHOLD:
+            prolific_bonus = min(paper_count / 50.0, 5.0)  
+            reward += prolific_bonus
+            reasons.append(f"prolific+{prolific_bonus:.1f}")
+
+
+        h_index = self.current_node.get('hIndex', 0) or self.current_node.get('hindex', 0)
+        if h_index >= self.config.H_INDEX_THRESHOLD:
+            h_bonus = min(np.log1p(h_index - 20) * self.config.AUTHOR_H_INDEX_BONUS, 5.0)
+            reward += h_bonus
+            reasons.append(f"h_index+{h_bonus:.1f}")
+
+            self.author_stats['max_hindex'] = max(self.author_stats.get('max_hindex', 0), h_index)
+
+        if hasattr(self.store, 'get_collab_count_by_author'):
+            collab_count = await self.store.get_collab_count_by_author(author_id)
+            if collab_count >= self.config.COLLABORATION_THRESHOLD:
+                collab_bonus = min(collab_count / 20.0, 3.0)
+                reward += collab_bonus
+                reasons.append(f"collabs+{collab_bonus:.1f}")
+
+        if len(self.trajectory_history) > 0:
+            prev_was_paper = 'paperId' in self.trajectory_history[-1]['node']
+            if prev_was_paper:
+                reward += self.config.NODE_TYPE_SWITCH
+                reasons.append(f"switch+{self.config.NODE_TYPE_SWITCH:.1f}")
+        
+
+        reason_str = ', '.join(reasons) if reasons else 'none'
+        return reward, 'Author', reason_str
+
+
 
     def _calculate_trajectory_rewards(self) -> float:
         if len(self.trajectory_history) < 2 :
@@ -524,7 +584,6 @@ class AdvancedGraphTraversalEnv:
                     candidates.extend(results[:5])
             
             if not candidates:
-                # Fallback: field-of-study query
                 field_query = """
                 MATCH (p:Paper)
                 WHERE 'Computer Science' IN p.fieldsOfStudy
@@ -789,10 +848,10 @@ class AdvancedGraphTraversalEnv:
         community_features = self._get_community_features()
     
         return np.concatenate([
-            self.query_embedding,      # 384-dim
-            node_emb,                  # 384-dim
-            intent_vec,                # 5-dim
-            community_features         # NEW: 10-dim
+            self.query_embedding,      
+            node_emb,                
+            intent_vec,              
+            community_features         
         ]) 
 
 
@@ -1182,41 +1241,29 @@ class AdvancedGraphTraversalEnv:
 
 
     async def worker_step(self, chosen_node: Dict) -> Tuple[np.ndarray, float, bool]:
-        """Enhanced worker step with balanced rewards."""
         self.current_step += 1
         self.episode_stats['total_nodes_explored'] += 1
-        worker_reward = 0.0
         
         self.current_node = self._normalize_node_keys(chosen_node)
         self.current_comm_node = self.current_node
-        paper_id = self.current_node.get('paper_id')
-        author_id = self.current_node.get('author_id')
-
+        
+        paper_id = self.current_node.get('paperId')
+        author_id = self.current_node.get('authorId')
+        
+        is_revisit = False
         if paper_id:
+            if paper_id in self.visited:
+                is_revisit = True
+                self.episode_stats['revisits'] += 1
             self.node_visit_count[paper_id] = self.node_visit_count.get(paper_id, 0) + 1
             self.visited.add(paper_id)
             self._update_community_tracking(paper_id)
-    
+        
         if author_id:
+            if author_id in self.visited:
+                is_revisit = True
+                self.episode_stats['revisits'] += 1
             self.node_visit_count[author_id] = self.node_visit_count.get(author_id, 0) + 1
-            self.visited.add(author_id)
-            self._update_community_tracking(author_id)
-    
-        
-        # Track revisits
-        is_revisit = False
-        if paper_id and paper_id in self.visited:
-            is_revisit = True
-            self.episode_stats['revisits'] += 1
-        if author_id and author_id in self.visited:
-            is_revisit = True
-            self.episode_stats['revisits'] += 1
-        
-        if paper_id:
-            self.visited.add(paper_id)
-            self._update_community_tracking(paper_id)
-        
-        if author_id:
             self.visited.add(author_id)
             self._update_community_tracking(author_id)
         
@@ -1227,46 +1274,86 @@ class AdvancedGraphTraversalEnv:
         semantic_sim = np.dot(self.query_embedding, node_emb) / (
             np.linalg.norm(self.query_embedding) * np.linalg.norm(node_emb) + 1e-9
         )
+
+        worker_reward = 0.0
         
-        if self.current_step <= 3:
-            title_str = (str(self.current_node.get('title') or 'NA'))[:50]
-            name_str = (str(self.current_node.get('name') or 'NA'))[:50]
-            display = title_str if paper_id else name_str
-            print(f"  [DEBUG] Step {self.current_step}: sim={semantic_sim:.3f}, {'paper' if paper_id else 'author'}={display}")
-
-        if semantic_sim > self.best_similarity_so_far:
-            worker_reward += 100.0
-            self.best_similarity_so_far = semantic_sim
-            self.episode_stats['max_similarity_achieved'] = semantic_sim
-
-        if semantic_sim > 0.7:
-            worker_reward = 200.0  # Jackpot
-        elif semantic_sim > 0.5:
-            worker_reward = 50.0 + 150.0 * ((semantic_sim - 0.5) / 0.2) ** 2
-        elif semantic_sim > 0.3:
-            worker_reward = 10.0 + 40.0 * ((semantic_sim - 0.3) / 0.2) ** 2
-        elif semantic_sim > 0.15:
-            worker_reward = (semantic_sim - 0.15) * 20.0
+        if semantic_sim >= 0.7:
+            worker_reward = 100.0  
+        elif semantic_sim >= 0.6:
+            worker_reward = 50.0 + 50.0 * ((semantic_sim - 0.6) / 0.1)
+        elif semantic_sim >= 0.5:
+            worker_reward = 25.0 + 25.0 * ((semantic_sim - 0.5) / 0.1)
+        elif semantic_sim >= 0.4:
+            worker_reward = 10.0 + 15.0 * ((semantic_sim - 0.4) / 0.1)
+        elif semantic_sim >= 0.3:
+            worker_reward = 0.0 + 10.0 * ((semantic_sim - 0.3) / 0.1)
+        elif semantic_sim >= 0.2:
+            worker_reward = -5.0 + 5.0 * ((semantic_sim - 0.2) / 0.1)
         else:
-            worker_reward = -20.0 + semantic_sim * 50.0
+            worker_reward = -10.0 + 5.0 * semantic_sim / 0.2
         
         if self.previous_node_embedding is not None:
             prev_sim = np.dot(self.query_embedding, self.previous_node_embedding) / (
                 np.linalg.norm(self.query_embedding) * np.linalg.norm(self.previous_node_embedding) + 1e-9
             )
-            
             progress = semantic_sim - prev_sim
+            
             if progress > 0.15:
-                worker_reward += 40.0
+                worker_reward += self.config.PROGRESS_REWARD * 2  # Big jump
             elif progress > 0.05:
-                worker_reward += 20.0
-            elif progress > 0:
-                worker_reward += 10.0
-            elif progress < -0.1:
-                worker_reward -= 30.0
+                worker_reward += self.config.PROGRESS_REWARD
+            elif progress < -0.15:
+                worker_reward += self.config.STAGNATION_PENALTY
             elif progress < -0.05:
-                worker_reward -= 15.0
+                worker_reward += self.config.STAGNATION_PENALTY * 0.5
+        
+        if author_id:
+            author_reward, _, author_reason = self.calculate_author_reward()
+            if author_reward != 0:
+                worker_reward += author_reward
+                if self.current_step <= 5:
+                    print(f"AUTH-R: +{author_reward:.1f} | {author_reason}")
+        
+        elif paper_id:
+            citation_count = self.current_node.get('citationCount', 0)
+            if citation_count >= 100:
+                cit_bonus = min(np.log10(citation_count / 100.0) * 2.0, 5.0)
+                worker_reward += cit_bonus
+            
+            year = self.current_node.get('year')
+            if year and year >= 2020:
+                recency_bonus = (year - 2020) * self.config.RECENCY_BONUS
+                worker_reward += recency_bonus
 
+            venue = self.current_node.get('venue', '') or self.current_node.get('publicationName', '')
+            if venue:
+                for top_venue in self.config.TOP_VENUES:
+                    if top_venue.lower() in venue.lower():
+                        worker_reward += 2.0
+                        break
+        
+        if is_revisit:
+            visit_count = self.node_visit_count.get(paper_id or author_id, 1)
+            if visit_count > 2: 
+                revisit_penalty = -5.0 * (visit_count - 2) 
+                worker_reward += revisit_penalty
+        
+        if self.use_communities and (self.current_step % 5 == 0 or self.current_step <= 3):
+            comm_reward, _, comm_reason = self.calculate_community_reward()
+            if comm_reward != 0:
+                worker_reward += comm_reward
+                if self.current_step <= 5 or self.current_step % 5 == 0:
+                    print(f"COMM-R: {comm_reward:+.1f} | {comm_reason}")
+        
+        if not is_revisit and semantic_sim < 0.6:  
+            node_id = paper_id or author_id
+            novelty_bonus = self.curiosity_module.get_novelty_bonus(node_id)
+            current_state = await self._get_state()
+            intrinsic = self.curiosity_module.compute_intrinsic_reward(
+                current_state, node_emb, current_state
+            )
+            curiosity_total = min(novelty_bonus + intrinsic * 0.3, self.config.MAX_NOVELTY_BONUS)
+            worker_reward += curiosity_total
 
         if self.query_intent and self.reward_mapper:
             h_reward, h_reason = self.reward_mapper.get_worker_reward(
@@ -1274,168 +1361,27 @@ class AdvancedGraphTraversalEnv:
                 query_intent=self.query_intent,
                 semantic_sim=semantic_sim
             )
-            
             if h_reward != 0:
                 worker_reward += h_reward
-                if self.current_step <= 5:  
-                    print(f"  [DSPy-WKR] {h_reward:+.1f} ({h_reason})")
-
-
-        if is_revisit:
-            worker_reward -= 50.0
+                if self.current_step <= 5:
+                    print(f"DSPy-WKR: {h_reward:+.1f} | {h_reason}")
         
-        if paper_id and self.use_communities and semantic_sim > 0.3:
-            # Community switch bonus (+5)
-            if self.previous_community and self.current_community != self.previous_community:
-                worker_reward += self.config.COMMUNITY_SWITCH_BONUS
-                
-                # New community discovery (+3)
-                if self.current_community not in self.visited_communities:
-                    worker_reward += 3.0
-            
-            # Stuck penalty (escalating)
-            if self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
-                penalty = self.config.COMMUNITY_STUCK_PENALTY
-                if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
-                    penalty *= self.config.SEVERE_STUCK_MULTIPLIER
-                worker_reward += penalty 
-            
-            # Loop penalty (-5)
-            if len(self.community_history) > 1:
-                previous_communities = [c for c in self.community_history[:-1]]
-                if self.current_community in previous_communities:
-                    worker_reward += self.config.COMMUNITY_LOOP_PENALTY
-            
-            # Diversity bonus (+10)
-            unique_communities = len(self.visited_communities)
-            if unique_communities >= 5:
-                diversity_bonus = min((unique_communities - 4) * 2.0, 10.0)
-                worker_reward += diversity_bonus
-            
-            # Community size bonus (+2)
-            if self.current_community:
-                size = self.community_detector.get_community_size(self.current_community)
-                if 5 <= size <= 50:  
-                    worker_reward += self.config.COMMUNITY_SIZE_BONUS
-                elif 50 <= size <= 200:
-                    worker_reward += 0.5
-            
-            # Temporal jump bonus (+3)
-            if len(self.community_history) > 1 and self.current_community:
-                try:
-                    prev_comm = self.community_history[-2]
-                    curr_comm_parts = self.current_community.split('_')
-                    prev_comm_parts = prev_comm.split('_')
-                    
-                    if curr_comm_parts[0] == 'L': 
-                        curr_year = int(curr_comm_parts[2])
-                        prev_year = int(prev_comm_parts[2])
-                    else: 
-                        curr_year = int(curr_comm_parts[1])
-                        prev_year = int(prev_comm_parts[1])
-                    
-                    if curr_year > prev_year:
-                        worker_reward += self.config.TEMPORAL_JUMP_BONUS
-                    elif curr_year < prev_year:
-                        worker_reward += self.config.TEMPORAL_JUMP_PENALTY
-                except:
-                    pass
-        
-        if author_id and self.use_communities and semantic_sim > 0.2:
-            # Community switch for authors (+5)
-            if self.previous_community and self.current_community != self.previous_community:
-                worker_reward += self.config.COMMUNITY_SWITCH_BONUS
-                
-                if self.current_community not in self.visited_communities:
-                    worker_reward += 3.0
-            
-            # Stuck penalty
-            if self.steps_in_current_community >= self.config.STUCK_THRESHOLD:
-                penalty = self.config.COMMUNITY_STUCK_PENALTY
-                if self.steps_in_current_community >= self.config.SEVERE_STUCK_THRESHOLD:
-                    penalty *= self.config.SEVERE_STUCK_MULTIPLIER
-                worker_reward += penalty
-            
-            # Prolific author bonus (Max: +5)
-            paper_count = self.current_node.get('paperCount', 0) or self.current_node.get('paper_count', 0)
-            if paper_count >= self.config.PROLIFIC_THRESHOLD:
-                prolific_bonus = min(paper_count / 50.0, 5.0)
-                worker_reward += prolific_bonus
-            
-            # H-index bonus (Max: +3)
-            h_index = self.current_node.get('hIndex', 0) or self.current_node.get('h_index', 0)
-            if h_index > 0:
-                if author_id not in self.h_index_cache:
-                    self.h_index_cache[author_id] = h_index
-                    self.author_stats['max_h_index'] = max(self.author_stats['max_h_index'], h_index)
-                
-                h_index_bonus = min(h_index / 20.0, 3.0)
-                worker_reward += h_index_bonus
-            
-            # Citation velocity bonus (Max: +2)
-            citation_count = self.current_node.get('citationCount', 0)
-            if citation_count > 1000:
-                velocity_bonus = min(np.log10(citation_count) - 3, 2.0)
-                worker_reward += velocity_bonus
-            
-            # Collaboration bonus (+2)
-            if self.steps_in_current_community == 1:
-                worker_reward += 2.0
-
-        if hasattr(self, 'previous_node_type'):
-            previous_was_paper = self.previous_node_type == 'paper'
-            current_is_paper = paper_id is not None
-            
-            if previous_was_paper != current_is_paper:
-                worker_reward += self.config.NODE_TYPE_SWITCH
-        
-        self.previous_node_type = 'paper' if paper_id else 'author'
-        
-
-        if not is_revisit and semantic_sim > 0.2:
-            node_id = paper_id or author_id
-            novelty_bonus = self.curiosity_module.get_novelty_bonus(node_id)
-            
-            # Intrinsic curiosity (forward model prediction error)
-            current_state = await self._get_state()
-            intrinsic = self.curiosity_module.compute_intrinsic_reward(
-                current_state, node_emb, current_state
-            )
-            
-            curiosity_total = min(novelty_bonus + intrinsic * 0.3, self.config.MAX_NOVELTY_BONUS)
-            worker_reward += curiosity_total
-        
-        worker_reward -= 0.5
-        
-        if semantic_sim > 0.65 and self.current_step <= 10:
-            worker_reward += 30.0
-
-        if self.use_communities and (self.current_step <= 5 or self.current_step % 5 == 0):
-
-            comm_reward , node_type , comm_reason = self.calculate_community_reward()
-            print(f"[COMM] Step {self.current_step} : {self.current_community}")
-            print(f"    Visited: {len(self.visited_communities)} unique | " +
-              f"Steps here: {self.steps_in_current_community} | " +
-              f"Reward: {comm_reward:.1f} ({comm_reason})")
-            worker_reward += comm_reward
-
-
-        worker_reward = np.clip(worker_reward, -100.0, 250.0)
+        worker_reward = np.clip(worker_reward, -50.0, 150.0) 
         
         self.previous_node_embedding = node_emb
-    
+        if semantic_sim > self.best_similarity_so_far:
+            worker_reward += 20.0  
+            self.best_similarity_so_far = semantic_sim
+            self.episode_stats['max_similarity_achieved'] = semantic_sim
+        
         done = self.current_step >= self.max_steps
+        
         if done:
             diversity_reward = self._calculate_trajectory_rewards()
             worker_reward += diversity_reward
-            
-            print(f"  [TERM] Episode ended: step={self.current_step}/{self.max_steps}")
-            print(f"  [REWARD] Trajectory diversity bonus: +{diversity_reward:.1f}")
+            print(f" TERM: Episode ended (step{self.current_step}/{self.max_steps})")
+            print(f"REWARD: Trajectory diversity bonus = {diversity_reward:.1f}")
         
-        # Get next state
-        next_state = await self._get_state()
-        
-        # Log trajectory
         self.trajectory_history.append({
             'node': self.current_node,
             'similarity': semantic_sim,
@@ -1445,7 +1391,14 @@ class AdvancedGraphTraversalEnv:
             'node_type': 'paper' if paper_id else 'author'
         })
         
-        return next_state, worker_reward, done
+        if self.current_step <= 3:
+            title_str = str(self.current_node.get('title') or 'NA')[:50]
+            name_str = str(self.current_node.get('name') or 'NA')[:50]
+            display = title_str if paper_id else name_str
+            print(f" DEBUG: Step {self.current_step} | sim={semantic_sim:.3f}, {'paper' if paper_id else 'author'}={display}")
+        
+        return await self._get_state(), worker_reward, done
+
 
     def _is_target_paper(self, current_title: str, target_title: str) -> bool:
         current = current_title.lower().strip()
@@ -1458,7 +1411,6 @@ class AdvancedGraphTraversalEnv:
             if len(target) > 3:
                 return True
         
-        # Fuzzy match (Levenshtein distance)
         from difflib import SequenceMatcher
         similarity = SequenceMatcher(None, current, target).ratio()
         return similarity > 0.85
@@ -1472,14 +1424,13 @@ class AdvancedGraphTraversalEnv:
     ) -> bool:
         """Check if source paper cites target paper (or vice versa)."""
         
-        # First check cache (fast)
         if hasattr(self, 'training_edge_cache'):
             edges = self.training_edge_cache.get(source_paper_id, [])
             for edge_type, dest_id in edges:
                 if edge_type == direction and dest_id == target_paper_id:
                     return True
         
-        # Fallback to Neo4j query (slower but accurate)
+        # Fallback to Neo4j query 
         query = """
         MATCH (p1:Paper {paperId: $1})-[:CITES]->(p2:Paper {paperId: $2})
         RETURN count(*) > 0 as exists

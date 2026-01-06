@@ -478,4 +478,24 @@ class EnhancedStore:
         """
         return await self._run_query_method(query, [author_name])
 
-    
+    async def get_collab_count_by_author(self, author_id: str) -> int:
+        """Get number of unique collaborators for an author."""
+        query = """
+        MATCH (a:Author {authorId: $author_id})-[:WROTE]->(p:Paper)<-[:WROTE]-(collab:Author)
+        WHERE collab.authorId <> $author_id
+        RETURN COUNT(DISTINCT collab) as collab_count
+        """
+        result = await self._run_query_method(query, [author_id])
+        return result[0].get('collab_count', 0) if result else 0
+
+    async def get_author_by_name_fuzzy(self, name: str, limit: int = 5) -> List[Dict]:
+        """Fuzzy search for authors by name."""
+        query = """
+        MATCH (a:Author)
+        WHERE toLower(a.name) CONTAINS toLower($name)
+        RETURN a
+        ORDER BY a.paperCount DESC
+        LIMIT $limit
+        """
+        results = await self._run_query_method(query, [name])
+        return results[0].get('name' , '') if results else 0

@@ -24,5 +24,6 @@ dependencies = [
     "requests>=2.32.5",
     "sentence-transformers>=5.1.2",
     "unstructured>=0.18.21",
+    "wandb>=0.23.1",
     "wget>=3.2",
 ]

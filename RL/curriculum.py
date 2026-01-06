@@ -8,7 +8,7 @@ class CurriculumManager:
         self.cached_papers = cached_papers
         self.encoder = encoder 
         self.current_stages = 0
-        self.stage_episodes = [30 , 50 , 50 , 50 ]
+        self.stage_episodes = [100, 200 , 300 , 400] 
         self.performance_history = deque(maxlen = 20)
 
         self.stages = [
@@ -37,7 +37,7 @@ class CurriculumManager:
                 'name': 'Stage 4: Expert',
                 'query_difficulty': 'expert',
                 'max_steps': 50,
-                'start_similarity_threshold': 0.2,  # Any starting point
+                'start_similarity_threshold': 0.1,  # Any starting point
                 'description': 'Complex multi-hop reasoning'
             }
         ]
@@ -127,30 +127,46 @@ class CurriculumManager:
         return queries[episode % len(queries)]
     
 
-    def get_starting_paper(self , query: str , stage: Dict) -> Dict: 
+    def get_starting_paper(self, query: str, stage: Dict) -> Dict:
+        """Get starting paper with safe field name handling."""
         threshold = stage['start_similarity_threshold']
-        query_emb = self.encoder.encode_with_cache(query ,cache_key=f"query_{query}")
-
-        scored_papers= []
+        query_emb = self.encoder.encode_with_cache(query, cache_key=f"query_{query}")
+        
+        scored_papers = []
         for paper in self.cached_papers:
-            paper_id = paper['paper_id']
+            paper_id = paper.get('paper_id') or paper.get('paperId')
+            if not paper_id:
+                continue
+
+            paper_id = str(paper_id).strip().lstrip('0')
+            paper_id = paper_id if paper_id else "0"
+            
             if paper_id in self.encoder.cache:
-                    paper_emb = self.encoder.cache[paper_id]
-                    sim = np.dot(query_emb, paper_emb) / (
-                        np.linalg.norm(query_emb) * np.linalg.norm(paper_emb) + 1e-9
-                    )
-                    scored_papers.append((paper, sim))
-            
-            scored_papers.sort(key=lambda x: x[1], reverse=True)
-            
-            # Filter by threshold and get random from candidates
-            candidates = [p for p, s in scored_papers if s >= threshold]
-            
-            if not candidates:
-                # Fall back to top papers if threshold too strict
-                candidates = [p for p, s in scored_papers[:50]]
-            
-            return np.random.choice(candidates)
+                paper_emb = self.encoder.cache[paper_id]
+                sim = np.dot(query_emb, paper_emb) / (
+                    np.linalg.norm(query_emb) * np.linalg.norm(paper_emb) + 1e-9
+                )
+                scored_papers.append((paper, sim))
+        
+        if not scored_papers:
+            for paper in self.cached_papers:
+                paper_id = paper.get('paper_id') or paper.get('paperId')
+                if paper_id:
+                    return paper
+            raise ValueError("No valid papers found in curriculum cache")
+        
+        scored_papers.sort(key=lambda x: x[1], reverse=True)
+
+        candidates = [p for p, s in scored_papers if s >= threshold]
+        
+        if not candidates:
+            candidates = [p for p, s in scored_papers[:50]]
+        
+        if not candidates:
+            candidates = [p for p, s in scored_papers[:10]]
+        
+        return np.random.choice(candidates)
+
         
 
     def update_performance(self, episode_reward: float, max_similarity: float):

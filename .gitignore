@@ -19,3 +19,4 @@ s2_arxiv/*.jsonl
 *.pt
 *.jsoncitations_load.log
 nohup.out
+wandb/

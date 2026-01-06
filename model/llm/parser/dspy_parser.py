@@ -199,6 +199,25 @@ class HierarchicalQueryParser(dspy.Module):
                 semantic=query,
                 constraints=[]
             )
+        
+
+def detect_author_query(self, query: str) -> Optional[str]:
+    """Extract author name from query if present."""
+    author_patterns = [
+        r"(?:papers? by|author|wrote|written by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})",
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})(?:'s|s')\s+(?:papers?|work)",
+        r"collaborators? of\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})",
+    ]
+    
+    for pattern in author_patterns:
+        match = re.search(pattern, query)
+        if match:
+            return match.group(1).strip()
+    
+    return None
+
+
+
 
 def create_hierarchical_examples() -> List[dspy.Example]:
     """Create training examples for DSPy optimization."""

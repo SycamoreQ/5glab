@@ -81,7 +81,7 @@ class SharedExperienceBuffer:
     
 
 class AgentWorker: 
-    def __init__(self , agent_id: int , store: EnhancedStore , state_dim: int = 773 , text_dim: int = 384 , use_communities: bool = True): 
+    def __init__(self , agent_id: int , store: EnhancedStore , state_dim: int = 783 , text_dim: int = 384 , use_communities: bool = True): 
         self.agent_id = agent_id
         self.agent = DDQLAgent(state_dim=state_dim, text_dim=text_dim)
         self.env = AdvancedGraphTraversalEnv(store, use_communities=use_communities)
@@ -264,7 +264,7 @@ class MultiAgentTrainer:
         
     def update_target_network(self): 
         for agent in self.agents: 
-            agent.agent.update_target
+            agent.agent.update_target()
 
     def get_statistics(self) -> Dict[str , Any]:
 
