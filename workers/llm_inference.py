@@ -9,10 +9,6 @@ from enum import Enum
 
 
 class ResearchChatbot:
-    """
-    LLM-powered chatbot frontend for research paper recommendations.
-    """
-    
     def __init__(self, config_path: str = "config/cluster_config.yaml"):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
