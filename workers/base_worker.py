@@ -91,3 +91,6 @@ class BaseWorker:
     def get_uptime(self) -> float:
         """Get worker uptime in seconds."""
         return time.time() - self.start_time
+    
+
+@ray.remote

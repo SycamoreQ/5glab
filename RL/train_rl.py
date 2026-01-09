@@ -9,6 +9,7 @@ from RL.ddqn import DDQLAgent
 from RL.env import AdvancedGraphTraversalEnv, RelationType
 from graph.database.store import EnhancedStore
 from RL.curriculum import CurriculumManager  
+import ray 
 
 try:
     import wandb
@@ -274,7 +275,7 @@ async def build_embeddings():
     print(f"Loaded {len(embeddings):,} embeddings")
     return papers, edge_cache_str, paper_id_set, embeddings, encoder
 
-
+@ray.remote(num_gpus =)
 async def train():
     """Main training loop with curriculum integration and frequent updates."""
 

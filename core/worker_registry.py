@@ -165,4 +165,4 @@ class WorkerRegistry:
     def list_all_workers(self) -> List[Dict]:
         return [asdict(w) for w in self.workers.values()]
 
-
+    def 

@@ -1,97 +1,103 @@
 import ray 
 import time 
 import heapq
-from typing import Dict , List , Optional
+from typing import Dict, List, Optional 
 from dataclasses import dataclass, field
 from core.job_spec import JobSpec, JobStatus, JobType
 
 
-@dataclass(order = True)
-class PrioritizeJob: 
+@dataclass(order=True)
+class PrioritizedJob: 
     priority: int 
-    timestamp: float = field(compare= False)
+    timestamp: float = field(compare=False)
     job: JobSpec = field(compare=False)
     
 
 @ray.remote
 class FIFOScheduler: 
     
-    def __init__(self , worker_registry): 
+    def __init__(self, worker_registry): 
         self.worker_registry = worker_registry
         self.job_queue = []
-        self.running_jobs : Dict[str , JobSpec] = {}
-        self.completed_jobs: Dict[str , JobSpec] = {}
-        self.job_futures: Dict[str , ray.ObjectRef] = {}
+        self.running_jobs: Dict[str, JobSpec] = {}
+        self.completed_jobs: Dict[str, JobSpec] = {}
+        self.job_futures: Dict[str, ray.ObjectRef] = {}
+        print("Scheduler initialized")
 
-    def submit_job(self , job: JobSpec) -> str: 
-        prioriized_job = PrioritizeJob(
-            priority= job.job_priority.value,
-            timestamp= time.time(),
-            job = job
+    def submit_job(self, job: JobSpec) -> str: 
+        prioritized_job = PrioritizedJob(
+            priority=-job.job_priority.value,  # Negative for max-heap
+            timestamp=time.time(),
+            job=job
         )
 
-        heapq.heappush(self.job_queue , prioriized_job)
+        heapq.heappush(self.job_queue, prioritized_job)
         print(f"Job queued: {job.job_id} (priority={job.job_priority.value}, type={job.job_type.value})")
 
         return job.job_id
     
-
     def schedule_next_job(self) -> Optional[ray.ObjectRef]: 
         if not self.job_queue: 
             return None 
         
-        prioritize_job = heapq.heappop(self.job_queue)
-        job = prioritize_job.job 
+        prioritized_job = heapq.heappop(self.job_queue)
+        job = prioritized_job.job 
 
-
+        # Get available workers
         available_workers = ray.get(self.worker_registry.get_available_workers.remote(
             min_cpus=job.resources.num_cpus, 
             min_gpu_memory=job.resources.num_gpus * 2.0,
-            custom_resource=list(job.resources.custom_resources.keys())[0] if job.resources.custom_resources else None))
+            custom_resource=list(job.resources.custom_resources.keys())[0] if job.resources.custom_resources else None
+        ))
         
         if not available_workers:
             # No workers available, requeue job
-            heapq.heappush(self.job_queue, prioritize_job)
+            heapq.heappush(self.job_queue, prioritized_job)
             return None
         
         worker_id = available_workers[0]
         
         try: 
-            future = self._dispatch_job(job , worker_id)
+            future = self._dispatch_job(job, worker_id)
             job.mark_started(worker_id)
             self.running_jobs[job.job_id] = job 
             self.job_futures[job.job_id] = future
 
             print(f"Job dispatched: {job.job_id} → {worker_id}")
+            return future
 
-        except Exception as e : 
-            print(f"✗ Failed to dispatch job {job.job_id}: {e}")
+        except Exception as e: 
+            print(f"Failed to dispatch job {job.job_id}: {e}")
             job.mark_failed(str(e))
             self.completed_jobs[job.job_id] = job
             return None
+        
     
-    
-    def _dispatch_job(self , job : JobSpec , worker_id: str) -> ray.ObjectRef: 
+    def _dispatch_job(self, job: JobSpec, worker_id: str) -> ray.ObjectRef: 
+        """Dispatch job to appropriate worker based on job type."""
         if job.job_type == JobType.RL_TRAINING: 
-            from RL.train_rl import train_single_process
-
+            from workers.rl_trainer import DistributedRLTrainer
             
-            worker = train_single_process.options(
+            # Get database config from job parameters or use defaults
+            db_config = job.parameters.get('db_config', {})
+            
+            trainer = DistributedRLTrainer.options(
+                name=f"trainer_{worker_id}_{job.job_id}",
                 **job.resources.to_dict()
-            ).remote(worker_id)
-
-        elif job.job_type == JobType.LLM_INFERENCE:
-            from workers.llm_inference import LLMInferenceWorker
+            ).remote(
+                worker_id=worker_id,
+                db_host=db_config.get('host', '192.168.1.10'),
+                db_port=db_config.get('port', 7687),
+                db_user=db_config.get('user', 'neo4j'),
+                db_password=db_config.get('password', 'diam0ndman@3'),
+                db_name=db_config.get('database', 'researchdbv3')
+            )
             
-            worker = LLMInferenceWorker.options(
-                **job.resources.to_dict()
-            ).remote(worker_id)
-            
-            return worker.infer.remote(**job.parameters)
-        
-        else:
-            raise ValueError(f"Unknown job type: {job.job_type}")
-        
+            return trainer.train_episodes.remote(
+                episodes=job.parameters['episodes'],
+                query=job.parameters['query'],
+                start_paper_id=job.parameters['start_paper_id']
+            )
 
     def check_job_completion(self) -> List[str]:
         """Check for completed jobs and update status."""
@@ -156,3 +162,33 @@ class FIFOScheduler:
             }
         
         return completed
+    
+
+class RoundRobinScheduler:
+    """Round Robin Scheduler implementation."""
+    
+    def __init__(self , worker_registry): 
+        self.worker_registry = worker_registry
+        self.job_queue = []
+        self.running_jobs : Dict[str , JobSpec] ={}
+        self.completed_jobs: Dict[str , JobSpec] = {}
+        self.job_futures: Dict[str , ray.ObjectRef] = {}
+        self.quantum_time = float
+        self.time_hash = 
+
+    
+    def submit_job(self , job: JobSpec) -> str:
+        prioritized_job = PrioritizedJob(
+            priority = job.job_priority.value,
+            timestamp= time.time(),
+            job = job 
+        )
+
+        heapq.heappush(self.job_queue , prioritized_job)
+        print(f"Job queued: {job.job_id} (priority={job.job_priority.value}, type={job.job_type.value})")
+
+    def schedule_next_job(self) -> Optional[ray.ObjectRef]:
+        if not self.job_queue:
+            return None
+        
+        prioriizted_job = heapq.heappop(self.job_queue)

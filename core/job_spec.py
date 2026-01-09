@@ -14,7 +14,7 @@ class JobType(Enum):
 
 class JobPriority(Enum): 
     LOW = 1
-    MEDUIM = 5
+    MEDIUM = 5
     HIGH = 8
     CRITICAL = 10 
 
@@ -24,7 +24,6 @@ class JobStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
-
 
 
 @dataclass
@@ -123,7 +122,7 @@ def create_rl_training_job(
     return JobSpec(
         job_id = f"rl_train_{int(time.time())}",
         job_type= JobType.RL_TRAINING,
-        status= status 
+        job_status= status,
         job_priority= priority,
         
         resources =ResourceRequirement(
@@ -147,15 +146,16 @@ def create_embedding_job(
     return JobSpec(
         job_id=f"embed_{int(time.time())}",
         job_type=JobType.EMBEDDING,
-        priority=priority,
+        job_status=JobStatus.PENDING,
+        job_priority=priority,
         resources=ResourceRequirement(
             num_cpus=4.0,
             num_gpus=0.0,
             memory_mb=2048,
-            custom_resources={"pi": 1}  # Prefer Pi workers
+            custom_resources={"pi": 1} 
         ),
         parameters={
             'texts': texts
         },
-        timeout_sec=300.0  # 5 minutes
+        timeout_sec=300.0 
     )
