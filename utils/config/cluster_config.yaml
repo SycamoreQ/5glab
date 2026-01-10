@@ -1,91 +1,31 @@
-cluster_name: rl_chat_cluster
-
-database_server:
-  host: "192.168.1.10"  # Your database server IP
+\database_server:
+  host: "192.168.1.10"  # ✓ Your database/master IP
   neo4j_port: 7687
   neo4j_user: "neo4j"
   neo4j_password: "diam0ndman@3"
   database_name: "neo4j"
 
-# Master node (runs on database server or separate)
 master_node:
-  host: "192.168.1.10"  # Same as DB server
-  ray_port: 6379
+  host: "192.168.1.10"  # ✓ Master node IP
+  ray_port: 6379        # ✓ Not Redis - just Ray's default port
   dashboard_port: 8265
-  redis_password: "5G_cluster"
+  redis_password: "5G_cluster"  # ✓ Not actual Redis - Ray internal
 
-# RL Training Workers (2 systems)
 rl_training_workers:
   - name: rl_worker_1
-    host: "192.168.1.11"  # Training system 1
+    host: "192.168.1.11"  # ✓ Worker 1 IP
     type: desktop
     role: rl_training
     resources:
       CPU: 6
       GPU: 1
-      memory: 16000000000  # 16GB
-    custom_resources:
-      rl_trainer: 1
-    
-    # Parser configuration 
-    parser:
-      type: "dspy"  # or "dspy" or "rule"
-      model: "llama3.2"
-      enabled: true
+      memory: 16000000000
 
   - name: rl_worker_2
-    host: "192.168.1.12"  # Training system 2
+    host: "192.168.1.12"  # ✓ Worker 2 IP
     type: desktop
     role: rl_training
     resources:
       CPU: 4
       GPU: 1
-      memory: 8000000000  # 8GB
-    custom_resources:
-      rl_trainer: 1
-    
-    parser:
-      type: "dspy"
-      model: "llama3.2"
-      enabled: true
-
-
-  - name: rl_worker_3
-    host: ""
-    type: desktop
-    role: rl_training
-    resources: 
-      CPU: 4
-      GPU: 1
-      memory: 16000000000
-    custom_resources:
-      rl_trainer: 1
-
-    parser: 
-      type: "dspy"
-      model: "llama3.2"
-      enabled: true
-
-training_config:
-    "total_episodes": 1000, 
-    "max_steps_per_episode": 12,  
-    "batch_size": 64,  
-    "learning_rate": 1e-4,
-    "gamma": 0.95,
-
-    "epsilon_start": 1.0,
-    "epsilon_min": 0.15,  
-    "epsilon_decay": 0.99985,  
-    "epsilon_warmup_episodes": 100,  
-    "epsilon_curriculum_boost": 0.1, 
-
-    "target_update_freq": 10,
-    "use_communities": True,
-    "state_dim": 783,
-    "text_dim": 384,
-    "use_prioritized_replay": True,
-
-    "train_every_n_steps": 2,
-    "end_of_episode_replays": 3,
-
-    "use_curriculum": True,
+      memory: 8000000000
