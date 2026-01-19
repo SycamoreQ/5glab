@@ -17,7 +17,7 @@ from train_rl import (
     COMPLEX_QUERIES
 )
 
-WANDB_PROJECT = "graph-traversal-marl"
+WANDB_PROJECT = "marl_research_paper_navigation"
 WANDB_ENTITY = "your-wandb-username"
 
 CONFIG = {
@@ -37,10 +37,6 @@ CONFIG = {
     "state_dim": 783,
     "text_dim": 384,
 }
-
-# ============================================================================
-# W&B LOGGING FOR MARL
-# ============================================================================
 
 def log_parallel_episode(global_ep, experiences: List[AgentExperience]):
     """Log metrics from parallel episode runs."""
@@ -136,9 +132,7 @@ async def train_marl():
     print(f"  Papers: {len(normalized_paper_id_set):,}")
     print(f"  Edges: {sum(len(v) for v in pruned_edge_cache.values()):,}")
     
-    print("\n" + "="*80)
     print("STARTING MULTI-AGENT TRAINING")
-    print("="*80)
     print(f"W&B Run: {run.url}")
     print(f"Agents: {CONFIG['num_agents']}")
     print(f"Global episodes: {CONFIG['total_global_episodes']}")
