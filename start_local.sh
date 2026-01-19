@@ -8,7 +8,7 @@ echo "  (Single machine simulation)"
 echo "=================================================="
 echo ""
 
-# Cleanup
+
 echo "Cleaning up Ray..."
 ray stop 2>/dev/null || true
 sleep 2
@@ -38,7 +38,19 @@ echo "  Dashboard: http://127.0.0.1:8265"
 echo ""
 
 echo "Starting coordinator..."
-python3 RL/train_rl.py --config "$CONFIG_FILE" &
+
+if [ -f "distribute/workers/distributed_master.py" ]; then
+    python3 distribute/workers/distributed_master.py --config "$CONFIG_FILE" &
+elif [ -f "distributed_master.py" ]; then
+    python3 distributed_master.py --config "$CONFIG_FILE" &
+else
+    echo "distributed_master.py not found"
+    echo "Expected locations:"
+    echo "  - distribute/workers/distributed_master.py"
+    echo "  - distributed_master.py"
+    ray stop
+    exit 1
+fi
 
 COORDINATOR_PID=$!
 sleep 3
